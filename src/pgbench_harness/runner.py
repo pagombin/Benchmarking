@@ -49,6 +49,12 @@ def _dataset_error(check: "capture.DatasetCheck", spec_path: Path) -> PreflightE
     hints = {
         "missing": f"run `pgbench-harness prepare --spec {spec_path}` first; "
                    "`run` never prepares silently.",
+        "wrong_schema": "the tables exist but not on this connection's search_path, so "
+                        "sysbench's run would not see them. Set the search_path on the "
+                        "target (e.g. `ALTER ROLE <user> IN DATABASE <db> SET "
+                        "search_path = <schema>, public;`) so the schema above is first, "
+                        "then re-run preflight. This commonly happens on poolers/clusters "
+                        "where the default schema is not `public`.",
         "incomplete": "the benchmark tables are partially present or have an "
                       "unrecognized schema. Drop them (or use a dedicated database) "
                       "and run `prepare` again — the harness never overwrites tables "
@@ -119,6 +125,15 @@ def _write_prepare_stats(
     return stats
 
 
+def _log_tail(path: Path, lines: int = 15) -> str:
+    """Last *lines* of a log file, indented, for inclusion in an error hint."""
+    try:
+        tail = path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    except OSError:
+        return f"  (could not read {path})"
+    return "\n".join("    " + line for line in tail) or "  (log is empty)"
+
+
 def cmd_prepare(spec_path: Path, results_dir: Path) -> int:
     """`prepare` subcommand: load the dataset idempotently, recording load metrics."""
     spec = load_spec(spec_path)
@@ -144,9 +159,16 @@ def cmd_prepare(spec_path: Path, results_dir: Path) -> int:
             hint="inspect the log; common causes are credentials, sslmode and disk space.",
         )
     check = capture.check_dataset(spec, password)
+    if check.status in ("wrong_schema", "mismatch", "incomplete"):
+        # sysbench succeeded but the result is not usable as-is — give the
+        # specific guidance rather than blaming the load.
+        raise _dataset_error(check, spec_path)
     if not check.ok:
-        raise RunError(f"prepare finished but the dataset check still fails: {check.detail}",
-                       hint="inspect the prepare log; the load may have been cut short.")
+        raise RunError(
+            f"sysbench prepare reported success but no benchmark tables exist "
+            f"afterwards: {check.detail}",
+            hint=f"inspect the prepare log for errors:\n{_log_tail(log_path)}",
+        )
     stats = _write_prepare_stats(spec, password, results_dir,
                                  time.monotonic() - t0, started, log_path)
     logger.info("dataset ready: %s", check.detail)

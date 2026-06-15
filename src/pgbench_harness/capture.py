@@ -59,7 +59,7 @@ class ProbeResult:
 class DatasetCheck:
     """Outcome of the dataset conformance check (presence AND size vs spec)."""
 
-    status: str = "error"  # ok | missing | incomplete | mismatch | error
+    status: str = "error"  # ok | missing | wrong_schema | incomplete | mismatch | error
     detail: str = ""
     expected_tables: int = 0
     present_tables: int = 0
@@ -67,6 +67,8 @@ class DatasetCheck:
     expected_size: int = 0
     actual_size: Optional[int] = None
     size_unit: str = ""
+    found_elsewhere: list[str] = field(default_factory=list)
+    search_path: str = ""
 
     @property
     def ok(self) -> bool:
@@ -263,6 +265,41 @@ def _count_query(spec: Spec, password: str, sql: str) -> Optional[int]:
     return int(out) if ok and out.lstrip("-").isdigit() else None
 
 
+def _list_query(spec: Spec, password: str, sql: str) -> list[str]:
+    ok, out = psql_query_soft(spec, password, sql)
+    return [line for line in out.splitlines() if line.strip()] if ok else []
+
+
+def _sql_str(value: str) -> str:
+    """Quote a Python string as a SQL string literal (single quotes doubled)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def count_resolvable_tables(spec: Spec, password: str, names: list[str]) -> Optional[int]:
+    """Count how many unqualified table names resolve via the session search_path.
+
+    Uses ``to_regclass`` so the answer matches exactly how sysbench (which
+    issues unqualified ``CREATE``/``SELECT``) resolves the same names. This is
+    schema-agnostic: the dataset is "present" iff sysbench's own run would
+    find it, regardless of which schema it actually lives in.
+    """
+    values = ", ".join(f"({_sql_str(n)})" for n in names)
+    return _count_query(
+        spec, password,
+        f"SELECT count(*) FROM (VALUES {values}) v(n) WHERE to_regclass(v.n) IS NOT NULL",
+    )
+
+
+def find_tables_any_schema(spec: Spec, password: str, names: list[str]) -> list[str]:
+    """Locate the given table names across *all* schemas, as schema.table strings."""
+    in_list = ", ".join(_sql_str(n) for n in names)
+    return _list_query(
+        spec, password,
+        f"SELECT schemaname || '.' || tablename FROM pg_catalog.pg_tables "
+        f"WHERE tablename IN ({in_list}) ORDER BY 1",
+    )
+
+
 def database_size_bytes(spec: Spec, password: str) -> Optional[int]:
     """Current size of the target database in bytes (best effort)."""
     return _count_query(
@@ -270,18 +307,22 @@ def database_size_bytes(spec: Spec, password: str) -> Optional[int]:
 
 
 def _check_canary_schema(spec: Spec, password: str) -> tuple[bool, str]:
-    """Verify the canary table has the columns the workload's schema defines."""
+    """Verify the canary table has the columns the workload's schema defines.
+
+    Resolves the canary via ``to_regclass`` (search_path-aware, so it inspects
+    the same table sysbench will use, in whichever schema it lives).
+    """
     cols: tuple[str, ...]
     if spec.workload.type == "tpcc":
         table, cols = "warehouse1", ("w_id", "w_ytd")
     else:
         table, cols = "sbtest1", ("id", "k", "c", "pad")
-    quoted = ", ".join(f"'{c}'" for c in cols)
+    quoted = ", ".join(_sql_str(c) for c in cols)
     n = _count_query(
         spec, password,
-        f"SELECT count(*) FROM information_schema.columns "
-        f"WHERE table_schema='public' AND table_name='{table}' "
-        f"AND column_name IN ({quoted})",
+        f"SELECT count(*) FROM pg_catalog.pg_attribute "
+        f"WHERE attrelid = to_regclass({_sql_str(table)}) "
+        f"AND attname IN ({quoted}) AND attnum > 0 AND NOT attisdropped",
     )
     if n != len(cols):
         return False, (
@@ -328,32 +369,44 @@ def check_dataset(spec: Spec, password: str) -> DatasetCheck:
     callers can warn about shared databases.
     """
     names = expected_table_names(spec)
-    quoted = ", ".join(f"'{n}'" for n in names)
+    quoted = ", ".join(_sql_str(n) for n in names)
     chk = DatasetCheck(expected_tables=len(names))
-    present = _count_query(
-        spec, password,
-        f"SELECT count(*) FROM information_schema.tables "
-        f"WHERE table_schema='public' AND table_name IN ({quoted})",
-    )
+    chk.search_path = (psql_query_soft(spec, password, "SHOW search_path")[1] or "").strip()
+    present = count_resolvable_tables(spec, password, names)
     if present is None:
-        chk.detail = "could not query information_schema (connectivity/permissions?)"
+        chk.detail = "could not resolve benchmark tables (connectivity/permissions?)"
         return chk
     chk.present_tables = present
     chk.foreign_tables = _count_query(
         spec, password,
-        f"SELECT count(*) FROM information_schema.tables "
-        f"WHERE table_schema='public' AND table_type='BASE TABLE' "
-        f"AND table_name NOT IN ({quoted})",
+        f"SELECT count(*) FROM pg_catalog.pg_tables "
+        f"WHERE schemaname NOT IN ('pg_catalog','information_schema') "
+        f"AND tablename NOT IN ({quoted})",
     ) or 0
     if present == 0:
-        chk.status = "missing"
-        chk.detail = f"none of the {len(names)} expected benchmark tables exist"
+        # Not on the search_path — but did sysbench create them in another
+        # schema? If so this is a routing/search_path problem, not a load failure.
+        chk.found_elsewhere = find_tables_any_schema(spec, password, names)
+        if chk.found_elsewhere:
+            chk.status = "wrong_schema"
+            chk.detail = (
+                f"sysbench created the benchmark tables, but they are not on the "
+                f"connection's search_path ({chk.search_path or 'unknown'}). Found: "
+                + ", ".join(chk.found_elsewhere[:6])
+                + (" …" if len(chk.found_elsewhere) > 6 else "")
+            )
+        else:
+            chk.status = "missing"
+            chk.detail = (
+                f"none of the {len(names)} expected benchmark tables exist in any "
+                "schema — the load did not create them"
+            )
         return chk
     if present < len(names):
         chk.status = "incomplete"
         chk.detail = (
-            f"only {present} of {len(names)} expected benchmark tables exist — "
-            "a previous load was interrupted, or the spec's `tables` changed"
+            f"only {present} of {len(names)} expected benchmark tables resolve on the "
+            "search_path — a previous load was interrupted, or the spec's `tables` changed"
         )
         return chk
     schema_ok, schema_err = _check_canary_schema(spec, password)
