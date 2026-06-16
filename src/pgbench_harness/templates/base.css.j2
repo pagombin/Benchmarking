@@ -6,7 +6,7 @@
   color-scheme: light;
 }
 * { box-sizing: border-box; }
-html { background: #eef1f5; }
+html { background: #eef1f5; overflow-y: auto; }
 /* NOTE: never set overflow:hidden on <html>/<body> — the root element's
    overflow propagates to the viewport and would disable page scrolling. */
 body {
@@ -80,8 +80,8 @@ table.settings { table-layout: fixed; }
 table.settings td { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
 /* The report's 4-column config tables get explicit widths (.cfg); the compare
    diff table has a variable column count and just inherits equal widths. */
-table.settings.cfg th:nth-child(1), table.settings.cfg td:nth-child(1) { width: 34%; }
-table.settings.cfg th:nth-child(2), table.settings.cfg td:nth-child(2) { width: 34%; }
+table.settings.cfg th:nth-child(1), table.settings.cfg td:nth-child(1) { width: 38%; }
+table.settings.cfg th:nth-child(2), table.settings.cfg td:nth-child(2) { width: 30%; }
 table.settings.cfg th:nth-child(3), table.settings.cfg td:nth-child(3) { width: 12%; }
 table.settings.cfg th:nth-child(4), table.settings.cfg td:nth-child(4) { width: 20%; }
 .chart { margin: 26px 0; border: 1px solid var(--line); border-radius: 12px;
