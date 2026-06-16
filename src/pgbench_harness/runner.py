@@ -180,17 +180,21 @@ def cmd_prepare(spec_path: Path, results_dir: Path) -> int:
 
 
 def _find_resume_dir(results_dir: Path, label: str) -> Path:
-    """Latest run directory for this label (used by --resume without --run-dir)."""
+    """Most-recent run directory for this label (used by --resume without --run-dir).
+
+    Sorted by manifest mtime, not name: the ``-2`` same-second disambiguation
+    suffix breaks lexicographic ordering (``...Z-10`` < ``...Z-2``).
+    """
     slug = make_run_id(label).rsplit("-", 1)[0]
-    candidates = sorted(
+    candidates = [
         d for d in results_dir.glob(f"{slug}-*") if (d / "manifest.json").exists()
-    )
+    ]
     if not candidates:
         raise RunError(
             f"--resume: no previous run for label '{label}' under {results_dir}",
             hint="pass --run-dir explicitly, or start a fresh run without --resume.",
         )
-    return candidates[-1]
+    return max(candidates, key=lambda d: (d / "manifest.json").stat().st_mtime)
 
 
 def _init_run(
@@ -343,15 +347,26 @@ def _preflight_doc(pf: capture.PreflightResult) -> dict:
 
 
 def _wall_time_s(manifest: Manifest) -> float:
+    """Actual benchmarking time: the sum of per-level durations.
+
+    Summing levels (rather than finished-minus-created) keeps the figure
+    correct across ``--resume``, where a run may be picked up hours or days
+    after it was created — the idle gap is not benchmarking time.
+    """
     from datetime import datetime
 
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    try:
-        start = datetime.strptime(manifest.created_utc, fmt)
-        end = datetime.strptime(manifest.finished_utc, fmt)
-        return (end - start).total_seconds()
-    except ValueError:
-        return 0.0
+    total = 0.0
+    for lvl in manifest.levels:
+        if not lvl.started_utc or not lvl.finished_utc:
+            continue
+        try:
+            start = datetime.strptime(lvl.started_utc, fmt)
+            end = datetime.strptime(lvl.finished_utc, fmt)
+        except ValueError:
+            continue
+        total += max(0.0, (end - start).total_seconds())
+    return total
 
 
 def cmd_report(run_dir: Path) -> int:

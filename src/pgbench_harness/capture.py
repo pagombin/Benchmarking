@@ -19,7 +19,7 @@ from pgbench_harness import __version__
 from pgbench_harness.errors import PreflightError
 from pgbench_harness.spec import Spec
 from pgbench_harness.sysbench import child_env, sysbench_version
-from pgbench_harness.util import get_redactor
+from pgbench_harness.util import atomic_write_text, get_redactor
 
 PSQL_TIMEOUT_S = 30
 # How long the ceiling probe waits for all holders to establish before
@@ -200,13 +200,15 @@ def host_info() -> str:
 def connection_ceiling_probe(
     spec: Spec, password: str, count: int, logger: logging.Logger
 ) -> ProbeResult:
-    """Open *count* simultaneous connections (cheap SELECT pg_sleep holders).
+    """Open *count* simultaneous connections (cheap ``SELECT pg_sleep`` holders).
 
-    Connections are launched in order with a tiny stagger; after a grace
-    period every process still running is counted as an established holder
-    and any early exit is a refusal. The first failed launch index
-    approximates the connection count at which the target refused, and its
-    stderr is captured verbatim.
+    Connections are launched in order with a tiny stagger. We wait the *full*
+    grace period (a single fast refusal must not short-circuit the wait, or
+    slow-to-establish holders would be miscounted), then classify each holder:
+    a process still alive at the deadline is holding an established session
+    (success); a process that already exited was refused. The lowest exited
+    launch index approximates the connection count at which the target
+    refused, and its verbatim (redacted) stderr is captured.
     """
     logger.info("preflight: connection-ceiling probe with %d simultaneous connections", count)
     env = child_env(spec, password)
@@ -219,18 +221,14 @@ def connection_ceiling_probe(
             ))
             time.sleep(0.01)
         grace = float(os.environ.get("PGB_PROBE_GRACE_S", str(PROBE_CONNECT_GRACE_S)))
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if any(p.poll() is not None for p in procs):
-                time.sleep(0.5)  # let the remaining refusals land
-                break
-            time.sleep(0.2)
+        time.sleep(grace)  # full wait — established holders sleep for 30s, refusals exit fast
         result = ProbeResult(requested=count, succeeded=0)
         for idx, p in enumerate(procs, start=1):
-            if p.poll() is None or p.returncode == 0:
-                result.succeeded += 1
+            if p.poll() is None:
+                result.succeeded += 1  # still holding the connection open
             elif result.first_failed_index is None:
                 result.first_failed_index = idx
+                # Safe to read: an exited process won't block the pipe.
                 stderr = p.stderr.read().strip() if p.stderr else ""
                 result.first_error = get_redactor().redact(stderr)
         return result
@@ -243,6 +241,9 @@ def connection_ceiling_probe(
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 p.kill()
+            finally:
+                if p.stderr and not p.stderr.closed:
+                    p.stderr.close()  # avoid leaked-pipe ResourceWarnings
 
 
 TPCC_TABLE_BASES = (
@@ -478,15 +479,15 @@ def capture_env(run_dir: Path, spec: Spec, password: str, pf: PreflightResult) -
     """Write the env/ capture directory (settings, versions, host info)."""
     env_dir = run_dir / "env"
     env_dir.mkdir(parents=True, exist_ok=True)
+    # All writes go through atomic_write_text, which redacts the registered
+    # secret — so even psql output that echoed connection params stays safe.
     if spec.capture.pg_settings:
-        (env_dir / "pg_settings.csv").write_text(
-            capture_pg_settings(spec, password) + "\n", encoding="utf-8")
-    (env_dir / "server_version.txt").write_text(
-        pf.server_version_full + "\n", encoding="utf-8")
-    (env_dir / "sysbench_version.txt").write_text(pf.sysbench_version + "\n", encoding="utf-8")
-    (env_dir / "tpcc_git_sha.txt").write_text(pf.tpcc_git_sha + "\n", encoding="utf-8")
-    (env_dir / "harness_git_sha.txt").write_text(harness_version() + "\n", encoding="utf-8")
-    (env_dir / "host_info.txt").write_text(host_info(), encoding="utf-8")
+        atomic_write_text(env_dir / "pg_settings.csv", capture_pg_settings(spec, password) + "\n")
+    atomic_write_text(env_dir / "server_version.txt", pf.server_version_full + "\n")
+    atomic_write_text(env_dir / "sysbench_version.txt", pf.sysbench_version + "\n")
+    atomic_write_text(env_dir / "tpcc_git_sha.txt", pf.tpcc_git_sha + "\n")
+    atomic_write_text(env_dir / "harness_git_sha.txt", harness_version() + "\n")
+    atomic_write_text(env_dir / "host_info.txt", host_info())
 
 
 def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> PreflightResult:
