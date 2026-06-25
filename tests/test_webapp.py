@@ -107,6 +107,27 @@ def test_health_no_auth(web):
     assert client.get("/healthz").json()["status"] == "ok"
 
 
+def test_secret_store_self_heals_invalid_key(tmp_path):
+    """A non-Fernet key file (e.g. installer wrote raw base64-48) self-heals when
+    no secrets exist yet, but refuses (no silent orphaning) once secrets are stored."""
+    from pgbench_webapp.secrets_store import SecretStore
+    kp, sp = tmp_path / "secret.key", tmp_path / "secrets.enc"
+    kp.write_bytes(b"not-a-valid-fernet-key")          # what the buggy installer wrote
+    store = SecretStore(kp, sp)                          # regenerates a valid key
+    store.set("db", "pw"); assert store.get("db") == "pw"
+    kp.write_bytes(b"corrupt-now")                       # key broken but secrets exist
+    with pytest.raises(ValueError, match="not a valid Fernet key"):
+        SecretStore(kp, sp)
+
+
+def test_installer_keygen_is_fernet_valid():
+    """`openssl rand -base64 32 | tr +/ -_` must be a usable Fernet key (deploy.sh)."""
+    import subprocess
+    from cryptography.fernet import Fernet
+    key = subprocess.check_output("openssl rand -base64 32 | tr '+/' '-_'", shell=True).strip()
+    Fernet(key)   # raises if invalid
+
+
 # ── auth / RBAC ─────────────────────────────────────────────────────
 
 def test_rbac_matrix(web):

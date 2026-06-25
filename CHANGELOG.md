@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.1
+
+### Fix: web services failed to start on a real install (invalid Fernet key)
+- `deploy.sh` generated `secret.key` with `openssl rand -base64 48` (standard
+  base64, 48 bytes), which is not a valid Fernet key, so `pgbench-web`/
+  `pgbench-worker` crashed at startup (`Fernet key must be 32 url-safe
+  base64-encoded bytes`). The installer now writes a valid key
+  (`openssl rand -base64 32 | tr '+/' '-_'`).
+- The secret store now **self-heals**: an invalid key file is regenerated when
+  no secrets are encrypted yet, and refused with a clear message (rather than
+  silently orphaning data) when secrets already exist. Recover an affected
+  install by deleting `secret.key` and restarting the services.
+
 ## 0.7.0
 
 ### Self-hosted web application (new `pgbench_webapp` package)
