@@ -7,3 +7,10 @@ __pycache__/
 results/
 build/
 dist/
+
+# web app local data
+*.db
+*.db-*
+secrets.enc
+secret.key
+certs/

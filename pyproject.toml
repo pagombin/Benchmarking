@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pgbench-harness"
-version = "0.6.0"
+version = "0.7.0"
 description = "Repeatable PostgreSQL benchmarking harness (sysbench-based) with automated per-run HTML reports"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,16 +16,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "mypy>=1.5", "types-PyYAML"]
+dev = ["pytest>=7.0", "mypy>=1.5", "types-PyYAML", "httpx>=0.27"]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "python-multipart>=0.0.9",
+    "bcrypt>=4.1",
+    "cryptography>=42.0",
+]
 
 [project.scripts]
 pgbench-harness = "pgbench_harness.cli:main"
+pgbench-web = "pgbench_webapp.cli_entry:web_main"
+pgbench-worker = "pgbench_webapp.cli_entry:worker_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 pgbench_harness = ["templates/*.j2"]
+pgbench_webapp = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

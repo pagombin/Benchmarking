@@ -25,6 +25,10 @@ class RunMeta:
     edition: str
     tshirt_size: str
     notes: str = ""
+    tags: tuple[str, ...] = ()       # free-form labels for history filtering/grouping
+    environment: str = ""            # e.g. staging / prod-like
+    ticket: str = ""                 # e.g. DBAAS-1234
+    owner: str = ""                  # who launched / owns this run
 
 
 @dataclass(frozen=True)
@@ -178,8 +182,18 @@ def _int_list(
     return tuple(val)
 
 
+def _str_list(sec: dict[str, Any], where: str, key: str) -> tuple[str, ...]:
+    if key not in sec:
+        return ()
+    val = sec[key]
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        raise SpecError(f"'{where}.{key}' must be a list of strings")
+    return tuple(v.strip() for v in val if v.strip())
+
+
 def _parse_run(sec: dict[str, Any]) -> RunMeta:
-    _check_keys(sec, "run", {"label", "edition", "tshirt_size"}, {"notes"})
+    _check_keys(sec, "run", {"label", "edition", "tshirt_size"},
+                {"notes", "tags", "environment", "ticket", "owner"})
     edition = _typed(sec, "run", "edition", str)
     if edition not in EDITIONS:
         raise SpecError(f"'run.edition' must be one of {EDITIONS}, got '{edition}'")
@@ -191,6 +205,10 @@ def _parse_run(sec: dict[str, Any]) -> RunMeta:
         edition=edition,
         tshirt_size=_typed(sec, "run", "tshirt_size", str),
         notes=_typed(sec, "run", "notes", str, ""),
+        tags=_str_list(sec, "run", "tags"),
+        environment=_typed(sec, "run", "environment", str, ""),
+        ticket=_typed(sec, "run", "ticket", str, ""),
+        owner=_typed(sec, "run", "owner", str, ""),
     )
 
 

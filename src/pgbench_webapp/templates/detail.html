@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}{{ run.run_id }} — pgbench-harness{% endblock %}
+{% block content %}
+<h1>{{ run.label }} <span class="muted">{{ run.run_id }}</span></h1>
+<div class="meta">
+  <span class="badge {{ run.status }}">{{ run.status }}</span>
+  <span>{{ run.edition }} · {{ run.tshirt_size }} · {{ run.mode }} · {{ run.workload_type }}</span>
+  {% if run.peak_qps %}<span>peak {{ '%.0f'|format(run.peak_qps) }} QPS</span>{% endif %}
+  {% if run.ticket %}<span>{{ run.ticket }}</span>{% endif %}
+</div>
+
+<div class="actions">
+  <a class="btn" href="/runs/{{ run.run_id }}/report" target="_blank">Open report</a>
+  <a class="btn" href="/runs/{{ run.run_id }}/report/download">Download report</a>
+  <a class="btn" href="/runs/{{ run.run_id }}/artifact">Download artifacts (.tar.gz)</a>
+  <a class="btn" href="/runs/{{ run.run_id }}/spec" target="_blank">View spec</a>
+  {% if can_run %}
+  {% if run.mode == 'soak' %}
+    <button class="btn mark-btn" data-type="failover" data-run="{{ run.run_id }}">⚑ Mark failover</button>
+    <button class="btn mark-btn" data-type="scale_up" data-run="{{ run.run_id }}">⚑ Mark scale-up</button>
+  {% endif %}
+  {% if run.status in ['partial','failed','running'] and run.mode == 'sweep' %}
+    <button class="btn" id="resume-btn" data-run="{{ run.run_id }}">Resume</button>
+  {% endif %}
+  {% endif %}
+</div>
+
+<div class="grid2">
+  <div class="card"><h2>Throughput (live)</h2>
+    <canvas id="chart" width="560" height="240"></canvas>
+    <div class="muted" id="chart_status">connecting…</div>
+  </div>
+  <div class="card"><h2>Log</h2>
+    <pre id="log" class="logpane mono"></pre>
+  </div>
+</div>
+<script>window.RUN_ID = "{{ run.run_id }}"; window.CSRF = "{{ csrf }}";</script>
+{% endblock %}

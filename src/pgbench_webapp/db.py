@@ -1,0 +1,133 @@
+"""SQLite control-plane: connection helper + forward-only migrations.
+
+SQLite is an *index and control plane* over the filesystem ``results/`` tree —
+never a second source of truth for benchmark data. Migrations are plain SQL
+applied in order and tracked in ``schema_migrations``; the installer runs
+``migrate`` on every update and it is safe to re-run.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import sys
+from pathlib import Path
+
+from pgbench_webapp.config import ensure_dirs, load_config
+
+# Each migration is (version, SQL). Append new ones; never edit applied ones.
+MIGRATIONS: list[tuple[int, str]] = [
+    (1, """
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        pw_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'viewer',
+        disabled INTEGER NOT NULL DEFAULT 0,
+        created_utc TEXT NOT NULL
+    );
+    CREATE TABLE sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        created_utc TEXT NOT NULL,
+        expires_utc TEXT NOT NULL
+    );
+    CREATE TABLE targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        host TEXT NOT NULL, port INTEGER NOT NULL, dbname TEXT NOT NULL,
+        dbuser TEXT NOT NULL, sslmode TEXT NOT NULL DEFAULT 'require',
+        password_ref TEXT NOT NULL,            -- key into the encrypted secret store
+        created_utc TEXT NOT NULL
+    );
+    CREATE TABLE runs (
+        run_id TEXT PRIMARY KEY,
+        label TEXT, edition TEXT, tshirt_size TEXT, mode TEXT,
+        workload_type TEXT, status TEXT,
+        tags TEXT, ticket TEXT, owner TEXT, environment TEXT,
+        peak_qps REAL, created_utc TEXT, finished_utc TEXT, source TEXT
+    );
+    CREATE TABLE jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,                    -- run | soak
+        state TEXT NOT NULL DEFAULT 'queued',  -- queued|running|done|failed|canceled
+        spec_yaml TEXT NOT NULL,               -- never contains a secret (password_env only)
+        target_id INTEGER REFERENCES targets(id),
+        run_id TEXT,
+        resume_run_id TEXT,                    -- set => worker adds --resume --run-dir
+        scheduled_utc TEXT,
+        created_utc TEXT NOT NULL,
+        started_utc TEXT, finished_utc TEXT,
+        pid INTEGER, exit_code INTEGER, error TEXT,
+        requested_by TEXT
+    );
+    CREATE TABLE templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+        spec_yaml TEXT NOT NULL, created_utc TEXT NOT NULL, created_by TEXT,
+        UNIQUE(name, version)
+    );
+    CREATE TABLE audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_utc TEXT NOT NULL, username TEXT, action TEXT NOT NULL,
+        target TEXT, detail TEXT
+    );
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE INDEX idx_jobs_state ON jobs(state);
+    CREATE INDEX idx_runs_created ON runs(created_utc);
+    """),
+]
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    """Open SQLite with WAL + foreign keys + row access by name."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _applied(conn: sqlite3.Connection) -> set[int]:
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                 "(version INTEGER PRIMARY KEY, applied_utc TEXT)")
+    return {r[0] for r in conn.execute("SELECT version FROM schema_migrations")}
+
+
+def migrate(db_path: Path) -> int:
+    """Apply pending migrations in order; returns how many were applied."""
+    from pgbench_webapp.util import utc_now_iso
+
+    conn = connect(db_path)
+    try:
+        done = _applied(conn)
+        n = 0
+        for version, sql in sorted(MIGRATIONS):
+            if version in done:
+                continue
+            # connect() is autocommit; executescript commits its own statements.
+            conn.executescript(sql)
+            conn.execute("INSERT INTO schema_migrations(version, applied_utc) VALUES (?, ?)",
+                         (version, utc_now_iso()))
+            n += 1
+        return n
+    finally:
+        conn.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m pgbench_webapp.db migrate` — run by the installer on update."""
+    args = argv if argv is not None else sys.argv[1:]
+    cfg = load_config()
+    ensure_dirs(cfg)
+    if args and args[0] == "migrate":
+        applied = migrate(cfg.db_path)
+        print(f"migrations: applied {applied} (db={cfg.db_path})")
+        return 0
+    print("usage: python -m pgbench_webapp.db migrate", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

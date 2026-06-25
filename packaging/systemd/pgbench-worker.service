@@ -1,0 +1,39 @@
+[Unit]
+Description=pgbench-harness queue worker (runs sysbench / psql jobs)
+Documentation=file:///opt/pgbench-harness/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgbench
+Group=pgbench
+WorkingDirectory=/opt/pgbench-harness
+EnvironmentFile=/etc/pgbench-harness.env
+ExecStart=/opt/pgbench-harness/venv/bin/pgbench-worker
+Restart=on-failure
+RestartSec=3
+# Benchmark runs can be long; give the worker time to finish/cleanup a job
+# on stop before it is killed.
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+# --- Hardening ---
+# The worker spawns external processes (sysbench, psql, the pgbench-harness
+# CLI) and reads the sysbench-tpcc checkout, so it is deliberately less
+# locked-down than the web unit: PrivateTmp is OFF (some tools write to a
+# shared /tmp), and ReadWritePaths includes the data dir + log dir. We keep
+# the rest of the filesystem read-only via ProtectSystem=strict.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=false
+ReadWritePaths=/var/lib/pgbench-harness /var/log/pgbench-harness
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+
+[Install]
+WantedBy=multi-user.target

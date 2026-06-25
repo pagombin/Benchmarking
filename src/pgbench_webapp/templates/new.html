@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}New run — pgbench-harness{% endblock %}
+{% block content %}
+<h1>New run</h1>
+<div class="grid2">
+  <div class="card">
+    <h2>Guided</h2>
+    <label>Preset
+      <select id="preset">
+        <option value="">— none —</option>
+        {% for name in presets %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Label <input id="g_label" placeholder="advanced-8c32g-tpcc"></label>
+    <div class="row">
+      <label>Edition
+        <select id="g_edition"><option>advanced</option><option>standard</option></select></label>
+      <label>T-shirt size <input id="g_size" value="8c32g"></label>
+    </div>
+    <label>Mode
+      <select id="g_mode"><option value="sweep">sweep</option><option value="soak">soak</option></select></label>
+    <div class="row">
+      <label>Tags (comma) <input id="g_tags" placeholder="nightly,tpcc"></label>
+      <label>Ticket <input id="g_ticket" placeholder="DBAAS-1234"></label>
+    </div>
+    <button class="link" id="scaffold">↧ scaffold YAML from these fields</button>
+    <hr>
+    <h2>Target password</h2>
+    <label>DB password (stored encrypted, never written to spec/DB/report)
+      <input id="g_password" type="password" autocomplete="off"></label>
+    <p class="muted">Injected as <code>PGB_TARGET_PASSWORD</code> at run time only.</p>
+  </div>
+
+  <div class="card">
+    <h2>Spec (YAML)</h2>
+    <textarea id="spec" spellcheck="false" rows="22" placeholder="# paste or scaffold a spec"></textarea>
+    <div id="validate_out" class="out"></div>
+    <div class="actions">
+      <button class="link" id="btn_validate">Validate</button>
+      <button class="link" id="btn_dryrun">Dry-run</button>
+      {% if can_run %}<button class="primary" id="btn_start">Start run</button>
+      {% else %}<span class="muted">viewer role: read-only</span>{% endif %}
+    </div>
+    <pre id="dryrun_out" class="out mono"></pre>
+  </div>
+</div>
+<script>window.PRESETS = {{ presets|tojson }}; window.CSRF = "{{ csrf }}";</script>
+{% endblock %}

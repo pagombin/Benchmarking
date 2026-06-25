@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}pgbench-harness{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">pgbench<span>-harness</span></div>
+  {% if user %}
+  <nav>
+    <a href="/">History</a>
+    <a href="/new">New run</a>
+    <a href="/compare">Compare</a>
+    {% if role == 'admin' %}<a href="/admin/users">Users</a><a href="/audit">Audit</a>{% endif %}
+  </nav>
+  <div class="who">
+    <span class="role role-{{ role }}">{{ role }}</span> {{ user }}
+    <form method="post" action="/logout" class="inline">
+      <input type="hidden" name="{{ 'csrf_token' }}" value="{{ csrf }}">
+      <button class="link">log out</button>
+    </form>
+    <button id="themeToggle" class="link" title="toggle theme">◐</button>
+  </div>
+  {% endif %}
+</header>
+{% block banner %}{% endblock %}
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>pgbench-harness {{ version }} · self-signed TLS — verify the fingerprint shown at install.
+Times are UTC.</footer>
+<script src="/static/app.js"></script>
+{% block script %}{% endblock %}
+</body>
+</html>

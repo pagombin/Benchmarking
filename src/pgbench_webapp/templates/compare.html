@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Compare — pgbench-harness{% endblock %}
+{% block content %}
+<h1>Compare runs</h1>
+<p class="muted">Select two or more runs, then compare. Cross-loadgen runs merged into
+this history can be compared too (e.g. standard vs advanced, single vs multi-node).</p>
+<form id="cmpform">
+<div class="card">
+  <table>
+    <thead><tr><th></th><th>Run</th><th>Label</th><th>Edition</th><th>Mode</th><th>Peak QPS</th></tr></thead>
+    <tbody>
+    {% for r in runs %}
+    <tr><td><input type="checkbox" name="run" value="{{ r.run_id }}"></td>
+      <td>{{ r.run_id }}</td><td>{{ r.label }}</td><td>{{ r.edition }}</td><td>{{ r.mode }}</td>
+      <td>{{ '%.0f'|format(r.peak_qps) if r.peak_qps else '—' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<button class="primary" id="cmpgo">Compare selected</button>
+</form>
+{% endblock %}

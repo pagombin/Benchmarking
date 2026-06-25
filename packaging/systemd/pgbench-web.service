@@ -1,0 +1,40 @@
+[Unit]
+Description=pgbench-harness web UI (uvicorn, TLS)
+Documentation=file:///opt/pgbench-harness/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgbench
+Group=pgbench
+WorkingDirectory=/opt/pgbench-harness
+EnvironmentFile=/etc/pgbench-harness.env
+ExecStart=/opt/pgbench-harness/venv/bin/pgbench-web
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# --- Hardening ---
+# ProtectSystem=strict makes the entire filesystem read-only except the paths
+# listed in ReadWritePaths. The data dir holds the sqlite db, results, secret
+# key and TLS material; the log dir is for the install/app logs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pgbench-harness /var/log/pgbench-harness
+# Binding 8443 (>1024) needs no extra capability, but be explicit:
+AmbientCapabilities=
+CapabilityBoundingSet=
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target

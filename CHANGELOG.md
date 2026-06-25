@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.0
+
+### Self-hosted web application (new `pgbench_webapp` package)
+Browser UI + JSON API over the harness, installed/run entirely on a droplet over
+HTTPS. The CLI is unchanged and remains a first-class entry point; the web tier
+**calls the harness library** (validator, dry-run, report/compare, mark) rather
+than duplicating logic.
+- **Stack:** FastAPI + Uvicorn (TLS), SQLite control-plane (index/queue/audit;
+  the filesystem `results/` stays the source of truth), server-rendered UI with
+  dependency-free inline JS (live canvas chart + SSE) so downloaded reports stay
+  offline-viewable.
+- **Execution model:** DB-backed job queue + a **separate worker** (systemd), so
+  a run survives web restarts/disconnects; the worker shells out to the CLI and
+  reuses `--resume`. Cancel = graceful SIGTERM.
+- **Lifecycle from the UI:** guided + raw-YAML config (same validator), import/
+  export YAML, dry-run preview, start run/soak, one-click **mark** (failover/
+  scale, same read-time UTC clock), cancel, resume; **live progress** via SSE
+  (log tail + per-second chart) that catches up on reconnect.
+- **Reports & history:** on-demand report generation (view inline + download),
+  filterable/sortable run history backed by a filesystem reconcile (CLI-created
+  runs appear too), compare 2+ runs, artifact tarball download.
+- **Auth/RBAC:** bcrypt-hashed users; roles admin/operator/viewer enforced at
+  every route; HTTP Basic (API) + secure session cookies (browser); CSRF on
+  state-changing cookie requests; rate-limited login; HSTS + CSP security headers.
+- **Secrets:** DB password (and future DO/SMTP/Slack/SSH creds) live Fernet-
+  encrypted in `secrets.enc` (0600) keyed by `secret.key`; the DB stores only a
+  reference; injected to the child env at exec time. The leak gate is **extended**
+  to assert no secret lands in `results/`, the DB, logs, audit, or API responses.
+- **Audit log:** append-only record of every state-changing action (login, run
+  start/cancel/resume, mark, user changes), viewable + CSV export (admin).
+- **Installer:** `deploy.sh` (idempotent install/update/uninstall, self-signed
+  SAN cert + fingerprint, systemd units, migrations, admin bootstrap, DO firewall
+  guidance); see `OPERATIONS.md`.
+
+### New (optional, backward-compatible) run-spec fields
+- `run.tags` (list), `run.environment`, `run.ticket`, `run.owner` — for history
+  filtering and grouping. Existing specs keep working unchanged.
+
 ## 0.6.0
 
 ### Soak/resilience bug fixes (from a full audit)

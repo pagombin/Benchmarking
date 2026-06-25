@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Audit — pgbench-harness{% endblock %}
+{% block content %}
+<h1>Audit log</h1>
+<p><a class="btn" href="/audit/export.csv">Export CSV</a></p>
+<div class="card">
+  <table>
+    <thead><tr><th>When (UTC)</th><th>User</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+    <tr><td class="mono">{{ r.ts_utc }}</td><td>{{ r.username or '—' }}</td>
+      <td>{{ r.action }}</td><td>{{ r.target }}</td><td class="muted">{{ r.detail }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

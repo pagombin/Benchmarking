@@ -107,6 +107,10 @@ run:
   edition: advanced                       # required; standard | advanced (metadata only)
   tshirt_size: 8c32g                      # required; metadata only
   notes: "baseline, operator defaults"    # optional; lands in the report header
+  tags: [nightly, tpcc]                    # optional; free-form, for history filtering/grouping
+  environment: prod-like                   # optional; e.g. staging / prod-like
+  ticket: DBAAS-1234                       # optional; tracking reference
+  owner: pat                               # optional; who owns the run
 
 target:
   host: private-xyz.db.ondigitalocean.com # required
@@ -350,6 +354,42 @@ verdict. The whole-run chart is decimated (with per-bucket minimums preserved)
 so even an 8-hour run stays legible, with a full-resolution zoom per event.
 Artifacts (`parsed/soak_timeseries.csv`, `parsed/soak_summary.json`,
 `events.jsonl`) are shaped for later single-node-vs-multi-node overlay.
+
+## Web application (self-hosted UI)
+
+The CLI above is the engine; a self-hosted **web app** wraps it so the whole
+workflow — configure, validate, dry-run, run/soak, watch live progress, mark
+failover/scale events, view/download reports, browse history, compare — happens
+in a browser over HTTPS, with no SSH or scp. It's installed and run entirely on
+a droplet; the CLI keeps working standalone.
+
+```bash
+sudo ./deploy.sh                 # fresh install (or: sudo ./deploy.sh --update)
+# prints the HTTPS URL (https://<public-ip>:8443), the self-signed cert
+# fingerprint to verify, and the DigitalOcean firewall rule to open the port.
+```
+
+- **Stack:** FastAPI + Uvicorn (TLS), a SQLite control-plane (run index, job
+  queue, audit) — the filesystem `results/` tree stays the source of truth — and
+  a separate **worker** service so runs survive web restarts and browser
+  disconnects. The worker shells out to this CLI and reuses `--resume`.
+- **Auth/RBAC:** single admin at install; add `operator` (run control) and
+  `viewer` (read-only) users in the UI. HTTP Basic for the API, secure session
+  cookies + CSRF for the browser; rate-limited login; HSTS/CSP headers.
+- **Secrets:** the DB password is captured in the UI and stored Fernet-encrypted
+  (`secrets.enc`, 0600) — never in the spec, DB, logs, reports, or audit; it's
+  injected into the child env at run time exactly as the CLI does.
+- **Live view:** per-second TPS chart + log tail over SSE that catches up on
+  reconnect; soak event markers land the instant you click "Mark failover".
+
+Install, update, cert-trust, firewall, backup, RBAC, and troubleshooting are
+documented in **[OPERATIONS.md](OPERATIONS.md)**. Data lives under
+`/var/lib/pgbench-harness` (results + `pgbench.db` + `secret.key` + certs);
+updates never touch it.
+
+Run the web app for local development with `pip install -e '.[web]'` then
+`pgbench-web` (and `pgbench-worker` in a second shell); both read `PGBENCH_*`
+environment variables (see `OPERATIONS.md`).
 
 ## Development
 

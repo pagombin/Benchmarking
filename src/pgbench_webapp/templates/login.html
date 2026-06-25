@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Sign in — pgbench-harness{% endblock %}
+{% block content %}
+<div class="card login">
+  <h1>Sign in</h1>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="post" action="/login">
+    <label>Username<input name="username" autofocus autocomplete="username"></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password"></label>
+    <button class="primary">Sign in</button>
+  </form>
+  <p class="muted">This server uses a self-signed certificate. Verify its SHA-256
+  fingerprint (shown by the installer) before trusting it.</p>
+</div>
+{% endblock %}
