@@ -14,6 +14,16 @@ stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
   app shell with auth bootstrap; the Runs (history) view ported. New JSON APIs
   `GET /api/me`, `GET /api/runs`, `GET /api/jobs` (the jobs API never exposes
   `spec_yaml`). Served at `/ui/*`.
+- **Phase 2 — live cockpit:** a real-time run view fed by SSE — multi-series
+  uPlot charts (TPS/QPS on dual axes, p99 latency, errors/s + reconnects/s),
+  live progress (elapsed vs planned budget, level completion), and a first-class
+  console pane (filter, follow, severity highlighting). The stream is now
+  **incremental** (`hello`/`log`/`samples`-with-row-offset/`progress`/`done`) —
+  no more re-sending the last 300 samples every second, and reconnect catches up
+  cleanly. New `GET /api/runs/{id}`; `max_concurrency` is now settable via
+  `GET/POST /api/settings[/concurrency]` (admin) so several clusters can run at
+  once. Per-run actions (report/spec/artifacts/mark/resume/cancel) are a coherent
+  surface on the detail page.
 
 ## 0.8.0
 

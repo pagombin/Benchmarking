@@ -202,6 +202,41 @@ label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px
 .login-wrap { display: grid; place-items: center; min-height: 100vh; padding: 20px; }
 .login-card { width: 360px; max-width: 100%; }
 
+/* ── run cockpit ── */
+.meta-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 16px; align-items: center; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 3px 10px; border-radius: 999px; background: var(--surface-2);
+  border: 1px solid var(--line); color: var(--ink-dim);
+}
+.live-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); display: inline-block; }
+.live-chip .dot.on { background: var(--live); box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 60%, transparent); animation: live 1.6s ease-out infinite; }
+@keyframes live { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 55%, transparent); } 100% { box-shadow: 0 0 0 7px transparent; } }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+
+.progress-line { display: flex; align-items: center; gap: 12px; }
+.progress-line .bar { flex: 1; height: 8px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.progress-line .fill { height: 100%; background: linear-gradient(90deg, var(--live), var(--brand)); border-radius: 999px; transition: width 0.6s ease; }
+
+.chart { width: 100%; }
+.uplot, .uplot * { font-family: var(--font-mono) !important; }
+.u-title { color: var(--ink-dim) !important; font-size: 13px !important; font-weight: 600 !important; font-family: var(--font-sans) !important; }
+.u-legend { color: var(--ink-dim); font-size: 12px; }
+
+.logpane {
+  background: #0a0e14; color: #cdd9e5; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 10px 12px; height: 320px; overflow: auto;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+}
+[data-theme="light"] .logpane { background: #0d1117; color: #d6dee8; }
+.logpane .lg { white-space: pre-wrap; word-break: break-word; }
+.logpane .lg-err { color: #ff8389; }
+.logpane .lg-warn { color: #e3b341; }
+.log-search { width: 160px; padding: 4px 8px; font-size: 12px; }
+.follow { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); margin: 0; }
+.follow input { width: auto; }
+
 /* keyboard focus visibility (quality floor) */
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

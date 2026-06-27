@@ -254,6 +254,36 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         rows = queries.list_runs(conn, " AND ".join(where), tuple(params))
         return JSONResponse([dict(r) for r in rows])
 
+    @app.get("/api/runs/{run_id}")
+    def api_get_run(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
+                    user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        r = queries.get_run(conn, run_id)
+        if r is None:
+            raise HTTPException(404, "run not found")
+        return JSONResponse(dict(r))
+
+    # Concurrency: how many runs the worker executes at once (the max_concurrency
+    # guard). Default 1; raise it to run against several clusters simultaneously.
+    @app.get("/api/settings")
+    def api_settings(conn: sqlite3.Connection = Depends(get_conn),
+                     user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        return JSONResponse({"max_concurrency":
+                             int(queries.get_setting(conn, "max_concurrency", "1") or 1)})
+
+    @app.post("/api/settings/concurrency")
+    def api_set_concurrency(request: Request, payload: dict,
+                            conn: sqlite3.Connection = Depends(get_conn),
+                            user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        try:
+            value = max(1, min(16, int(payload.get("value", 1))))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "value must be an integer 1–16")
+        queries.set_setting(conn, "max_concurrency", str(value))
+        queries.audit(conn, user["username"], "settings_update", target="max_concurrency",
+                      detail=str(value))
+        return JSONResponse({"max_concurrency": value})
+
     _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by",
                    "scheduled_utc", "created_utc", "started_utc", "finished_utc", "error")
 
@@ -590,22 +620,36 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
 
 def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]:
-    """Server-sent events: stream harness.log tail + latest samples until terminal.
+    """Server-sent events for the live cockpit.
 
-    On (re)connect the client gets a fresh snapshot, so EventSource auto-reconnect
-    catches up with no lost state. Terminates when the run reaches a terminal status.
+    Emits ``hello`` once, then incremental ``log`` (byte offset) and ``samples``
+    (row offset — only *new* per-second rows, not a re-send each tick) plus a
+    ``progress`` heartbeat, until the run reaches a terminal status. On
+    EventSource auto-reconnect a fresh generator starts at offset 0, and the
+    ``offset`` field tells the client to reset its buffers and catch up cleanly.
     """
     log = run_dir / "harness.log"
-    sent = 0
+    sent_log = 0
+    sent_rows = 0
+    cur_file: Optional[str] = None
+    budget_s = _planned_budget_s(run_dir)
+    yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
+                           "status": _run_status(run_dir), "budget_s": budget_s})
     for _ in range(max_ticks):
         if log.exists():
             text = log.read_text(encoding="utf-8", errors="replace")
-            if len(text) > sent:
-                yield _event("log", text[sent:])
-                sent = len(text)
-        samples = _latest_samples(run_dir)
-        if samples is not None:
-            yield _event("samples", samples)
+            if len(text) > sent_log:
+                yield _event("log", text[sent_log:])
+                sent_log = len(text)
+        rel, header, data = _read_samples(run_dir)
+        if rel is not None:
+            if rel != cur_file:          # first/swapped file -> client resets
+                cur_file, sent_rows = rel, 0
+            if len(data) > sent_rows:
+                yield _event("samples", {"file": rel, "header": header,
+                                         "offset": sent_rows, "rows": data[sent_rows:]})
+                sent_rows = len(data)
+        yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
             yield _event("done", {"status": status})
@@ -628,19 +672,55 @@ def _epoch(iso: Optional[str]) -> int:
         return 0
 
 
-def _run_status(run_dir: Path) -> str:
+def _manifest(run_dir: Path) -> dict:
     try:
-        return json.loads((run_dir / "manifest.json").read_text()).get("status", "")
+        return dict(json.loads((run_dir / "manifest.json").read_text()))
     except (OSError, ValueError):
-        return ""
+        return {}
 
 
-def _latest_samples(run_dir: Path) -> Optional[dict]:
-    """Tail the per-second samples for the live chart (sweep or soak)."""
+def _run_status(run_dir: Path) -> str:
+    return str(_manifest(run_dir).get("status", ""))
+
+
+def _run_mode(run_dir: Path) -> str:
+    return str(_manifest(run_dir).get("mode", "sweep"))
+
+
+def _planned_budget_s(run_dir: Path) -> int:
+    """Planned wall-clock budget from the spec (for live ETA); 0 if unknown."""
+    spec = run_dir / "spec.yaml"
+    if not spec.exists():
+        return 0
+    try:
+        return int(harness_api.dry_run(spec.read_text(encoding="utf-8")).get("budget_s", 0))
+    except Exception:  # noqa: BLE001  (ETA is best-effort, never breaks the stream)
+        return 0
+
+
+def _progress(run_dir: Path, budget_s: int) -> dict:
+    """Live progress snapshot: status, elapsed, budget, and level completion."""
+    m = _manifest(run_dir)
+    status = str(m.get("status", ""))
+    created = _epoch(m.get("created_utc"))
+    if status in ("complete", "partial", "failed", "canceled"):
+        elapsed = int(m.get("wall_time_s") or 0)
+    else:
+        now = int(datetime.now(timezone.utc).timestamp())
+        elapsed = max(0, now - created) if created else 0
+    levels = m.get("levels") or []
+    done = sum(1 for lv in levels if lv.get("status") in ("ok", "failed"))
+    current = next((f"{lv.get('threads')}t" for lv in levels if lv.get("status") == "running"), "")
+    return {"status": status, "elapsed_s": elapsed, "budget_s": budget_s,
+            "levels_total": len(levels), "levels_done": done, "current": current}
+
+
+def _read_samples(run_dir: Path) -> tuple[Optional[str], str, list[str]]:
+    """Return (relpath, header, data_rows) for the active samples file, or (None,'',[])."""
     for rel in ("parsed/soak_timeseries.csv", "parsed/samples.csv"):
         p = run_dir / rel
         if p.exists():
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
             if len(lines) > 1:
-                return {"file": rel, "header": lines[0], "rows": lines[-300:]}
-    return None
+                return rel, lines[0], lines[1:]
+    return None, "", []

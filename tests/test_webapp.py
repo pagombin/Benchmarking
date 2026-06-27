@@ -431,3 +431,38 @@ def test_spa_shell_served_under_ui(web):
     m = re.search(r"/static/spa/assets/[\w.-]+\.js", root.text)
     assert m, "no JS asset reference in shell"
     assert client.get(m.group(0)).status_code == 200
+
+
+# ── cockpit (Phase 2: single-run API, concurrency, incremental SSE) ─────
+
+def test_api_get_single_run(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    r = client.get(f"/api/runs/{run_id}", auth=("viewer", "vpw"))
+    assert r.status_code == 200 and r.json()["run_id"] == run_id
+    assert client.get("/api/runs/does-not-exist", auth=("viewer", "vpw")).status_code == 404
+
+
+def test_concurrency_setting_rbac_and_clamp(web):
+    client, _ = web
+    assert client.get("/api/settings", auth=("viewer", "vpw")).json()["max_concurrency"] == 1
+    # operator cannot change it; admin can; value clamps to 1..16
+    assert client.post("/api/settings/concurrency", json={"value": 4}, auth=("op", "oppw")).status_code == 403
+    r = client.post("/api/settings/concurrency", json={"value": 99}, auth=("admin", "apw"))
+    assert r.status_code == 200 and r.json()["max_concurrency"] == 16
+    assert client.get("/api/settings", auth=("admin", "apw")).json()["max_concurrency"] == 16
+
+
+def test_sse_emits_hello_progress_and_incremental_samples(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    body = client.get(f"/runs/{run_id}/stream", auth=("viewer", "vpw")).text
+    assert "event: hello" in body
+    assert "event: progress" in body
+    assert "event: done" in body
+    # samples are sent incrementally with a row offset (not a 300-row re-send)
+    assert "event: samples" in body and '"offset"' in body

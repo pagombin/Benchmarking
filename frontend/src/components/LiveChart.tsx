@@ -1,0 +1,93 @@
+import { useEffect, useRef } from "react";
+import uPlot from "uplot";
+import "uplot/dist/uPlot.min.css";
+
+export interface ChartSeries {
+  label: string;
+  values: number[];
+  stroke: string;
+  scale?: string; // y-scale key; series on a different key get a right-hand axis
+}
+
+interface Props {
+  title: string;
+  xs: number[]; // elapsed seconds
+  series: ChartSeries[];
+  height?: number;
+  yFormat?: (v: number) => string;
+}
+
+// Axis/grid colours that read on both themes (mid-grey, low-alpha grid).
+const AXIS = "#8b97a6";
+const GRID = "rgba(139,151,166,0.16)";
+
+export function LiveChart({ title, xs, series, height = 220, yFormat }: Props) {
+  const host = useRef<HTMLDivElement>(null);
+  const plot = useRef<uPlot | null>(null);
+
+  // (Re)create the plot when the *shape* (series identity) changes.
+  useEffect(() => {
+    if (!host.current) return;
+    const el = host.current;
+    const fmt = (vals: number[]) => (yFormat ? vals.map((v) => yFormat(v)) : vals.map(String));
+    const hasRight = series.some((s) => s.scale === "y2");
+    const axes: uPlot.Axis[] = [
+      {
+        stroke: AXIS, grid: { stroke: GRID, width: 1 }, ticks: { stroke: GRID },
+        values: (_u, vals) => vals.map((v) => `${v}s`),
+        font: "11px 'IBM Plex Mono', monospace",
+      },
+      {
+        scale: "y", stroke: AXIS, grid: { stroke: GRID, width: 1 }, ticks: { stroke: GRID },
+        values: (_u, vals) => fmt(vals), font: "11px 'IBM Plex Mono', monospace", size: 56,
+      },
+    ];
+    if (hasRight) {
+      axes.push({
+        scale: "y2", side: 1, stroke: AXIS, grid: { show: false }, ticks: { stroke: GRID },
+        values: (_u, vals) => fmt(vals), font: "11px 'IBM Plex Mono', monospace", size: 56,
+      });
+    }
+    const opts: uPlot.Options = {
+      title,
+      width: el.clientWidth || 600,
+      height,
+      cursor: { drag: { x: true, y: false } },
+      legend: { live: true },
+      scales: { x: { time: false } },
+      axes,
+      series: [
+        {},
+        ...series.map((s) => ({
+          label: s.label,
+          stroke: s.stroke,
+          width: 1.6,
+          scale: s.scale ?? "y",
+          points: { show: false },
+        })),
+      ],
+    };
+    const data: uPlot.AlignedData = [xs, ...series.map((s) => s.values)];
+    plot.current = new uPlot(opts, data, el);
+
+    const ro = new ResizeObserver(() => {
+      if (plot.current) plot.current.setSize({ width: el.clientWidth, height });
+    });
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      plot.current?.destroy();
+      plot.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [title, series.length, height]);
+
+  // Stream data in on every update without rebuilding the plot.
+  useEffect(() => {
+    if (plot.current) {
+      plot.current.setData([xs, ...series.map((s) => s.values)] as uPlot.AlignedData);
+    }
+  }, [xs, series]);
+
+  return <div className="chart" ref={host} />;
+}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { Job, Me, Run } from "../types";
 import { fmtInt, fmtWhen, relAge } from "../lib/format";
@@ -99,7 +100,7 @@ export function History({ me }: { me: Me }) {
                   <td className="mono">{j.id}</td>
                   <td>{j.kind}</td>
                   <td><span className={`badge ${j.state}`}>{j.state}</span></td>
-                  <td>{j.run_id ? <a href={`/runs/${j.run_id}`}>{j.run_id}</a> : "—"}</td>
+                  <td>{j.run_id ? <Link className="mono" to={`/runs/${j.run_id}`}>{j.run_id}</Link> : "—"}</td>
                   <td className="mono">{j.requested_by}</td>
                   <td className="mono subtle">{j.scheduled_utc ? fmtWhen(j.scheduled_utc) : "now"}</td>
                   <td style={{ textAlign: "right" }}>
@@ -143,7 +144,7 @@ export function History({ me }: { me: Me }) {
             ) : (
               filtered.map((r) => (
                 <tr key={r.run_id}>
-                  <td><a className="mono" href={`/runs/${r.run_id}`}>{r.run_id}</a></td>
+                  <td><Link className="mono" to={`/runs/${r.run_id}`}>{r.run_id}</Link></td>
                   <td>{r.label || "—"}</td>
                   <td>{r.edition || "—"}</td>
                   <td>{r.mode}</td>

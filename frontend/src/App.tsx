@@ -4,6 +4,7 @@ import { api } from "./api";
 import type { Me } from "./types";
 import { Shell } from "./components/Shell";
 import { History } from "./pages/History";
+import { RunDetail } from "./pages/RunDetail";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -33,6 +34,7 @@ export function App() {
       <Shell me={me}>
         <Routes>
           <Route path="/" element={<History me={me} />} />
+          <Route path="/runs/:runId" element={<RunDetail me={me} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Shell>
