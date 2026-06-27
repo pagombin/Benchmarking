@@ -500,6 +500,36 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return Response(out.read_text(encoding="utf-8"), media_type="text/html",
                         headers={"Content-Disposition": f'attachment; filename="{run_id}-{out.name}"'})
 
+    @app.get("/api/runs/{run_id}/summary")
+    def api_run_summary(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Parsed run data for the interactive in-app report (manifest + summary)."""
+        run_dir = cfg.results_dir / run_id
+        man = run_dir / "manifest.json"
+        if not man.exists():
+            raise HTTPException(404, "run not found")
+        manifest = json.loads(man.read_text(encoding="utf-8"))
+        mode = manifest.get("mode", "sweep")
+        sp = run_dir / "parsed" / ("soak_summary.json" if mode == "soak" else "summary.json")
+        summary = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+        return JSONResponse({"mode": mode, "manifest": manifest, "summary": summary,
+                             "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists()})
+
+    _CSV_FILES = {"samples": "parsed/samples.csv",
+                  "timeseries": "parsed/soak_timeseries.csv",
+                  "pg": "parsed/pg_timeseries.csv"}
+
+    @app.get("/runs/{run_id}/csv")
+    def run_csv(run_id: str, which: str = "samples",
+                user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+        rel = _CSV_FILES.get(which)
+        if rel is None:
+            raise HTTPException(400, f"unknown csv '{which}'")
+        p = cfg.results_dir / run_id / rel
+        if not p.exists():
+            raise HTTPException(404, "no such data for this run")
+        return Response(p.read_text(encoding="utf-8"), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{run_id}-{which}.csv"'})
+
     @app.get("/runs/{run_id}/spec")
     def run_spec(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
         p = cfg.results_dir / run_id / "spec.yaml"

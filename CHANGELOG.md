@@ -2,6 +2,17 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Phase 6 — reports (interactive view + CSV/print, offline kept):** the report
+  page is now tabbed — an **Interactive** in-app view (KPI band; QPS/TPS-vs-threads
+  and latency-vs-threads uPlot charts on dual axes; per-level table; a
+  **Provenance** card with server version, max_connections, sysbench/psql/tpcc
+  SHAs and dataset; soak shows baseline + per-event disruption metrics) reading a
+  new `GET /api/runs/{id}/summary`, plus the **Classic** tab that renders the
+  existing self-contained matplotlib report inline (offline-portability kept). A
+  **Print / PDF** action (print stylesheet hides chrome; prints the classic report
+  via the iframe) and **Export CSV** downloads (`/runs/{id}/csv?which=samples|
+  timeseries|pg`). This completes the console (phases 1–7).
+
 A ground-up **operator console** (React + Vite + TypeScript SPA, served by FastAPI
 as prebuilt static assets — no Node on the droplet) is being built in reviewable
 phases alongside the existing UI. The classic server-rendered pages keep working

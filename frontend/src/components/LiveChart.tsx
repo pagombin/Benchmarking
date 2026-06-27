@@ -11,17 +11,18 @@ export interface ChartSeries {
 
 interface Props {
   title: string;
-  xs: number[]; // elapsed seconds
+  xs: number[]; // elapsed seconds by default
   series: ChartSeries[];
   height?: number;
   yFormat?: (v: number) => string;
+  xFormat?: (v: number) => string; // default: "<v>s"
 }
 
 // Axis/grid colours that read on both themes (mid-grey, low-alpha grid).
 const AXIS = "#8b97a6";
 const GRID = "rgba(139,151,166,0.16)";
 
-export function LiveChart({ title, xs, series, height = 220, yFormat }: Props) {
+export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
 
@@ -34,7 +35,7 @@ export function LiveChart({ title, xs, series, height = 220, yFormat }: Props) {
     const axes: uPlot.Axis[] = [
       {
         stroke: AXIS, grid: { stroke: GRID, width: 1 }, ticks: { stroke: GRID },
-        values: (_u, vals) => vals.map((v) => `${v}s`),
+        values: (_u, vals) => vals.map((v) => (xFormat ? xFormat(v) : `${v}s`)),
         font: "11px 'IBM Plex Mono', monospace",
       },
       {

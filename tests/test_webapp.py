@@ -579,3 +579,19 @@ def test_sse_streams_pg_metrics(web):
     pg.write_text("t,active,total_conn,xacts_s,cache_hit_pct,wal_mb_s\n1,8,20,100.0,98.9,0.5\n")
     body = client.get(f"/runs/{run_id}/stream", auth=("viewer", "vpw")).text
     assert "event: pg" in body and "cache_hit_pct" in body
+
+
+def test_interactive_report_summary_and_csv(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    body = client.get(f"/api/runs/{run_id}/summary", auth=("viewer", "vpw"))
+    assert body.status_code == 200
+    j = body.json()
+    assert j["mode"] in ("sweep", "soak") and "manifest" in j and "summary" in j
+    # CSV export (samples present for a sweep run); bad name -> 400; missing run -> 404
+    csv = client.get(f"/runs/{run_id}/csv?which=samples", auth=("viewer", "vpw"))
+    assert csv.status_code == 200 and "t_offset" in csv.text
+    assert client.get(f"/runs/{run_id}/csv?which=bogus", auth=("viewer", "vpw")).status_code == 400
+    assert client.get("/api/runs/nope/summary", auth=("viewer", "vpw")).status_code == 404

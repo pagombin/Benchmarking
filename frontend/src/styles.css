@@ -286,6 +286,23 @@ pre.out.dry { background: #0a0e14; color: #cdd9e5; padding: 10px 12px; border-ra
   padding-bottom: 6px; border-bottom: 1px solid var(--line); }
 .section-label .subtle { font-weight: 400; }
 
+/* ── export menu (details/summary popover) ── */
+.menu { position: relative; }
+.menu > summary { list-style: none; cursor: pointer; }
+.menu > summary::-webkit-details-marker { display: none; }
+.menu-pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; min-width: 190px;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
+  box-shadow: var(--shadow); padding: 6px; display: flex; flex-direction: column; }
+.menu-pop a { padding: 7px 10px; border-radius: 6px; color: var(--ink); font-size: 13px; }
+.menu-pop a:hover { background: var(--surface-3); text-decoration: none; }
+
+/* ── print / PDF ── */
+@media print {
+  .topbar, .foot, .no-print { display: none !important; }
+  main.page { max-width: none; margin: 0; padding: 0; }
+  .card { break-inside: avoid; box-shadow: none; }
+}
+
 /* keyboard focus visibility (quality floor) */
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
