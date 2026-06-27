@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { Me, Target } from "../types";
@@ -8,13 +8,26 @@ function toYaml(o: Record<string, unknown>, indent = ""): string {
   const lines: string[] = [];
   for (const [k, v] of Object.entries(o)) {
     if (v === undefined || v === null || v === "") continue;
-    if (Array.isArray(v)) lines.push(`${indent}${k}: [${v.join(", ")}]`);
+    if (Array.isArray(v)) lines.push(`${indent}${k}: [${v.map(yamlScalar).join(", ")}]`);
     else if (typeof v === "object") {
       const inner = toYaml(v as Record<string, unknown>, indent + "  ");
       if (inner) { lines.push(`${indent}${k}:`); lines.push(inner); }
-    } else lines.push(`${indent}${k}: ${v}`);
+    } else lines.push(`${indent}${k}: ${yamlScalar(v)}`);
   }
   return lines.join("\n");
+}
+
+// Quote a scalar when it would otherwise be misparsed as YAML (contains `:` `#`,
+// leading/trailing space, a leading indicator char, or looks like a bool/number).
+// JSON double-quoting is valid YAML flow-scalar syntax.
+function yamlScalar(v: unknown): string {
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  const s = String(v);
+  const needsQuote =
+    s === "" || /[:#\[\]{}&*!|>'"%@`,]/.test(s) || /^[\s\-?]/.test(s) || /\s$/.test(s) ||
+    ["true", "false", "null", "yes", "no", "on", "off", "~"].includes(s.toLowerCase()) ||
+    /^[+-]?(\d|\.\d)/.test(s);   // numeric-looking strings stay strings
+  return needsQuote ? JSON.stringify(s) : s;
 }
 
 const WORKLOADS = ["tpcc", "oltp_read_write", "oltp_read_only", "oltp_write_only"];
@@ -42,7 +55,6 @@ export function NewRun({ me }: { me: Me }) {
   const [validateOut, setValidateOut] = useState<{ ok: boolean; msg: string } | null>(null);
   const [dryOut, setDryOut] = useState("");
   const [err, setErr] = useState<string | null>(null);
-  const firstBuild = useRef(true);
 
   useEffect(() => {
     api.get<Target[]>("/api/targets").then((t) => {
@@ -81,8 +93,7 @@ export function NewRun({ me }: { me: Me }) {
   }, [targetMode, targetId, targets, inline, meta, wl, mode, sweep, soak]);
 
   useEffect(() => {
-    if (autoSync) { setYaml(toYaml(doc) + "\n"); }
-    firstBuild.current = false;
+    if (autoSync) setYaml(toYaml(doc) + "\n");
   }, [doc, autoSync]);
 
   async function validate() {
@@ -102,23 +113,25 @@ export function NewRun({ me }: { me: Me }) {
       setDryOut(`# ${d.mode} — planned wall-clock ~${Math.round(d.budget_s / 60)} min (${d.budget_s}s)\n` + d.commands.join("\n"));
     } catch (e) { setDryOut("error: " + (e as Error).message); }
   }
+  function credBody(): Record<string, unknown> {
+    if (targetMode === "saved") {
+      if (!targetId) throw new Error("select a saved target first (or choose “Enter host”)");
+      return { target_id: targetId };
+    }
+    if (!inline.host.trim()) throw new Error("enter a host (or choose a saved target)");
+    return { password: inline.password };
+  }
   async function start() {
     setErr(null);
     try {
-      const body: Record<string, unknown> = { spec_yaml: yaml, scheduled_utc: schedule.trim() || null };
-      if (targetMode === "saved") body.target_id = targetId;
-      else body.password = inline.password;
-      await api.post("/api/runs", body);
+      await api.post("/api/runs", { spec_yaml: yaml, scheduled_utc: schedule.trim() || null, ...credBody() });
       window.location.href = "/ui";
     } catch (e) { setErr("could not start: " + (e as Error).message); }
   }
   async function task(kind: "preflight" | "prepare") {
     setErr(null);
     try {
-      const body: Record<string, unknown> = { spec_yaml: yaml };
-      if (targetMode === "saved") body.target_id = targetId;
-      else body.password = inline.password;
-      const d = await api.post<{ job_id: number }>(`/api/${kind}`, body);
+      const d = await api.post<{ job_id: number }>(`/api/${kind}`, { spec_yaml: yaml, ...credBody() });
       navigate(`/jobs/${d.job_id}`);
     } catch (e) { setErr(`could not start ${kind}: ` + (e as Error).message); }
   }

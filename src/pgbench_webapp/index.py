@@ -42,12 +42,15 @@ def _run_row(run_dir: Path) -> Optional[dict[str, Any]]:
         m = json.loads(man.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
+    if not isinstance(m, dict):          # valid JSON but not a manifest object
+        return None
     run_meta: dict[str, Any] = {}
     spec_path = run_dir / "spec.yaml"
     if spec_path.exists():
         try:
-            run_meta = (yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}).get("run", {})
-        except yaml.YAMLError:
+            loaded = (yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}).get("run", {})
+            run_meta = loaded if isinstance(loaded, dict) else {}
+        except (yaml.YAMLError, AttributeError):
             run_meta = {}
     mode = m.get("mode", "sweep")
     workload = ""
@@ -80,7 +83,10 @@ def reconcile(conn: sqlite3.Connection, results_dir: Path) -> int:
     for d in sorted(results_dir.iterdir()):
         if not d.is_dir():
             continue
-        row = _run_row(d)
+        try:                      # one bad run dir must not abort indexing of all
+            row = _run_row(d)
+        except Exception:         # noqa: BLE001
+            row = None
         if row is not None:
             queries.upsert_run(conn, row)
             n += 1

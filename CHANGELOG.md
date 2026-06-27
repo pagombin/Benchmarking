@@ -2,6 +2,33 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Bug-bash hardening** (multi-subsystem review). Fixes:
+  - **Security — path traversal** in `/api/diff` (`a`/`b`) and `/compare/view`
+    (`runs`): these are query params (not constrained like path params), so a
+    viewer could read any `spec.yaml`/probe dirs via `../`. Now validated to a
+    single safe segment inside `results/`.
+  - **CSRF** added to `/logout` and `/api/notify/test` (cookie-session state
+    changes that the double-submit design otherwise covers).
+  - **Worker run-id mis-detection**: a `prepare` job could pick up
+    `prepare_<slug>.json` as a bogus run_id; run-id detection is now gated to
+    run/soak and filtered to manifest-bearing dirs. A cancel that kills the child
+    by signal (rc < 0) is reported as **canceled**, not failed. `run_id` is never
+    overwritten with NULL; the per-job secret is deleted in a `finally` (no orphan
+    on error); doctor/preflight/prepare no longer send SMTP/Slack.
+  - **Reconcile robustness**: a malformed/non-object `manifest.json` no longer
+    aborts indexing of all runs at startup.
+  - **Live PG sampler**: short psql timeout (8s) so a stalled sample during a
+    failover can't block the run's end or leave an orphan psql.
+  - **Preflight checklist**: any unexpected per-check exception now yields a
+    degraded event instead of killing the stream.
+  - **SSE log streaming** is incremental (byte offset) instead of re-reading the
+    whole `harness.log` every second.
+  - **Frontend**: `toYaml` now quotes scalars with YAML-special characters
+    (labels/tickets/hosts with `:`/`#`/… no longer produce a broken spec); uPlot
+    guards degenerate all-zero axes (incl. the QPS right axis); report KPI peak
+    index is bounds-safe; New-run blocks starting with no target/host selected;
+    history clears stale errors; the 401 redirect can't loop on `/login`.
+
 - **Default-UI flip:** the console (SPA at `/ui`) is now the default — `/`, `/new`
   and `/runs/<id>` redirect into it (deep links keep working). The fully-ported
   pages are retired from the legacy UI; Compare and the admin pages (Users,

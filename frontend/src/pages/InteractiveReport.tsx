@@ -79,7 +79,8 @@ function SweepReport({ summary, prov }: { summary: Record<string, unknown>; prov
   const p50 = threads.map((t) => mean(byThreads.get(t)!, "lat_p50"));
   const p95 = threads.map((t) => mean(byThreads.get(t)!, "lat_p95"));
   const p99 = threads.map((t) => mean(byThreads.get(t)!, "lat_p99"));
-  const peakI = qps.indexOf(Math.max(...qps, 0));
+  // index of max QPS without a spread (large ladders) and without -1 on empty
+  const peakI = qps.length ? qps.reduce((bi, v, i, a) => (v > a[bi] ? i : bi), 0) : -1;
   const xt = (v: number) => `${v}t`;
 
   return (

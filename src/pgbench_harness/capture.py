@@ -133,10 +133,11 @@ def psql_query(spec: Spec, password: str, sql: str, timeout: int = PSQL_TIMEOUT_
     return proc.stdout.strip()
 
 
-def psql_query_soft(spec: Spec, password: str, sql: str) -> tuple[bool, str]:
+def psql_query_soft(spec: Spec, password: str, sql: str,
+                    timeout: int = PSQL_TIMEOUT_S) -> tuple[bool, str]:
     """Like psql_query but returns (ok, output_or_error) instead of raising."""
     try:
-        return True, psql_query(spec, password, sql)
+        return True, psql_query(spec, password, sql, timeout=timeout)
     except PreflightError as exc:
         return False, str(exc)
 
@@ -579,7 +580,7 @@ def preflight_steps(spec: Spec, password: str,
     try:
         detail = f"{sysbench_version()} · {psql_version()}"
         yield ev("Load-gen tools", "ok", detail)
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001
         yield ev("Load-gen tools", "fail", str(exc))
         return
     if spec.workload.type == "tpcc":
@@ -594,7 +595,7 @@ def preflight_steps(spec: Spec, password: str,
         ver = psql_query(spec, password, "SHOW server_version")
         yield ev("Connectivity", "ok", (full.splitlines()[0][:90] if full else "connected"))
         yield ev("Server version", "ok", ver)
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001  (emit a checklist event, never crash the stream)
         yield ev("Connectivity", "fail", str(exc))
         return
     try:
@@ -603,17 +604,17 @@ def preflight_steps(spec: Spec, password: str,
         ok = mx.isdigit() and int(mx) > peak
         yield ev("max_connections", "ok" if ok else "warn",
                  f"{mx} (run peaks at {peak} threads)")
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001
         yield ev("max_connections", "warn", str(exc))
     try:
         yield ev("Pooler probe", "info", detect_pooler(spec, password))
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001
         yield ev("Pooler probe", "info", str(exc))
     try:
         present = detect_pg_stat_statements(spec, password)
         yield ev("pg_stat_statements", "ok" if present else "warn",
                  "installed" if present else "not installed (per-query stats unavailable)")
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001
         yield ev("pg_stat_statements", "warn", str(exc))
     try:
         peak = peak_threads(spec)
@@ -625,13 +626,13 @@ def preflight_steps(spec: Spec, password: str,
             yield ev("Connection ceiling", "warn",
                      f"only {probe.succeeded}/{probe.requested} established; first refusal "
                      f"at #{probe.first_failed_index}: {probe.first_error}")
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001
         yield ev("Connection ceiling", "warn", str(exc))
     try:
         d = check_dataset(spec, password)
         status = "ok" if d.ok else ("warn" if d.status == "missing" else "fail")
         yield ev("Dataset", status, f"[{d.status}] {d.detail}")
-    except PreflightError as exc:
+    except Exception as exc:  # noqa: BLE001
         yield ev("Dataset", "fail", str(exc))
 
 
@@ -720,16 +721,19 @@ LIVE_PG_SQL = f"SELECT row_to_json(t) FROM (SELECT {_LIVE_PG_SELECT}, " \
 LIVE_PG_SQL_NOWAL = f"SELECT row_to_json(t) FROM (SELECT {_LIVE_PG_SELECT}, " \
                     "0 AS wal_bytes) t"
 LIVE_PG_COLUMNS = ("t", "active", "total_conn", "xacts_s", "cache_hit_pct", "wal_mb_s")
+# Live samples use a short timeout: a stuck sample (e.g. during a failover) must
+# not block the sampler for 30s or leave an orphan psql after the run ends.
+LIVE_PG_TIMEOUT_S = 8
 
 
 def live_pg_query(spec: Spec, password: str) -> Optional[dict[str, Any]]:
     """One engine-side sample (cumulative counters + gauges); None if unavailable.
 
     Tries the WAL-aware query first; falls back without ``pg_stat_wal`` on older
-    servers. Never raises.
+    servers. Never raises. Uses a short timeout so a stalled sample is skipped.
     """
     for sql in (LIVE_PG_SQL, LIVE_PG_SQL_NOWAL):
-        ok, out = psql_query_soft(spec, password, sql)
+        ok, out = psql_query_soft(spec, password, sql, timeout=LIVE_PG_TIMEOUT_S)
         if ok and out.strip():
             try:
                 row = json.loads(out.strip().splitlines()[0])

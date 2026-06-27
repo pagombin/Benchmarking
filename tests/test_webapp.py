@@ -608,3 +608,42 @@ def test_legacy_paths_redirect_to_console(web):
     assert r.status_code == 307 and r.headers["location"] == "/ui/runs/some-run-id"
     # not-yet-ported pages remain server-rendered
     assert client.get("/compare", auth=("op", "oppw")).status_code == 200
+
+
+# ── bug-bash regressions ────────────────────────────────────────────────
+
+def test_diff_and_compare_reject_path_traversal(web):
+    client, _ = web
+    assert client.get("/api/diff?a=../../../../etc/hosts&b=x", auth=("viewer", "vpw")).status_code == 400
+    assert client.get("/api/diff?a=a/b&b=x", auth=("viewer", "vpw")).status_code == 400
+    assert client.get("/compare/view?runs=../../etc", auth=("viewer", "vpw")).status_code == 400
+
+
+def test_prepare_job_sets_no_run_id(web):
+    """A prepare job must not pick up prepare_<slug>.json as a bogus run_id."""
+    client, cfg = web
+    client.post("/api/prepare", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _, state, job = _run_worker_once(cfg)
+    assert not job["run_id"]            # gated to run/soak kinds only
+
+
+def test_reconcile_skips_malformed_manifest(web, tmp_path):
+    """A non-dict manifest.json must not abort indexing of all runs."""
+    from pgbench_webapp import index, queries
+    from pgbench_webapp.db import connect
+    bad = cfg_results(web) / "bad-run"
+    bad.mkdir(parents=True)
+    (bad / "manifest.json").write_text("[1, 2, 3]")          # valid JSON, not an object
+    good = cfg_results(web) / "good-run"
+    good.mkdir(parents=True)
+    (good / "manifest.json").write_text(
+        '{"run_id":"good-run","mode":"sweep","status":"complete","created_utc":"2026-01-01T00:00:00Z"}')
+    conn = connect(web[1].db_path)
+    n = index.reconcile(conn, web[1].results_dir)            # must not raise
+    assert queries.get_run(conn, "good-run") is not None
+    assert queries.get_run(conn, "bad-run") is None
+    conn.close()
+
+
+def cfg_results(web):
+    return web[1].results_dir

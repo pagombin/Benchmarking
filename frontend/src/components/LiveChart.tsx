@@ -55,7 +55,13 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat }:
       height,
       cursor: { drag: { x: true, y: false } },
       legend: { live: true },
-      scales: { x: { time: false } },
+      // Guard degenerate auto-ranges: when a series is all zeros (e.g. before any
+      // data arrives), uPlot would collapse min==max and render a broken axis.
+      scales: {
+        x: { time: false },
+        y: { range: (_u, min, max) => (min === max ? [0, max || 1] : [min, max]) },
+        y2: { range: (_u, min, max) => (min === max ? [0, max || 1] : [min, max]) },
+      },
       axes,
       series: [
         {},
@@ -81,7 +87,7 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat }:
       plot.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [title, series.length, height]);
+  }, [title, height, series.map((s) => `${s.label}:${s.scale ?? "y"}`).join("|")]);
 
   // Stream data in on every update without rebuilding the plot.
   useEffect(() => {

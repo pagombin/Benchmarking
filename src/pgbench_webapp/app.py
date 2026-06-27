@@ -188,7 +188,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return resp
 
     @app.post("/logout")
-    def logout(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+    def logout(request: Request, csrf_token: str = Form(""),
+               conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+        _check_csrf(request, csrf_token)
         token = request.cookies.get(SESSION_COOKIE)
         if token:
             queries.delete_session(conn, token)
@@ -477,13 +479,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def api_run_summary(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         """Parsed run data for the interactive in-app report (manifest + summary)."""
         run_dir = cfg.results_dir / run_id
-        man = run_dir / "manifest.json"
-        if not man.exists():
+        if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
-        manifest = json.loads(man.read_text(encoding="utf-8"))
+        manifest = _manifest(run_dir)          # tolerant of a malformed manifest
         mode = manifest.get("mode", "sweep")
         sp = run_dir / "parsed" / ("soak_summary.json" if mode == "soak" else "summary.json")
-        summary = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+        summary: dict = {}
+        if sp.exists():
+            try:
+                summary = json.loads(sp.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                summary = {}
         return JSONResponse({"mode": mode, "manifest": manifest, "summary": summary,
                              "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists()})
 
@@ -538,7 +544,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     @app.get("/compare/view", response_class=HTMLResponse)
     def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        ids = [r for r in runs.split(",") if r]
+        ids = [_safe_segment(r) for r in runs.split(",") if r]
         dirs = [cfg.results_dir / r for r in ids]
         for d in dirs:
             if not (d / "manifest.json").exists():
@@ -627,8 +633,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return RedirectResponse("/admin/settings", status_code=303)
 
     @app.post("/api/notify/test")
-    def notify_test(conn: sqlite3.Connection = Depends(get_conn),
+    def notify_test(request: Request, conn: sqlite3.Connection = Depends(get_conn),
                     user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, request.headers.get("x-csrf-token"))
         sent = notify.notify(conn, store, state="test", run_id=None,
                              label="notification test", peak_qps=None)
         return JSONResponse({"sent": sent})
@@ -671,7 +678,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             if row is None:
                 raise HTTPException(404, f"template not found: {ref}")
             return str(row["spec_yaml"])
-        p = cfg.results_dir / ref / "spec.yaml"
+        p = cfg.results_dir / _safe_segment(ref) / "spec.yaml"
         if not p.exists():
             raise HTTPException(404, f"spec not found: {ref}")
         return p.read_text(encoding="utf-8")
@@ -691,7 +698,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         run_dir = cfg.results_dir / run_id
         cached = run_dir / "env" / "provider_metrics.json"
         if cached.exists():
-            return JSONResponse(json.loads(cached.read_text()))
+            try:
+                return JSONResponse(json.loads(cached.read_text()))
+            except (ValueError, OSError):
+                pass   # fall through and refetch
         if not provider.configured(conn, store):
             return JSONResponse({"available": False,
                                  "reason": "no DO token/cluster configured (engine-side only)"})
@@ -751,10 +761,9 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
                            "status": _run_status(run_dir), "budget_s": budget_s})
     for _ in range(max_ticks):
         if log.exists():
-            text = log.read_text(encoding="utf-8", errors="replace")
-            if len(text) > sent_log:
-                yield _event("log", text[sent_log:])
-                sent_log = len(text)
+            chunk, sent_log = _read_tail(log, sent_log)   # byte offset; incremental
+            if chunk:
+                yield _event("log", chunk)
         rel, header, data = _read_samples(run_dir)
         if rel is not None:
             if rel != cur_file:          # first/swapped file -> client resets
@@ -777,6 +786,18 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
 def _event(name: str, data: Any) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+def _safe_segment(ref: str) -> str:
+    """Validate a run-id used to build a filesystem path (no traversal).
+
+    Used for query-param ids (path params are already constrained to one segment
+    by Starlette, but query params are not). Rejects empty, separators, leading
+    dots, and ``..`` so ``results_dir / ref`` can never escape the tree.
+    """
+    if not ref or "/" in ref or "\\" in ref or ".." in ref or ref.startswith("."):
+        raise HTTPException(400, f"invalid id: {ref!r}")
+    return ref
 
 
 def _spec_with_target(conn: sqlite3.Connection, payload: dict) -> tuple[str, Optional[int]]:
@@ -887,6 +908,26 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
     current = next((f"{lv.get('threads')}t" for lv in levels if lv.get("status") == "running"), "")
     return {"status": status, "elapsed_s": elapsed, "budget_s": budget_s,
             "levels_total": len(levels), "levels_done": done, "current": current}
+
+
+def _read_tail(path: Path, offset: int) -> tuple[str, int]:
+    """Read complete new lines past *offset* bytes (incremental log streaming).
+
+    Returns (text, new_offset). Avoids re-reading the whole (potentially huge,
+    multi-hour) log each tick; only emits up to the last newline so a partial
+    in-progress line waits for its terminator.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return "", offset
+    nl = data.rfind(b"\n")
+    if nl == -1:
+        return "", offset
+    consumed = data[: nl + 1]
+    return consumed.decode("utf-8", "replace"), offset + len(consumed)
 
 
 def _read_csv(path: Path) -> tuple[str, list[str]]:

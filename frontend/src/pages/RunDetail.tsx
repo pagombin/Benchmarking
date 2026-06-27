@@ -119,7 +119,7 @@ export function RunDetail({ me }: { me: Me }) {
   const curTps = last >= 0 ? series.tps[last] : null;
   const peakTps = series.tps.length ? Math.max(...series.tps) : null;
   const curP99 = last >= 0 ? series.p99[last] : null;
-  const isSoak = (run?.mode ?? progress?.status) === "soak" || run?.mode === "soak";
+  const isSoak = run?.mode === "soak";
   const live = streamState === "live";
   const pct = progress && progress.budget_s
     ? Math.min(100, Math.round((progress.elapsed_s / progress.budget_s) * 100))

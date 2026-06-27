@@ -20,7 +20,7 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 
@@ -46,6 +46,19 @@ def _spec_path(cfg: Config, job_id: int) -> Path:
     d = cfg.data_dir / "jobs"
     d.mkdir(parents=True, exist_ok=True)
     return d / f"job_{job_id}.yaml"
+
+
+def _run_dir_names(results_dir: Path) -> set[str]:
+    """Names of actual run directories (those with a manifest.json).
+
+    Filters out stray files like ``prepare_<slug>.json`` / ``.log`` that also
+    live directly under ``results/`` — otherwise the new-dir set-diff could pick
+    one of them up as a bogus run_id.
+    """
+    if not results_dir.exists():
+        return set()
+    return {p.name for p in results_dir.iterdir()
+            if p.is_dir() and (p / "manifest.json").exists()}
 
 
 def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
@@ -75,7 +88,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         env["PGB_TARGET_PASSWORD"] = pw
         get_redactor().register(pw)  # scrub from any harness output the worker reads
 
-    before = {p.name for p in cfg.results_dir.iterdir()} if cfg.results_dir.exists() else set()
+    before = _run_dir_names(cfg.results_dir)
     kind = job["kind"]
     if kind == "doctor":                       # environment health; no spec/password
         argv = [cfg.harness_bin, "doctor"]
@@ -91,49 +104,59 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             argv += ["--resume", "--run-dir", str(cfg.results_dir / job["resume_run_id"])]
     log_path = cfg.data_dir / "jobs" / f"job_{job['id']}.out"
     redact = get_redactor().redact
-    with open(log_path, "w", encoding="utf-8") as logf:
-        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
-        queries.update_job(conn, job["id"], pid=proc.pid)
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            logf.write(redact(line))
-            logf.flush()
-        rc = proc.wait()
+    try:
+        with open(log_path, "w", encoding="utf-8") as logf:
+            proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+            queries.update_job(conn, job["id"], pid=proc.pid)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                logf.write(redact(line))
+                logf.flush()
+            rc = proc.wait()
 
-    # Link the job to the results directory it created.
-    after = {p.name for p in cfg.results_dir.iterdir()} if cfg.results_dir.exists() else set()
-    new_dirs = sorted(after - before)
-    run_id = new_dirs[-1] if new_dirs else None
-    fresh = queries.get_job(conn, job["id"])
-    canceling = fresh is not None and fresh["state"] == "canceling"
-    if canceling:
-        state = "canceled"
-    elif rc in (0, 1):       # 1 = partial (failed levels) — still a real result
-        state = "done"
-    else:
-        state = "failed"
-    queries.update_job(conn, job["id"], state=state, run_id=run_id, exit_code=rc,
-                       finished_utc=utc_now_iso(), pid=None,
-                       error="" if state != "failed" else f"exit {rc}")
-    if run_id:
-        run_dir = cfg.results_dir / run_id
-        row = index._run_row(run_dir)
-        if row:
-            row["source"] = "web"
-            queries.upsert_run(conn, row)
-    store.delete(job_password_ref(job["id"]))   # secret no longer needed
-    _notify(cfg, conn, job["id"], state, run_id)
-    return state
+        # Only run/soak produce a run directory; detect it by the new manifest-
+        # bearing dir (resume reuses its existing one). preflight/prepare/doctor
+        # never set a run_id.
+        run_id: Optional[str] = None
+        if kind in ("run", "soak"):
+            new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
+            run_id = new_dirs[-1] if new_dirs else (job["resume_run_id"] or None)
+        fresh = queries.get_job(conn, job["id"])
+        canceling = fresh is not None and fresh["state"] == "canceling"
+        if canceling or rc < 0:   # rc < 0 => killed by a signal (our cancel SIGTERM)
+            state = "canceled"
+        elif rc in (0, 1):        # 1 = partial (failed levels) — still a real result
+            state = "done"
+        else:
+            state = "failed"
+        fields: dict[str, Any] = {"state": state, "exit_code": rc, "pid": None,
+                                  "finished_utc": utc_now_iso(),
+                                  "error": "" if state != "failed" else f"exit {rc}"}
+        if run_id:               # never clobber an existing link with NULL
+            fields["run_id"] = run_id
+        queries.update_job(conn, job["id"], **fields)
+        if run_id:
+            row = index._run_row(cfg.results_dir / run_id)
+            if row:
+                row["source"] = "web"
+                queries.upsert_run(conn, row)
+        _notify(cfg, conn, job, state, run_id)
+        return state
+    finally:
+        store.delete(job_password_ref(job["id"]))   # secret gone even on error
 
 
-def _notify(cfg: Config, conn: sqlite3.Connection, job_id: int, state: str, run_id: Optional[str]) -> None:
+def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
+            run_id: Optional[str]) -> None:
     """Best-effort completion record + SMTP/Slack notification. Never raises."""
     try:
-        queries.audit(conn, None, f"job_{state}", target=run_id or f"job:{job_id}",
+        queries.audit(conn, None, f"job_{state}", target=run_id or f"job:{job['id']}",
                       detail="worker finished job")
     except Exception:  # noqa: BLE001
         pass
+    if job["kind"] not in ("run", "soak"):
+        return   # don't email/Slack for preflight/prepare/doctor health checks
     try:
         from pgbench_webapp import notify as _n
         run = queries.get_run(conn, run_id) if run_id else None

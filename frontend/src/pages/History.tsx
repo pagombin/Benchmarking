@@ -22,6 +22,7 @@ export function History({ me }: { me: Me }) {
       ]);
       setRuns(r);
       setJobs(j);
+      setErr(null);            // clear a stale error after a successful reload
     } catch (e) {
       setErr((e as Error).message);
     }
