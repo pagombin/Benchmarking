@@ -96,11 +96,25 @@ def list_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(conn.execute("SELECT id, name, host, port, dbname, dbuser, sslmode FROM targets ORDER BY name"))
 
 
+def get_target_by_name(conn: sqlite3.Connection, name: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM targets WHERE name=?", (name,)).fetchone()
+
+
+def delete_target(conn: sqlite3.Connection, target_id: int) -> None:
+    conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
+
+
+def job_for_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
+    """The most recent job that produced this run (for re-run target lookup)."""
+    return conn.execute("SELECT * FROM jobs WHERE run_id=? ORDER BY id DESC LIMIT 1",
+                        (run_id,)).fetchone()
+
+
 # ── runs index ──────────────────────────────────────────────────────
 
 RUN_COLUMNS = ("run_id", "label", "edition", "tshirt_size", "mode", "workload_type",
                "status", "tags", "ticket", "owner", "environment", "peak_qps",
-               "created_utc", "finished_utc", "source")
+               "created_utc", "finished_utc", "source", "target_host")
 
 
 def upsert_run(conn: sqlite3.Connection, row: dict[str, Any]) -> None:

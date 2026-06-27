@@ -466,3 +466,54 @@ def test_sse_emits_hello_progress_and_incremental_samples(web):
     assert "event: done" in body
     # samples are sent incrementally with a row offset (not a 300-row re-send)
     assert "event: samples" in body and '"offset"' in body
+
+
+# ── targets & re-run (Phase 3) ──────────────────────────────────────────
+
+def _make_target(client, name="nyc3", host="db-nyc3.example.invalid"):
+    return client.post("/api/targets", json={
+        "name": name, "host": host, "dbname": "sbtest", "dbuser": "doadmin",
+        "sslmode": "require", "password": WEB_PW}, auth=("op", "oppw"))
+
+
+def test_targets_crud_rbac_and_no_password_exposed(web):
+    client, cfg = web
+    assert client.post("/api/targets", json={"name": "x", "host": "h"}, auth=("viewer", "vpw")).status_code == 403
+    r = _make_target(client)
+    assert r.status_code == 200
+    tid = r.json()["id"]
+    lst = client.get("/api/targets", auth=("viewer", "vpw")).json()
+    assert any(t["name"] == "nyc3" and t["host"] == "db-nyc3.example.invalid" for t in lst)
+    for t in lst:
+        assert "password" not in t and "password_ref" not in t   # never exposed
+    assert _make_target(client).status_code == 400                # duplicate name
+    from pgbench_webapp.secrets_store import SecretStore
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    assert store.get("target:nyc3:password") == WEB_PW
+    assert client.delete(f"/api/targets/{tid}", auth=("op", "oppw")).status_code == 200
+    assert store.get("target:nyc3:password") is None              # secret erased with the target
+    assert all(t["id"] != tid for t in client.get("/api/targets", auth=("op", "oppw")).json())
+
+
+def test_target_backed_run_reuses_password_and_surfaces_host(web):
+    client, cfg = web
+    _make_target(client)
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    # start against the saved target with NO password in the request
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid}, auth=("op", "oppw"))
+    assert r.status_code == 200
+    _run_worker_once(cfg)
+    runs = client.get("/api/runs", auth=("viewer", "vpw")).json()
+    assert runs and runs[0]["target_host"] == "db-nyc3.example.invalid"
+    run_id = runs[0]["run_id"]
+    rr = client.post(f"/api/runs/{run_id}/rerun", auth=("op", "oppw"))
+    assert rr.status_code == 200 and rr.json()["needs_password"] is False
+
+
+def test_rerun_without_target_flags_needs_password(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    rr = client.post(f"/api/runs/{run_id}/rerun", auth=("op", "oppw"))
+    assert rr.status_code == 200 and rr.json()["needs_password"] is True

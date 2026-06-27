@@ -70,12 +70,30 @@ export function History({ me }: { me: Me }) {
     }
   }
 
+  async function rerun(id: string) {
+    if (!confirm(`Re-run ${id} with the same config?`)) return;
+    try {
+      const d = await api.post<{ needs_password: boolean }>(`/api/runs/${id}/rerun`);
+      if (d.needs_password)
+        alert("Re-run queued — but this run had no saved target, so it will fail without a password. "
+          + "Use Clone to re-enter credentials, or save the cluster under Targets.");
+      load();
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
+
+  function host(h?: string) {
+    if (!h) return "—";
+    return h.length > 30 ? h.slice(0, 14) + "…" + h.slice(-12) : h;
+  }
+
   return (
     <>
       <div className="toolbar">
         <h1>Runs</h1>
         <div className="spacer" />
-        {canRun && <a className="btn primary" href="/new">＋ New run</a>}
+        {canRun && <Link className="btn primary" to="/new">＋ New run</Link>}
       </div>
 
       {err && <div className="banner-err">{err}</div>}
@@ -132,8 +150,8 @@ export function History({ me }: { me: Me }) {
         <table>
           <thead>
             <tr>
-              <th>Run</th><th>Label</th><th>Edition</th><th>Mode</th><th>Workload</th>
-              <th>Status</th><th className="num">Peak QPS</th><th>Tags</th><th>Created</th>
+              <th>Run</th><th>Label</th><th>Host</th><th>Mode</th><th>Workload</th>
+              <th>Status</th><th className="num">Peak QPS</th><th>Created</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -146,13 +164,18 @@ export function History({ me }: { me: Me }) {
                 <tr key={r.run_id}>
                   <td><Link className="mono" to={`/runs/${r.run_id}`}>{r.run_id}</Link></td>
                   <td>{r.label || "—"}</td>
-                  <td>{r.edition || "—"}</td>
+                  <td className="mono" style={{ fontSize: 12 }} title={r.target_host}>{host(r.target_host)}</td>
                   <td>{r.mode}</td>
                   <td className="mono">{r.workload_type || "—"}</td>
                   <td><span className={`badge ${r.status}`}>{r.status || "—"}</span></td>
                   <td className="num">{r.peak_qps ? fmtInt(r.peak_qps) : "—"}</td>
-                  <td className="subtle">{r.tags}{r.ticket ? ` · ${r.ticket}` : ""}</td>
                   <td className="mono subtle" title={r.created_utc}>{relAge(r.created_utc) || fmtWhen(r.created_utc)}</td>
+                  <td className="row-actions">
+                    <Link className="btn-sm" to={`/runs/${r.run_id}/report`}>Report</Link>
+                    <a className="btn-sm" href={`/runs/${r.run_id}/spec`} target="_blank" rel="noreferrer">Spec</a>
+                    {canRun && <Link className="btn-sm" to={`/new?from=${r.run_id}`}>Clone</Link>}
+                    {canRun && <button className="btn-sm" onClick={() => rerun(r.run_id)}>Re-run</button>}
+                  </td>
                 </tr>
               ))
             )}

@@ -75,6 +75,11 @@ MIGRATIONS: list[tuple[int, str]] = [
     CREATE INDEX idx_jobs_state ON jobs(state);
     CREATE INDEX idx_runs_created ON runs(created_utc);
     """),
+    # 2: surface each run's target cluster host in the index (read from the spec
+    #    at reconcile time) so every run/job is unambiguous about where it ran.
+    (2, """
+    ALTER TABLE runs ADD COLUMN target_host TEXT;
+    """),
 ]
 
 

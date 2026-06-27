@@ -24,6 +24,22 @@ stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
   `GET/POST /api/settings[/concurrency]` (admin) so several clusters can run at
   once. Per-run actions (report/spec/artifacts/mark/resume/cancel) are a coherent
   surface on the detail page.
+- **Phase 3 — targets, re-run, inline reports:**
+  - **Inline reports:** a run's self-contained report renders *directly in the
+    console* (same-origin iframe) for past or in-flight runs — view it without
+    downloading; download / open-raw / regenerate remain.
+  - **Saved targets:** a Targets page backed by the existing `targets` table —
+    save a cluster's connection + password once (password encrypted via the
+    secret store, never in spec/DB/logs/reports/artifacts). New run lets you
+    **pick a saved target or enter a host inline** (fixes the missing-hostname
+    hole); the form ↔ YAML stay in sync with a raw power-user editor.
+  - **Re-run & clone:** one-click re-run reuses the saved target's password (no
+    re-entry); clone opens New run pre-filled from a prior spec. Runs launched
+    against a target resolve the password in the **worker** from the target, not
+    a per-job secret.
+  - Every run/job now shows its **target host**; history gains a per-row action
+    menu (report / spec / clone / re-run). New APIs: `GET/POST/DELETE
+    /api/targets`, `POST /api/runs/{id}/rerun`; runs index gains `target_host`.
 
 ## 0.8.0
 

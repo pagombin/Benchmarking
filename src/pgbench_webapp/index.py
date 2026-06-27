@@ -51,8 +51,11 @@ def _run_row(run_dir: Path) -> Optional[dict[str, Any]]:
             run_meta = {}
     mode = m.get("mode", "sweep")
     workload = ""
+    target_host = ""
     try:
-        workload = (yaml.safe_load((run_dir / "spec.yaml").read_text())).get("workload", {}).get("type", "")
+        doc = yaml.safe_load((run_dir / "spec.yaml").read_text()) or {}
+        workload = doc.get("workload", {}).get("type", "")
+        target_host = doc.get("target", {}).get("host", "")
     except (OSError, yaml.YAMLError, AttributeError):
         pass
     return {
@@ -65,7 +68,7 @@ def _run_row(run_dir: Path) -> Optional[dict[str, Any]]:
         "environment": run_meta.get("environment", ""),
         "peak_qps": _peak_qps(run_dir, mode),
         "created_utc": m.get("created_utc", ""), "finished_utc": m.get("finished_utc", ""),
-        "source": "fs",
+        "source": "fs", "target_host": target_host,
     }
 
 

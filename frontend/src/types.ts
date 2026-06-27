@@ -28,6 +28,16 @@ export interface Run {
   target_host?: string;
 }
 
+export interface Target {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  dbname: string;
+  dbuser: string;
+  sslmode: string;
+}
+
 export interface Job {
   id: number;
   kind: string;

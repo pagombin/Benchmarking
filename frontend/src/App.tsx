@@ -5,6 +5,9 @@ import type { Me } from "./types";
 import { Shell } from "./components/Shell";
 import { History } from "./pages/History";
 import { RunDetail } from "./pages/RunDetail";
+import { ReportView } from "./pages/ReportView";
+import { Targets } from "./pages/Targets";
+import { NewRun } from "./pages/NewRun";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -34,7 +37,10 @@ export function App() {
       <Shell me={me}>
         <Routes>
           <Route path="/" element={<History me={me} />} />
+          <Route path="/new" element={<NewRun me={me} />} />
+          <Route path="/targets" element={<Targets me={me} />} />
           <Route path="/runs/:runId" element={<RunDetail me={me} />} />
+          <Route path="/runs/:runId/report" element={<ReportView />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Shell>

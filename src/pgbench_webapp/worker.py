@@ -61,7 +61,16 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     spec_file.write_text(job["spec_yaml"], encoding="utf-8")  # never contains a secret
 
     env = dict(os.environ)
-    pw = store.get(job_password_ref(job["id"]))
+    # Prefer a saved target's persistent password (enables one-click re-run);
+    # otherwise the per-job secret captured at submit time. Either way the secret
+    # only ever reaches the child env — never the spec, DB, or any artifact.
+    pw = None
+    if job["target_id"]:
+        tgt = queries.get_target(conn, job["target_id"])
+        if tgt is not None:
+            pw = store.get(tgt["password_ref"])
+    if pw is None:
+        pw = store.get(job_password_ref(job["id"]))
     if pw:
         env["PGB_TARGET_PASSWORD"] = pw
         get_redactor().register(pw)  # scrub from any harness output the worker reads

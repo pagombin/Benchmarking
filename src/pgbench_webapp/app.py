@@ -315,17 +315,28 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       conn: sqlite3.Connection = Depends(get_conn),
                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
-        spec_yaml = payload.get("spec_yaml", "")
-        v = harness_api.validate_yaml(spec_yaml)
+        doc = yaml.safe_load(payload.get("spec_yaml", "")) or {}
+        if not isinstance(doc, dict):
+            raise HTTPException(400, "spec must be a YAML mapping")
+        doc.setdefault("target", {})
+        # A saved target is authoritative for the connection (and supplies the
+        # persistent password); the spec editor's target fields are overridden.
+        target_id = payload.get("target_id")
+        if target_id:
+            tgt = queries.get_target(conn, int(target_id))
+            if tgt is None:
+                raise HTTPException(400, "unknown target")
+            doc["target"].update(host=tgt["host"], port=tgt["port"], database=tgt["dbname"],
+                                 user=tgt["dbuser"], sslmode=tgt["sslmode"])
+        # Normalize password_env to the worker's injected var; never store the password in the spec.
+        doc["target"]["password_env"] = "PGB_TARGET_PASSWORD"
+        clean_yaml = yaml.safe_dump(doc, sort_keys=False)
+        v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
         kind = "soak" if v["mode"] == "soak" else "run"
-        # Normalize password_env to the worker's injected var; never store the password in the spec.
-        doc = yaml.safe_load(spec_yaml)
-        doc.setdefault("target", {})["password_env"] = "PGB_TARGET_PASSWORD"
-        clean_yaml = yaml.safe_dump(doc, sort_keys=False)
-        job_id = queries.enqueue_job(conn, kind, clean_yaml, None, user["username"],
-                                     scheduled_utc=payload.get("scheduled_utc") or None)
+        job_id = queries.enqueue_job(conn, kind, clean_yaml, int(target_id) if target_id else None,
+                                     user["username"], scheduled_utc=payload.get("scheduled_utc") or None)
         password = payload.get("password")
         if password:
             store.set(job_password_ref(job_id), password)  # encrypted, off-DB
@@ -368,6 +379,75 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                                      user["username"], resume_run_id=run_id)
         queries.audit(conn, user["username"], "run_resume", target=run_id, detail=f"job={job_id}")
         return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/runs/{run_id}/rerun")
+    def api_rerun(run_id: str, request: Request,
+                  conn: sqlite3.Connection = Depends(get_conn),
+                  store: SecretStore = Depends(get_store),
+                  user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        run_dir = cfg.results_dir / run_id
+        spec_path = run_dir / "spec.yaml"
+        if not spec_path.exists():
+            raise HTTPException(404, "run/spec not found")
+        kind = "soak" if _run_mode(run_dir) == "soak" else "run"
+        # Reuse the original run's saved target so the password needn't be re-entered.
+        prev = queries.job_for_run(conn, run_id)
+        target_id = prev["target_id"] if prev else None
+        has_pw = False
+        if target_id:
+            tgt = queries.get_target(conn, target_id)
+            has_pw = bool(tgt and store.get(tgt["password_ref"]))
+        job_id = queries.enqueue_job(conn, kind, spec_path.read_text(encoding="utf-8"),
+                                     target_id, user["username"])
+        queries.audit(conn, user["username"], "run_rerun", target=run_id, detail=f"job={job_id}")
+        return JSONResponse({"job_id": job_id, "kind": kind, "needs_password": not has_pw})
+
+    # ── targets (saved clusters: connection + persistent encrypted password) ──
+    @app.get("/api/targets")
+    def api_targets(conn: sqlite3.Connection = Depends(get_conn),
+                    user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        # Never returns the password — only the reference lives in the DB anyway.
+        return JSONResponse([dict(r) for r in queries.list_targets(conn)])
+
+    @app.post("/api/targets")
+    def api_create_target(request: Request, payload: dict,
+                          conn: sqlite3.Connection = Depends(get_conn),
+                          store: SecretStore = Depends(get_store),
+                          user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        name = str(payload.get("name", "")).strip()
+        host = str(payload.get("host", "")).strip()
+        if not name or not host:
+            raise HTTPException(400, "name and host are required")
+        ref = f"target:{name}:password"
+        password = payload.get("password") or ""
+        if password:
+            store.set(ref, password)  # encrypted, off-DB; only the ref is stored
+        try:
+            tid = queries.create_target(
+                conn, name, host, int(payload.get("port") or 5432),
+                str(payload.get("dbname", "")).strip() or "defaultdb",
+                str(payload.get("dbuser", "")).strip() or "doadmin",
+                str(payload.get("sslmode", "require")).strip() or "require", ref)
+        except sqlite3.IntegrityError:
+            raise HTTPException(400, "a target with that name already exists")
+        queries.audit(conn, user["username"], "target_create", target=name, detail=host)
+        return JSONResponse({"id": tid, "name": name})
+
+    @app.delete("/api/targets/{target_id}")
+    def api_delete_target(target_id: int, request: Request,
+                          conn: sqlite3.Connection = Depends(get_conn),
+                          store: SecretStore = Depends(get_store),
+                          user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        tgt = queries.get_target(conn, target_id)
+        if tgt is None:
+            raise HTTPException(404, "target not found")
+        queries.delete_target(conn, target_id)
+        store.delete(tgt["password_ref"])
+        queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
+        return JSONResponse({"deleted": True})
 
     # ── reports / artifacts ──
     @app.get("/runs/{run_id}/report", response_class=HTMLResponse)

@@ -6,9 +6,12 @@ import { useTheme } from "../lib/theme";
 // During the migration some destinations are still server-rendered Jinja pages.
 // `external: true` routes do a full-page navigation; the rest are SPA routes.
 // As each phase lands, flip `external` off and point at the SPA path.
+// Internal routes are basename-relative (the router's basename is /ui); external
+// destinations are still server-rendered Jinja pages reached by full-page nav.
 const NAV: { to: string; label: string; external?: boolean; admin?: boolean }[] = [
-  { to: "/ui", label: "Runs" },
-  { to: "/new", label: "New run", external: true },
+  { to: "/", label: "Runs" },
+  { to: "/new", label: "New run" },
+  { to: "/targets", label: "Targets" },
   { to: "/compare", label: "Compare", external: true },
   { to: "/admin/users", label: "Users", external: true, admin: true },
   { to: "/admin/settings", label: "Settings", external: true, admin: true },

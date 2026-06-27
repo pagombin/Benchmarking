@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
 import type { Job, Me, Run } from "../types";
 import { LiveChart } from "../components/LiveChart";
@@ -90,6 +90,18 @@ export function RunDetail({ me }: { me: Me }) {
       alert((e as Error).message);
     }
   }
+  async function rerun() {
+    if (!confirm("Re-run this run with the same config?")) return;
+    try {
+      const d = await api.post<{ needs_password: boolean }>(`/api/runs/${runId}/rerun`);
+      if (d.needs_password)
+        alert("Re-run queued — but this run had no saved target, so it needs a password. "
+          + "Use Clone to re-enter credentials, or save the cluster under Targets.");
+      window.location.href = "/ui";
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
 
   if (err) return <div className="banner-err">{err}</div>;
 
@@ -124,10 +136,12 @@ export function RunDetail({ me }: { me: Me }) {
       </div>
 
       <div className="actions">
-        <a className="btn" href={`/runs/${runId}/report`} target="_blank" rel="noreferrer">Open report</a>
-        <a className="btn" href={`/runs/${runId}/report/download`}>Download report</a>
-        <a className="btn" href={`/runs/${runId}/spec`} target="_blank" rel="noreferrer">View spec</a>
+        <Link className="btn primary" to={`/runs/${runId}/report`}>View report</Link>
+        <a className="btn" href={`/runs/${runId}/report/download`}>Download</a>
+        <a className="btn" href={`/runs/${runId}/spec`} target="_blank" rel="noreferrer">Spec</a>
         <a className="btn" href={`/runs/${runId}/artifact`}>Artifacts (.tar.gz)</a>
+        {canRun && <Link className="btn" to={`/new?from=${runId}`}>Clone</Link>}
+        {canRun && <button onClick={rerun}>Re-run</button>}
         {canRun && isSoak && <button onClick={() => mark("failover")}>⚑ Mark failover</button>}
         {canRun && isSoak && <button onClick={() => mark("scale_up")}>⚑ Mark scale-up</button>}
         {canRun && !isSoak && ["partial", "failed", "running"].includes(run?.status || "") && (
