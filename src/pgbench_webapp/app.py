@@ -197,48 +197,21 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return resp
 
     # ── pages ──
-    @app.get("/", response_class=HTMLResponse)
-    def history(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                q: str = "", status: str = "") -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        where, params = [], []
-        if q:
-            where.append("(label LIKE ? OR tags LIKE ? OR ticket LIKE ? OR owner LIKE ?)")
-            params += [f"%{q}%"] * 4
-        if status:
-            where.append("status=?")
-            params.append(status)
-        runs = queries.list_runs(conn, " AND ".join(where), tuple(params))
-        jobs = queries.list_jobs(conn, states=("queued", "running", "canceling"))
-        return page(request, "history.html", user, runs=runs, jobs=jobs, q=q, status=status)
+    # The operator console (SPA, /ui) is now the default UI. These three pages
+    # were fully ported, so the legacy paths redirect into the console; deep links
+    # keep working. (Compare and the admin pages are not yet ported, so they
+    # remain server-rendered and are reached from the console's nav.)
+    @app.get("/")
+    def root_to_console() -> Response:
+        return RedirectResponse("/ui/", status_code=307)
 
-    @app.get("/new", response_class=HTMLResponse)
-    def new_run(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        presets = {p.stem: p.read_text() for p in sorted((_PKG / "presets").glob("*.yaml"))} \
-            if (_PKG / "presets").exists() else {}
-        for t in queries.list_templates(conn):     # saved templates appear in the dropdown
-            row = queries.get_template(conn, t["name"])
-            if row:
-                presets[f"template: {t['name']}"] = row["spec_yaml"]
-        return page(request, "new.html", user, presets=presets,
-                    can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
+    @app.get("/new")
+    def new_to_console() -> Response:
+        return RedirectResponse("/ui/new", status_code=307)
 
-    @app.get("/runs/{run_id}", response_class=HTMLResponse)
-    def run_detail(run_id: str, request: Request,
-                   conn: sqlite3.Connection = Depends(get_conn)) -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        run = queries.get_run(conn, run_id)
-        if run is None:
-            raise HTTPException(404, "run not found")
-        return page(request, "detail.html", user, run=run,
-                    can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
+    @app.get("/runs/{run_id}")
+    def detail_to_console(run_id: str) -> Response:
+        return RedirectResponse(f"/ui/runs/{run_id}", status_code=307)
 
     # ── JSON API: runs / jobs index (SPA data) ──
     @app.get("/api/runs")

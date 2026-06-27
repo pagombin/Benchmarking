@@ -370,10 +370,12 @@ sudo ./deploy.sh                 # fresh install (or: sudo ./deploy.sh --update)
 # firewall rule to open the port.
 ```
 
-The modern **operator console** is served at **`/ui`** (the original server-rendered
-UI remains at `/` during the migration). `deploy.sh` ships the console's prebuilt
-assets, so the droplet needs no Node.js; it also prints the running git SHA so you
-can confirm an update actually landed.
+The modern **operator console** is the default UI: visiting `/` (and `/new`,
+`/runs/<id>`) redirects into the console at **`/ui`**. A few not-yet-ported admin
+pages (Compare, Users, Settings, Audit) are still server-rendered and reached from
+the console's nav. `deploy.sh` ships the console's prebuilt assets, so the droplet
+needs no Node.js; it also prints the running git SHA so you can confirm an update
+actually landed.
 
 - **Stack:** FastAPI + Uvicorn (TLS), a SQLite control-plane (run index, job
   queue, audit) — the filesystem `results/` tree stays the source of truth — and

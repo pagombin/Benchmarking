@@ -169,8 +169,10 @@ def test_run_through_api_and_worker(web):
     assert jid == job_id and state == "done"
     run_id = job["run_id"]
     assert run_id and (cfg.results_dir / run_id / "manifest.json").exists()
-    # appears in history + report renders + artifact downloads
-    assert run_id in client.get("/", auth=("viewer", "vpw")).text
+    # appears in the runs index + report renders + artifact downloads
+    assert any(r["run_id"] == run_id for r in client.get("/api/runs", auth=("viewer", "vpw")).json())
+    # the console is now the default UI: legacy paths redirect into /ui
+    assert client.get("/", auth=("viewer", "vpw"), follow_redirects=False).headers["location"] == "/ui/"
     rep = client.get(f"/runs/{run_id}/report", auth=("viewer", "vpw"))
     assert rep.status_code == 200 and "Headline results" in rep.text
     art = client.get(f"/runs/{run_id}/artifact", auth=("viewer", "vpw"))
@@ -595,3 +597,14 @@ def test_interactive_report_summary_and_csv(web):
     assert csv.status_code == 200 and "t_offset" in csv.text
     assert client.get(f"/runs/{run_id}/csv?which=bogus", auth=("viewer", "vpw")).status_code == 400
     assert client.get("/api/runs/nope/summary", auth=("viewer", "vpw")).status_code == 404
+
+
+def test_legacy_paths_redirect_to_console(web):
+    client, _ = web
+    for path, target in [("/", "/ui/"), ("/new", "/ui/new")]:
+        r = client.get(path, auth=("op", "oppw"), follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == target
+    r = client.get("/runs/some-run-id", auth=("op", "oppw"), follow_redirects=False)
+    assert r.status_code == 307 and r.headers["location"] == "/ui/runs/some-run-id"
+    # not-yet-ported pages remain server-rendered
+    assert client.get("/compare", auth=("op", "oppw")).status_code == 200

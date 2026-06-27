@@ -2,6 +2,20 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Default-UI flip:** the console (SPA at `/ui`) is now the default — `/`, `/new`
+  and `/runs/<id>` redirect into it (deep links keep working). The fully-ported
+  pages are retired from the legacy UI; Compare and the admin pages (Users,
+  Settings, Audit) remain server-rendered until ported and are reached from the
+  console nav.
+- **Fix — web/worker couldn't find the harness under systemd.** Services get a
+  minimal PATH that excludes the venv bin, so shelling out to a bare
+  `pgbench-harness` failed (`No such file or directory`) — breaking doctor,
+  preflight/prepare and every run (a queued job went straight to failed after the
+  ~3s poll and vanished from the panel). `deploy.sh` now sets
+  `PGBENCH_HARNESS_BIN=<venv>/bin/pgbench-harness` in the env file, and
+  `config.load_config()` resolves the CLI next to the running interpreter when the
+  var is unset (defense in depth).
+
 - **Phase 6 — reports (interactive view + CSV/print, offline kept):** the report
   page is now tabbed — an **Interactive** in-app view (KPI band; QPS/TPS-vs-threads
   and latency-vs-threads uPlot charts on dual axes; per-level table; a
