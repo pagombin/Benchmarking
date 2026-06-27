@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — operator console (incremental)
+
+A ground-up **operator console** (React + Vite + TypeScript SPA, served by FastAPI
+as prebuilt static assets — no Node on the droplet) is being built in reviewable
+phases alongside the existing UI. The classic server-rendered pages keep working
+throughout; the SPA lives under `/ui` until it reaches parity, then becomes the
+default. The web tier still only enqueues, the worker still executes, `results/`
+stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
+
+- **Phase 1 — scaffold:** Vite/TS build emitting into the package; control-room
+  design system (dark-first, IBM Plex Sans/Mono, status-as-structure colour);
+  app shell with auth bootstrap; the Runs (history) view ported. New JSON APIs
+  `GET /api/me`, `GET /api/runs`, `GET /api/jobs` (the jobs API never exposes
+  `spec_yaml`). Served at `/ui/*`.
+
 ## 0.8.0
 
 ### Web app: more of the deferred Part-C capabilities

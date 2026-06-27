@@ -35,7 +35,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 pgbench_harness = ["templates/*.j2"]
-pgbench_webapp = ["templates/*.html", "static/*"]
+pgbench_webapp = ["templates/*.html", "static/*", "static/spa/*", "static/spa/assets/*", "presets/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

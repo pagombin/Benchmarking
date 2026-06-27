@@ -152,6 +152,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok", "version": __version__})
 
+    # ── identity (SPA bootstrap) ──
+    @app.get("/api/me")
+    def api_me(user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        return JSONResponse({"user": user["username"], "role": user["role"],
+                             "version": __version__})
+
     # ── auth ──
     @app.get("/login", response_class=HTMLResponse)
     def login_form(request: Request) -> HTMLResponse:
@@ -232,6 +238,33 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(404, "run not found")
         return page(request, "detail.html", user, run=run,
                     can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
+
+    # ── JSON API: runs / jobs index (SPA data) ──
+    @app.get("/api/runs")
+    def api_list_runs(conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("viewer")),
+                      q: str = "", status: str = "") -> JSONResponse:
+        where, params = [], []
+        if q:
+            where.append("(label LIKE ? OR tags LIKE ? OR ticket LIKE ? OR owner LIKE ?)")
+            params += [f"%{q}%"] * 4
+        if status:
+            where.append("status=?")
+            params.append(status)
+        rows = queries.list_runs(conn, " AND ".join(where), tuple(params))
+        return JSONResponse([dict(r) for r in rows])
+
+    _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by",
+                   "scheduled_utc", "created_utc", "started_utc", "finished_utc", "error")
+
+    @app.get("/api/jobs")
+    def api_list_jobs(conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("viewer")),
+                      active: int = 0) -> JSONResponse:
+        states = ("queued", "running", "canceling") if active else ()
+        rows = queries.list_jobs(conn, states=states)
+        # Never expose spec_yaml here (large, and the source for password_env names).
+        return JSONResponse([{k: r[k] for k in _JOB_FIELDS} for r in rows])
 
     # ── JSON API: validate / dry-run ──
     @app.post("/api/validate")
@@ -530,6 +563,30 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         cached.parent.mkdir(parents=True, exist_ok=True)
         cached.write_text(json.dumps(data))
         return JSONResponse(data)
+
+    # ── SPA shell (served under /ui/*; assets via the /static mount) ──
+    # The shell loads unauthenticated and bootstraps via /api/me, which 401s to
+    # /login when there's no session — standard SPA auth, no secrets in the shell.
+    _spa_index = _PKG / "static" / "spa" / "index.html"
+
+    def _serve_spa() -> HTMLResponse:
+        if _spa_index.exists():
+            return HTMLResponse(_spa_index.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>pgbench console</title>"
+            "<body style='font-family:system-ui;max-width:40rem;margin:4rem auto'>"
+            "<h1>Console not built</h1><p>The SPA bundle is missing. Build it with "
+            "<code>npm --prefix frontend ci &amp;&amp; npm --prefix frontend run build</code> "
+            "or install a release that ships the built assets. The classic UI remains at "
+            "<a href='/'>/</a>.</p>", status_code=200)
+
+    @app.get("/ui", response_class=HTMLResponse)
+    def spa_root() -> HTMLResponse:
+        return _serve_spa()
+
+    @app.get("/ui/{path:path}", response_class=HTMLResponse)
+    def spa_path(path: str) -> HTMLResponse:
+        return _serve_spa()
 
 
 def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]:

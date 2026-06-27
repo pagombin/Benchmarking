@@ -378,3 +378,56 @@ def test_reconcile_indexes_filesystem(web, tmp_path):
     index.reconcile(conn, cfg.results_dir)
     assert queries.get_run(conn, "cli-made-20260101T000000Z") is not None
     conn.close()
+
+
+# ── SPA console (Phase 1: JSON bootstrap APIs + shell serving) ──────────
+
+def test_api_me_reports_role_and_version(web):
+    client, _ = web
+    for user, pw, role in [("viewer", "vpw", "viewer"), ("op", "oppw", "operator"),
+                           ("admin", "apw", "admin")]:
+        r = client.get("/api/me", auth=(user, pw))
+        assert r.status_code == 200
+        body = r.json()
+        assert body["user"] == user and body["role"] == role
+        assert body["version"]
+    # unauthenticated -> 401 (drives the SPA's redirect to /login)
+    assert client.get("/api/me").status_code == 401
+
+
+def test_api_runs_and_jobs_json(web):
+    client, cfg = web
+    # start a run so there's something to index
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _run_worker_once(cfg)
+    runs = client.get("/api/runs", auth=("viewer", "vpw"))
+    assert runs.status_code == 200
+    assert isinstance(runs.json(), list) and len(runs.json()) >= 1
+    assert "run_id" in runs.json()[0]
+    # jobs json never exposes spec_yaml (which carries password_env references)
+    jobs = client.get("/api/jobs", auth=("viewer", "vpw"))
+    assert jobs.status_code == 200
+    for j in jobs.json():
+        assert "spec_yaml" not in j and "id" in j and "state" in j
+    # active filter returns only in-flight states (none after worker drained)
+    active = client.get("/api/jobs?active=1", auth=("viewer", "vpw")).json()
+    assert all(j["state"] in ("queued", "running", "canceling") for j in active)
+    # unauthenticated -> 401
+    assert client.get("/api/runs").status_code == 401
+
+
+def test_spa_shell_served_under_ui(web):
+    client, _ = web
+    # The shell loads unauthenticated and bootstraps via /api/me.
+    root = client.get("/ui")
+    assert root.status_code == 200
+    assert "/static/spa/assets" in root.text  # references the built bundle
+    # client-side routes return the same shell (history fallback)
+    assert client.get("/ui/runs/whatever").status_code == 200
+    # the built asset bundle is actually served by the static mount
+    import re
+    m = re.search(r"/static/spa/assets/[\w.-]+\.js", root.text)
+    assert m, "no JS asset reference in shell"
+    assert client.get(m.group(0)).status_code == 200
