@@ -542,3 +542,28 @@ def test_prepare_enqueues_and_doctor_rbac(web):
     d = client.get("/api/doctor", auth=("op", "oppw"))
     assert d.status_code == 200 and "pgbench-harness" in d.json()["text"]
     assert client.get("/api/doctor", auth=("viewer", "vpw")).status_code == 403
+
+
+# ── regression: SQLite connection usable across threads (FastAPI threadpool) ──
+
+def test_connection_survives_cross_thread_use(tmp_path):
+    """A connection created on one thread must be usable/closable on another —
+    FastAPI runs sync deps in a threadpool and setup/teardown can differ."""
+    import threading
+    from pgbench_webapp.db import connect, migrate
+    db = tmp_path / "x.db"
+    migrate(db)
+    conn = connect(db)                      # created on the main thread
+    errors = []
+
+    def use_and_close():
+        try:
+            list(conn.execute("SELECT 1"))  # used on a different thread
+            conn.close()                    # closed on a different thread
+        except Exception as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=use_and_close)
+    t.start()
+    t.join()
+    assert not errors, f"cross-thread use raised: {errors}"
