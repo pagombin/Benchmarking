@@ -48,6 +48,33 @@ export function openStream(runId: string, h: StreamHandlers): EventSource {
   return es;
 }
 
+// ── task jobs (preflight / prepare / doctor) ────────────────────────────
+
+export interface CheckEvent {
+  name: string;
+  status: string; // ok | warn | fail | info
+  detail: string;
+}
+
+export interface JobHandlers {
+  onCheck?: (c: CheckEvent) => void;
+  onLog?: (line: string) => void;
+  onDone?: (d: { status: string }) => void;
+  onError?: () => void;
+}
+
+export function openJobStream(jobId: number, h: JobHandlers): EventSource {
+  const es = new EventSource(`/api/jobs/${jobId}/stream`);
+  es.addEventListener("check", (e) => h.onCheck?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("log", (e) => h.onLog?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("done", (e) => {
+    h.onDone?.(JSON.parse((e as MessageEvent).data));
+    es.close();
+  });
+  es.onerror = () => h.onError?.();
+  return es;
+}
+
 // ── series model ──────────────────────────────────────────────────────
 // Columnar buffers for uPlot: t (elapsed seconds) + the five harness metrics.
 // Sweep samples.csv uses `t_offset`; soak_timeseries.csv uses `t`.

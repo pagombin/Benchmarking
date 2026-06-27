@@ -517,3 +517,28 @@ def test_rerun_without_target_flags_needs_password(web):
     run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
     rr = client.post(f"/api/runs/{run_id}/rerun", auth=("op", "oppw"))
     assert rr.status_code == 200 and rr.json()["needs_password"] is True
+
+
+# ── lifecycle flows: preflight / prepare / doctor (Phase 4) ─────────────
+
+def test_preflight_job_streams_live_checklist(web):
+    client, cfg = web
+    r = client.post("/api/preflight", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["kind"] == "preflight"
+    job_id = r.json()["job_id"]
+    _run_worker_once(cfg)
+    body = client.get(f"/api/jobs/{job_id}/stream", auth=("viewer", "vpw")).text
+    assert "event: check" in body            # structured per-check events
+    assert "Connectivity" in body            # a known check name
+    assert "event: done" in body
+    # viewer cannot enqueue a preflight (operator+)
+    assert client.post("/api/preflight", json={"spec_yaml": _spec_yaml()}, auth=("viewer", "vpw")).status_code == 403
+
+
+def test_prepare_enqueues_and_doctor_rbac(web):
+    client, cfg = web
+    pj = client.post("/api/prepare", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    assert pj.status_code == 200 and pj.json()["kind"] == "prepare"
+    d = client.get("/api/doctor", auth=("op", "oppw"))
+    assert d.status_code == 200 and "pgbench-harness" in d.json()["text"]
+    assert client.get("/api/doctor", auth=("viewer", "vpw")).status_code == 403

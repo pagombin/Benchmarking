@@ -40,6 +40,21 @@ stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
   - Every run/job now shows its **target host**; history gains a per-row action
     menu (report / spec / clone / re-run). New APIs: `GET/POST/DELETE
     /api/targets`, `POST /api/runs/{id}/rerun`; runs index gains `target_host`.
+- **Phase 4 — preflight / prepare / doctor as live flows:**
+  - **Preflight** runs as a queued job and streams a **live checklist** — each
+    check (tools, connectivity, server version, max_connections, pooler,
+    pg_stat_statements, connection-ceiling probe, dataset) with pass/warn/fail
+    and the verbatim server message. The harness gained `preflight --json` (one
+    structured event per check) that **reuses the exact same checks** as the
+    run/soak preflight — no logic duplicated, default text output unchanged.
+  - **Prepare** runs as a queued job with a live console; **doctor** is a quick
+    environment-health panel (version, git SHA, sysbench/psql availability) that
+    never touches a database.
+  - Reuses the existing queue + worker + password injection: new job kinds
+    `preflight`/`prepare`/`doctor`, a job-scoped SSE at `/api/jobs/{id}/stream`
+    (structured `check` events + `log`), and `POST /api/preflight|/api/prepare`,
+    `GET /api/doctor`. New SPA views: a generic live Job view and a Diagnostics
+    page; New-run gains Preflight / Prepare buttons.
 
 ## 0.8.0
 

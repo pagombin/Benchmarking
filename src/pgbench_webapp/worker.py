@@ -76,10 +76,19 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         get_redactor().register(pw)  # scrub from any harness output the worker reads
 
     before = {p.name for p in cfg.results_dir.iterdir()} if cfg.results_dir.exists() else set()
-    argv = [cfg.harness_bin, job["kind"], "--spec", str(spec_file),
-            "--results-dir", str(cfg.results_dir)]
-    if job["resume_run_id"] and job["kind"] == "run":   # UI-driven resume of a sweep
-        argv += ["--resume", "--run-dir", str(cfg.results_dir / job["resume_run_id"])]
+    kind = job["kind"]
+    if kind == "doctor":                       # environment health; no spec/password
+        argv = [cfg.harness_bin, "doctor"]
+    elif kind == "preflight":                  # live checklist (structured JSON events)
+        argv = [cfg.harness_bin, "preflight", "--spec", str(spec_file), "--json"]
+    elif kind == "prepare":                    # dataset load (no run dir produced)
+        argv = [cfg.harness_bin, "prepare", "--spec", str(spec_file),
+                "--results-dir", str(cfg.results_dir)]
+    else:                                       # run | soak
+        argv = [cfg.harness_bin, kind, "--spec", str(spec_file),
+                "--results-dir", str(cfg.results_dir)]
+        if job["resume_run_id"] and kind == "run":   # UI-driven resume of a sweep
+            argv += ["--resume", "--run-dir", str(cfg.results_dir / job["resume_run_id"])]
     log_path = cfg.data_dir / "jobs" / f"job_{job['id']}.out"
     redact = get_redactor().redact
     with open(log_path, "w", encoding="utf-8") as logf:

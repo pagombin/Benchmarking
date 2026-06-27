@@ -8,10 +8,11 @@ import { useTheme } from "../lib/theme";
 // As each phase lands, flip `external` off and point at the SPA path.
 // Internal routes are basename-relative (the router's basename is /ui); external
 // destinations are still server-rendered Jinja pages reached by full-page nav.
-const NAV: { to: string; label: string; external?: boolean; admin?: boolean }[] = [
+const NAV: { to: string; label: string; external?: boolean; admin?: boolean; op?: boolean }[] = [
   { to: "/", label: "Runs" },
   { to: "/new", label: "New run" },
   { to: "/targets", label: "Targets" },
+  { to: "/diagnostics", label: "Diagnostics", op: true },
   { to: "/compare", label: "Compare", external: true },
   { to: "/admin/users", label: "Users", external: true, admin: true },
   { to: "/admin/settings", label: "Settings", external: true, admin: true },
@@ -20,7 +21,8 @@ const NAV: { to: string; label: string; external?: boolean; admin?: boolean }[] 
 
 export function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
   const [theme, toggle] = useTheme();
-  const items = NAV.filter((n) => !n.admin || me.role === "admin");
+  const items = NAV.filter((n) =>
+    (!n.admin || me.role === "admin") && (!n.op || me.role !== "viewer"));
   return (
     <div className="app">
       <header className="topbar">

@@ -125,12 +125,30 @@ def _maybe_prepare(spec_path: Path, results_dir: Path, do_prepare: bool,
         cmd_prepare(spec_path, results_dir)
 
 
-def cmd_preflight(spec_path: Path) -> int:
-    """`preflight` subcommand."""
+def cmd_preflight(spec_path: Path, json_output: bool = False) -> int:
+    """`preflight` subcommand.
+
+    With ``json_output`` (used by the web tier), emit one JSON event per check on
+    stdout as it completes — a live checklist — and exit non-zero if any check
+    failed. Default text behaviour (used by humans and run/soak) is unchanged.
+    """
     spec = load_spec(spec_path)
     password = spec.password()
     get_redactor().register(password)
     logger = setup_logging()
+    if json_output:
+        import json as _json
+        import sys as _sys
+        worst = "ok"
+        rank = {"ok": 0, "info": 0, "warn": 1, "fail": 2}
+        for event in capture.preflight_steps(spec, password, logger):
+            print(_json.dumps(event), flush=True)
+            if rank.get(event["status"], 0) > rank.get(worst, 0):
+                worst = event["status"]
+        print(_json.dumps({"name": "Preflight", "status": worst,
+                           "detail": "all checks complete"}), flush=True)
+        _sys.stdout.flush()
+        return 0 if worst != "fail" else 1
     pf = capture.run_preflight(spec, password, logger)
     assert pf.dataset is not None
     if pf.dataset.status == "missing":

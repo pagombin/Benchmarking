@@ -8,6 +8,8 @@ import { RunDetail } from "./pages/RunDetail";
 import { ReportView } from "./pages/ReportView";
 import { Targets } from "./pages/Targets";
 import { NewRun } from "./pages/NewRun";
+import { JobView } from "./pages/JobView";
+import { Diagnostics } from "./pages/Diagnostics";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -39,6 +41,8 @@ export function App() {
           <Route path="/" element={<History me={me} />} />
           <Route path="/new" element={<NewRun me={me} />} />
           <Route path="/targets" element={<Targets me={me} />} />
+          <Route path="/diagnostics" element={<Diagnostics />} />
+          <Route path="/jobs/:jobId" element={<JobView />} />
           <Route path="/runs/:runId" element={<RunDetail me={me} />} />
           <Route path="/runs/:runId/report" element={<ReportView />} />
           <Route path="*" element={<Navigate to="/" replace />} />

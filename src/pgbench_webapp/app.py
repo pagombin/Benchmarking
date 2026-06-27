@@ -12,6 +12,7 @@ import difflib
 import io
 import json
 import sqlite3
+import subprocess
 import tarfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -315,28 +316,13 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       conn: sqlite3.Connection = Depends(get_conn),
                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
-        doc = yaml.safe_load(payload.get("spec_yaml", "")) or {}
-        if not isinstance(doc, dict):
-            raise HTTPException(400, "spec must be a YAML mapping")
-        doc.setdefault("target", {})
-        # A saved target is authoritative for the connection (and supplies the
-        # persistent password); the spec editor's target fields are overridden.
-        target_id = payload.get("target_id")
-        if target_id:
-            tgt = queries.get_target(conn, int(target_id))
-            if tgt is None:
-                raise HTTPException(400, "unknown target")
-            doc["target"].update(host=tgt["host"], port=tgt["port"], database=tgt["dbname"],
-                                 user=tgt["dbuser"], sslmode=tgt["sslmode"])
-        # Normalize password_env to the worker's injected var; never store the password in the spec.
-        doc["target"]["password_env"] = "PGB_TARGET_PASSWORD"
-        clean_yaml = yaml.safe_dump(doc, sort_keys=False)
+        clean_yaml, target_id = _spec_with_target(conn, payload)
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
         kind = "soak" if v["mode"] == "soak" else "run"
-        job_id = queries.enqueue_job(conn, kind, clean_yaml, int(target_id) if target_id else None,
-                                     user["username"], scheduled_utc=payload.get("scheduled_utc") or None)
+        job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
+                                     scheduled_utc=payload.get("scheduled_utc") or None)
         password = payload.get("password")
         if password:
             store.set(job_password_ref(job_id), password)  # encrypted, off-DB
@@ -448,6 +434,50 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         store.delete(tgt["password_ref"])
         queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
         return JSONResponse({"deleted": True})
+
+    # ── lifecycle tasks: preflight / prepare / doctor (live via the job queue) ──
+    @app.post("/api/preflight")
+    def api_preflight(request: Request, payload: dict,
+                      conn: sqlite3.Connection = Depends(get_conn),
+                      store: SecretStore = Depends(get_store),
+                      user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        return _enqueue_task(request, payload, conn, store, user, "preflight")
+
+    @app.post("/api/prepare")
+    def api_prepare(request: Request, payload: dict,
+                    conn: sqlite3.Connection = Depends(get_conn),
+                    store: SecretStore = Depends(get_store),
+                    user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        return _enqueue_task(request, payload, conn, store, user, "prepare")
+
+    def _enqueue_task(request: Request, payload: dict, conn: sqlite3.Connection,
+                      store: SecretStore, user: sqlite3.Row, kind: str) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        clean_yaml, target_id = _spec_with_target(conn, payload)
+        v = harness_api.validate_yaml(clean_yaml)
+        if not v.get("ok"):
+            raise HTTPException(400, v.get("error", "invalid spec"))
+        job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"])
+        password = payload.get("password")
+        if password:
+            store.set(job_password_ref(job_id), password)
+        queries.audit(conn, user["username"], f"{kind}_enqueue", target=v["label"],
+                      detail=f"job={job_id}")
+        return JSONResponse({"job_id": job_id, "kind": kind})
+
+    @app.get("/api/doctor")
+    def api_doctor(user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        # Quick, no DB/password: harness version, git SHA, sysbench/psql availability.
+        try:
+            out = subprocess.run([cfg.harness_bin, "doctor"], capture_output=True,
+                                 text=True, timeout=30)
+            return JSONResponse({"text": (out.stdout or out.stderr).strip(), "ok": out.returncode == 0})
+        except (OSError, subprocess.SubprocessError) as exc:
+            return JSONResponse({"text": f"doctor failed: {exc}", "ok": False})
+
+    @app.get("/api/jobs/{job_id}/stream")
+    def job_stream(job_id: int, user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
+        return StreamingResponse(_job_sse(cfg, job_id), media_type="text/event-stream")
 
     # ── reports / artifacts ──
     @app.get("/runs/{run_id}/report", response_class=HTMLResponse)
@@ -739,6 +769,62 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
 def _event(name: str, data: Any) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+def _spec_with_target(conn: sqlite3.Connection, payload: dict) -> tuple[str, Optional[int]]:
+    """Merge a saved target's connection into the spec and normalize password_env.
+
+    A saved target is authoritative for the connection (and supplies the
+    persistent password); the password itself never enters the spec. Shared by
+    run/soak/preflight/prepare enqueue paths.
+    """
+    doc = yaml.safe_load(payload.get("spec_yaml", "")) or {}
+    if not isinstance(doc, dict):
+        raise HTTPException(400, "spec must be a YAML mapping")
+    doc.setdefault("target", {})
+    target_id = payload.get("target_id")
+    if target_id:
+        tgt = queries.get_target(conn, int(target_id))
+        if tgt is None:
+            raise HTTPException(400, "unknown target")
+        doc["target"].update(host=tgt["host"], port=tgt["port"], database=tgt["dbname"],
+                             user=tgt["dbuser"], sslmode=tgt["sslmode"])
+    doc["target"]["password_env"] = "PGB_TARGET_PASSWORD"
+    return yaml.safe_dump(doc, sort_keys=False), (int(target_id) if target_id else None)
+
+
+def _job_sse(cfg: Config, job_id: int, max_ticks: int = 2 * 3600) -> Iterator[str]:
+    """Stream a task job's captured output (preflight/prepare/doctor) line-by-line.
+
+    Each new line is emitted as a ``check`` event when it parses as a structured
+    preflight event, otherwise as a ``log`` line. Ends on terminal job state.
+    """
+    out = cfg.data_dir / "jobs" / f"job_{job_id}.out"
+    conn = connect(cfg.db_path)
+    try:
+        lines_sent = 0
+        for _ in range(max_ticks):
+            if out.exists():
+                lines = out.read_text(encoding="utf-8", errors="replace").splitlines()
+                for line in lines[lines_sent:]:
+                    obj = None
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        obj = None
+                    if isinstance(obj, dict) and "status" in obj and "name" in obj:
+                        yield _event("check", obj)
+                    else:
+                        yield _event("log", line + "\n")
+                lines_sent = len(lines)
+            job = queries.get_job(conn, job_id)
+            state = job["state"] if job else "failed"
+            if state in ("done", "failed", "canceled"):
+                yield _event("done", {"status": state})
+                return
+            time.sleep(1)
+    finally:
+        conn.close()
 
 
 def _epoch(iso: Optional[str]) -> int:

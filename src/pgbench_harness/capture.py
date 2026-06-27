@@ -13,7 +13,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from pgbench_harness import __version__
 from pgbench_harness.errors import PreflightError
@@ -559,6 +559,78 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
     for w in pf.warnings:
         logger.warning("preflight: %s", w)
     return pf
+
+
+def preflight_steps(spec: Spec, password: str,
+                    logger: logging.Logger) -> "Iterator[dict[str, str]]":
+    """Yield one structured event per preflight check, in order, for a live UI.
+
+    Reuses exactly the same check functions as ``run_preflight`` (the source of
+    truth for the run/soak path) — this only changes *packaging* into per-step
+    events with a pass/warn/fail status, so the web tier can render a live
+    checklist. Each event is ``{"name","status","detail"}`` with status in
+    ok|warn|fail|info. A connectivity/tools/dataset failure ends the sequence.
+    """
+    def ev(name: str, status: str, detail: str) -> dict[str, str]:
+        return {"name": name, "status": status, "detail": detail}
+
+    try:
+        detail = f"{sysbench_version()} · {psql_version()}"
+        yield ev("Load-gen tools", "ok", detail)
+    except PreflightError as exc:
+        yield ev("Load-gen tools", "fail", str(exc))
+        return
+    if spec.workload.type == "tpcc":
+        ok = Path(spec.workload.tpcc_path, "tpcc.lua").exists()
+        yield ev("sysbench-tpcc scripts", "ok" if ok else "fail",
+                 f"tpcc @ {tpcc_git_sha(spec.workload.tpcc_path)}" if ok
+                 else f"tpcc.lua not found in {spec.workload.tpcc_path}")
+        if not ok:
+            return
+    try:
+        full = psql_query(spec, password, "SELECT version()")
+        ver = psql_query(spec, password, "SHOW server_version")
+        yield ev("Connectivity", "ok", (full.splitlines()[0][:90] if full else "connected"))
+        yield ev("Server version", "ok", ver)
+    except PreflightError as exc:
+        yield ev("Connectivity", "fail", str(exc))
+        return
+    try:
+        mx = psql_query(spec, password, "SHOW max_connections")
+        peak = peak_threads(spec)
+        ok = mx.isdigit() and int(mx) > peak
+        yield ev("max_connections", "ok" if ok else "warn",
+                 f"{mx} (run peaks at {peak} threads)")
+    except PreflightError as exc:
+        yield ev("max_connections", "warn", str(exc))
+    try:
+        yield ev("Pooler probe", "info", detect_pooler(spec, password))
+    except PreflightError as exc:
+        yield ev("Pooler probe", "info", str(exc))
+    try:
+        present = detect_pg_stat_statements(spec, password)
+        yield ev("pg_stat_statements", "ok" if present else "warn",
+                 "installed" if present else "not installed (per-query stats unavailable)")
+    except PreflightError as exc:
+        yield ev("pg_stat_statements", "warn", str(exc))
+    try:
+        peak = peak_threads(spec)
+        probe = connection_ceiling_probe(spec, password, peak, logger)
+        if probe.succeeded >= probe.requested:
+            yield ev("Connection ceiling", "ok",
+                     f"{probe.succeeded}/{probe.requested} simultaneous connections OK")
+        else:
+            yield ev("Connection ceiling", "warn",
+                     f"only {probe.succeeded}/{probe.requested} established; first refusal "
+                     f"at #{probe.first_failed_index}: {probe.first_error}")
+    except PreflightError as exc:
+        yield ev("Connection ceiling", "warn", str(exc))
+    try:
+        d = check_dataset(spec, password)
+        status = "ok" if d.ok else ("warn" if d.status == "missing" else "fail")
+        yield ev("Dataset", status, f"[{d.status}] {d.detail}")
+    except PreflightError as exc:
+        yield ev("Dataset", "fail", str(exc))
 
 
 def peak_threads(spec: Spec) -> int:

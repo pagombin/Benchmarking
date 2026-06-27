@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { Me, Target } from "../types";
 
@@ -21,6 +21,7 @@ const WORKLOADS = ["tpcc", "oltp_read_write", "oltp_read_only", "oltp_write_only
 
 export function NewRun({ me }: { me: Me }) {
   const canRun = me.role === "operator" || me.role === "admin";
+  const navigate = useNavigate();
   const [params] = useSearchParams();
   const cloneFrom = params.get("from") || "";
 
@@ -110,6 +111,16 @@ export function NewRun({ me }: { me: Me }) {
       await api.post("/api/runs", body);
       window.location.href = "/ui";
     } catch (e) { setErr("could not start: " + (e as Error).message); }
+  }
+  async function task(kind: "preflight" | "prepare") {
+    setErr(null);
+    try {
+      const body: Record<string, unknown> = { spec_yaml: yaml };
+      if (targetMode === "saved") body.target_id = targetId;
+      else body.password = inline.password;
+      const d = await api.post<{ job_id: number }>(`/api/${kind}`, body);
+      navigate(`/jobs/${d.job_id}`);
+    } catch (e) { setErr(`could not start ${kind}: ` + (e as Error).message); }
   }
   async function saveTemplate() {
     try {
@@ -218,6 +229,8 @@ export function NewRun({ me }: { me: Me }) {
           <div className="actions" style={{ marginTop: 10 }}>
             <button onClick={validate}>Validate</button>
             <button onClick={dryRun}>Dry-run</button>
+            {canRun && <button onClick={() => task("preflight")}>Preflight</button>}
+            {canRun && <button onClick={() => task("prepare")}>Prepare data</button>}
             {canRun ? <button className="primary" onClick={start}>Start run</button>
               : <span className="subtle">viewer role: read-only</span>}
           </div>

@@ -21,6 +21,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pf = sub.add_parser("preflight", help="connectivity, version and limits checks")
     pf.add_argument("--spec", required=True, type=Path, help="run spec YAML")
+    pf.add_argument("--json", action="store_true",
+                    help="emit one JSON event per check on stdout (for the web console)")
 
     pr = sub.add_parser("prepare", help="load the dataset (idempotent)")
     pr.add_argument("--spec", required=True, type=Path)
@@ -140,7 +142,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.command == "preflight":
             from pgbench_harness.runner import cmd_preflight
-            return cmd_preflight(args.spec)
+            return cmd_preflight(args.spec, json_output=args.json)
         if args.command == "prepare":
             from pgbench_harness.runner import cmd_prepare
             return cmd_prepare(args.spec, args.results_dir)
