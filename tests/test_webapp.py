@@ -567,3 +567,15 @@ def test_connection_survives_cross_thread_use(tmp_path):
     t.start()
     t.join()
     assert not errors, f"cross-thread use raised: {errors}"
+
+
+def test_sse_streams_pg_metrics(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    pg = cfg.results_dir / run_id / "parsed" / "pg_timeseries.csv"
+    pg.parent.mkdir(parents=True, exist_ok=True)
+    pg.write_text("t,active,total_conn,xacts_s,cache_hit_pct,wal_mb_s\n1,8,20,100.0,98.9,0.5\n")
+    body = client.get(f"/runs/{run_id}/stream", auth=("viewer", "vpw")).text
+    assert "event: pg" in body and "cache_hit_pct" in body

@@ -6,7 +6,8 @@ import { LiveChart } from "../components/LiveChart";
 import { LogConsole } from "../components/LogConsole";
 import { fmtInt } from "../lib/format";
 import {
-  appendBatch, emptySeries, openStream, type Progress, type Series,
+  appendBatch, appendPg, emptyPg, emptySeries, openStream,
+  type PgSeries, type Progress, type Series,
 } from "../lib/sse";
 
 function clock(s: number): string {
@@ -27,11 +28,13 @@ export function RunDetail({ me }: { me: Me }) {
   const [run, setRun] = useState<Run | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [series, setSeries] = useState<Series>(emptySeries());
+  const [pg, setPg] = useState<PgSeries>(emptyPg());
   const [log, setLog] = useState("");
   const [progress, setProgress] = useState<Progress | null>(null);
   const [streamState, setStreamState] = useState("connecting…");
   const [activeJob, setActiveJob] = useState<Job | null>(null);
   const seriesRef = useRef<Series>(emptySeries());
+  const pgRef = useRef<PgSeries>(emptyPg());
   const canRun = me.role === "operator" || me.role === "admin";
 
   useEffect(() => {
@@ -45,7 +48,9 @@ export function RunDetail({ me }: { me: Me }) {
     const es = openStream(runId, {
       onHello: () => {
         seriesRef.current = emptySeries();
+        pgRef.current = emptyPg();
         setSeries(seriesRef.current);
+        setPg(pgRef.current);
         setLog("");
         setStreamState("live");
       },
@@ -54,6 +59,11 @@ export function RunDetail({ me }: { me: Me }) {
         if (b.offset === 0) seriesRef.current = emptySeries();
         appendBatch(seriesRef.current, b);
         setSeries({ ...seriesRef.current });
+      },
+      onPg: (b) => {
+        if (b.offset === 0) pgRef.current = emptyPg();
+        appendPg(pgRef.current, b);
+        setPg({ ...pgRef.current });
       },
       onProgress: (p) => setProgress(p),
       onDone: (d) => {
@@ -191,6 +201,32 @@ export function RunDetail({ me }: { me: Me }) {
             { label: "reconnects/s", values: series.reconn, stroke: PALETTE.reconn },
           ]} />
       </div>
+
+      {pg.t.length > 0 && (
+        <>
+          <div className="section-label">PostgreSQL (engine-side) <span className="subtle">— from the server's own counters; an IOPS-proxy, not device metrics</span></div>
+          <div className="grid2">
+            <div className="card">
+              <LiveChart title="Cache hit % (interval)" xs={pg.t} height={180} yFormat={(v) => `${Math.round(v)}`}
+                series={[{ label: "cache hit %", values: pg.cacheHit, stroke: PALETTE.tps }]} />
+            </div>
+            <div className="card">
+              <LiveChart title="Active connections" xs={pg.t} height={180} yFormat={(v) => fmtInt(v)}
+                series={[{ label: "active", values: pg.active, stroke: PALETTE.qps }]} />
+            </div>
+          </div>
+          <div className="grid2">
+            <div className="card">
+              <LiveChart title="WAL throughput (MB/s)" xs={pg.t} height={180} yFormat={(v) => fmtInt(v)}
+                series={[{ label: "WAL MB/s", values: pg.walMbs, stroke: PALETTE.p99 }]} />
+            </div>
+            <div className="card">
+              <LiveChart title="Server transactions/s" xs={pg.t} height={180} yFormat={(v) => fmtInt(v)}
+                series={[{ label: "xacts/s", values: pg.xactsS, stroke: PALETTE.reconn }]} />
+            </div>
+          </div>
+        </>
+      )}
 
       <LogConsole text={log} />
     </>

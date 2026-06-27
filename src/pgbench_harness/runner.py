@@ -379,7 +379,16 @@ def cmd_run(
     manifest.save(run_dir)
     capture.capture_env(run_dir, spec, password, pf)
     _attach_prepare_stats(spec, results_dir, run_dir, logger)
-    _sweep(spec, password, run_dir, manifest, logger)
+    sampler = (capture.LivePgSampler(spec, password, run_dir,
+                                     spec.capture.live_pg_interval_s, logger)
+               if spec.capture.live_pg else None)
+    if sampler:
+        sampler.start()
+    try:
+        _sweep(spec, password, run_dir, manifest, logger)
+    finally:
+        if sampler:
+            sampler.stop()
     status = manifest.finalize_status()
     manifest.wall_time_s = _wall_time_s(manifest)
     manifest.save(run_dir)
@@ -569,9 +578,16 @@ def cmd_soak(
 
     old_int = signal.signal(signal.SIGINT, _on_signal)
     old_term = signal.signal(signal.SIGTERM, _on_signal)
+    sampler = (capture.LivePgSampler(spec, password, run_dir,
+                                     spec.capture.live_pg_interval_s, logger)
+               if spec.capture.live_pg else None)
+    if sampler:
+        sampler.start()
     try:
         manifest.soak = _soak_supervisor(spec, password, run_dir, manifest, logger, stop=stop)
     finally:
+        if sampler:
+            sampler.stop()
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
     summary = soak.analyze(run_dir, spec, manifest.soak)

@@ -282,6 +282,10 @@ pre.out.dry { background: #0a0e14; color: #cdd9e5; padding: 10px 12px; border-ra
 .chip.status-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .chip.status-fail { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
 
+.section-label { font-size: 13px; font-weight: 600; color: var(--ink-dim); margin: 22px 0 12px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.section-label .subtle { font-weight: 400; }
+
 /* keyboard focus visibility (quality floor) */
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

@@ -62,6 +62,25 @@ stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
   unambiguous. The console's built assets ship in the package (no Node on the
   droplet); the sysbench pgsql-driver check already hard-fails the install. README
   documents that the console lives at `/ui` (classic UI stays at `/`).
+- **Phase 5 — live PostgreSQL metrics:** a lightweight **engine-side sampler**
+  runs during run/soak and records `parsed/pg_timeseries.csv` — cache-hit %
+  (computed *over the interval*, so it shows cache re-warm after a storage
+  reattach), active connections, WAL MB/s, and server transactions/s. It lives in
+  the harness (the CLI benefits too) and runs in the worker's child, which already
+  has the password injected — the web tier never gets DB credentials. Reuses the
+  existing psql helpers, never raises, and writes only numbers (the password-leak
+  gate covers the new file). Streamed to the cockpit as a `pg` SSE event and shown
+  in a "PostgreSQL (engine-side)" chart section, clearly labelled an IOPS-proxy
+  (server counters, not device metrics). Configurable via `capture.live_pg` /
+  `capture.live_pg_interval_s` (default on, every 5s).
+
+### Fix
+- **SQLite "created in a thread" 500s on the live server.** FastAPI runs sync
+  dependencies in a threadpool, so a per-request connection could be opened and
+  closed on different worker threads; `connect()` now uses
+  `check_same_thread=False` (each connection is still used sequentially within one
+  request). This 500-ed `/api/runs`, `/api/jobs` and start-run on the real uvicorn
+  server (the TestClient masked it). Regression test added.
 
 ## 0.8.0
 

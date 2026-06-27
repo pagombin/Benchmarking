@@ -6,10 +6,12 @@ psql is invoked with the password in ``PGPASSWORD`` and sslmode in
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -691,3 +693,132 @@ def _check_ceiling(
         "preflight: connection ceiling OK (%d/%d simultaneous connections)",
         pf.probe.succeeded, pf.probe.requested,
     )
+
+
+# ── live PostgreSQL metrics sampler (engine-side; runs during run/soak) ──────
+#
+# A lightweight background sampler that records engine-side metrics every few
+# seconds during a run, so the web cockpit (and the report) can show what the
+# database was doing — cache-hit %, WAL throughput, active connections, server
+# transactions/s — alongside the load-generator timeline. This is the same
+# honest caveat as the IOPS proxy: these are PostgreSQL's own counters (no shell
+# on the managed host). It reuses psql_query_soft and never raises — a failed
+# sample is skipped, never breaking the run. The password is the run's password
+# (already injected by the worker / read from the spec env var); only numbers are
+# ever written to disk, so nothing secret can land in the timeseries.
+
+# One round-trip: cumulative counters + instantaneous gauges, as a JSON row.
+_LIVE_PG_SELECT = (
+    "(SELECT count(*) FROM pg_stat_activity WHERE state='active') AS active, "
+    "(SELECT count(*) FROM pg_stat_activity) AS total_conn, "
+    "(SELECT COALESCE(sum(xact_commit+xact_rollback),0) FROM pg_stat_database) AS xacts, "
+    "(SELECT COALESCE(sum(blks_hit),0) FROM pg_stat_database) AS blks_hit, "
+    "(SELECT COALESCE(sum(blks_read),0) FROM pg_stat_database) AS blks_read"
+)
+LIVE_PG_SQL = f"SELECT row_to_json(t) FROM (SELECT {_LIVE_PG_SELECT}, " \
+              "(SELECT COALESCE(wal_bytes,0) FROM pg_stat_wal) AS wal_bytes) t"
+LIVE_PG_SQL_NOWAL = f"SELECT row_to_json(t) FROM (SELECT {_LIVE_PG_SELECT}, " \
+                    "0 AS wal_bytes) t"
+LIVE_PG_COLUMNS = ("t", "active", "total_conn", "xacts_s", "cache_hit_pct", "wal_mb_s")
+
+
+def live_pg_query(spec: Spec, password: str) -> Optional[dict[str, Any]]:
+    """One engine-side sample (cumulative counters + gauges); None if unavailable.
+
+    Tries the WAL-aware query first; falls back without ``pg_stat_wal`` on older
+    servers. Never raises.
+    """
+    for sql in (LIVE_PG_SQL, LIVE_PG_SQL_NOWAL):
+        ok, out = psql_query_soft(spec, password, sql)
+        if ok and out.strip():
+            try:
+                row = json.loads(out.strip().splitlines()[0])
+                if isinstance(row, dict):
+                    return dict(row)
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def pg_delta_row(prev: dict[str, Any], cur: dict[str, Any], t: float) -> dict[str, Any]:
+    """Build one timeseries row from two cumulative samples (rates over the gap).
+
+    Cache-hit % is computed *over the interval* (delta hits / delta accesses), so
+    it reflects current cache behaviour — the key signal for re-warm after a
+    storage reattach — not the since-startup average.
+    """
+    dt = max(1e-9, float(cur["_mono"]) - float(prev["_mono"]))
+    d_hit = max(0.0, float(cur["blks_hit"]) - float(prev["blks_hit"]))
+    d_read = max(0.0, float(cur["blks_read"]) - float(prev["blks_read"]))
+    accesses = d_hit + d_read
+    hit_pct = round(100.0 * d_hit / accesses, 2) if accesses > 0 else ""
+    d_xact = max(0.0, float(cur["xacts"]) - float(prev["xacts"]))
+    d_wal = max(0.0, float(cur.get("wal_bytes", 0)) - float(prev.get("wal_bytes", 0)))
+    return {
+        "t": int(round(t)),
+        "active": int(cur.get("active", 0)),
+        "total_conn": int(cur.get("total_conn", 0)),
+        "xacts_s": round(d_xact / dt, 1),
+        "cache_hit_pct": hit_pct,
+        "wal_mb_s": round(d_wal / 1024 / 1024 / dt, 3),
+    }
+
+
+class LivePgSampler:
+    """Background thread sampling engine-side PG metrics into parsed/pg_timeseries.csv.
+
+    Best-effort: it owns no part of the run's correctness. Construct with the
+    run's spec/password/run_dir, ``start()`` before the load and ``stop()`` after.
+    """
+
+    def __init__(self, spec: Spec, password: str, run_dir: Path,
+                 interval_s: int = 5, logger: Optional[logging.Logger] = None) -> None:
+        self.spec = spec
+        self.password = password
+        self.path = run_dir / "parsed" / "pg_timeseries.csv"
+        self.interval = max(1, int(interval_s))
+        self.logger = logger
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _sample(self) -> Optional[dict[str, Any]]:
+        s = live_pg_query(self.spec, self.password)
+        if s is not None:
+            s["_mono"] = time.monotonic()
+        return s
+
+    def _append(self, row: dict[str, Any]) -> None:
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(",".join(str(row[c]) for c in LIVE_PG_COLUMNS) + "\n")
+        except OSError:
+            pass
+
+    def _run(self) -> None:
+        t0 = time.monotonic()
+        prev = self._sample()
+        while not self._stop.wait(self.interval):
+            cur = self._sample()
+            if cur is None:
+                continue
+            if prev is not None:
+                self._append(pg_delta_row(prev, cur, cur["_mono"] - t0))
+            prev = cur
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                fh.write(",".join(LIVE_PG_COLUMNS) + "\n")
+        except OSError:
+            return
+        self._thread = threading.Thread(target=self._run, name="pg-sampler", daemon=True)
+        self._thread.start()
+        if self.logger:
+            self.logger.info("live PG sampler started (every %ds) -> %s",
+                             self.interval, self.path.name)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval + 5)

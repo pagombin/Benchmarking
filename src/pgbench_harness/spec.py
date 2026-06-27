@@ -67,6 +67,8 @@ class Capture:
     bgwriter_stats: bool = True
     io_stats: bool = True
     histogram: bool = True
+    live_pg: bool = True               # background engine-side metrics during the run
+    live_pg_interval_s: int = 5
 
 
 @dataclass(frozen=True)
@@ -281,7 +283,8 @@ def _parse_sweep(sec: dict[str, Any]) -> Sweep:
 
 def _parse_capture(sec: dict[str, Any]) -> Capture:
     _check_keys(sec, "capture", set(),
-                {"pg_settings", "pg_stat_statements", "bgwriter_stats", "io_stats", "histogram"})
+                {"pg_settings", "pg_stat_statements", "bgwriter_stats", "io_stats", "histogram",
+                 "live_pg", "live_pg_interval_s"})
     pss = sec.get("pg_stat_statements", "auto")
     if isinstance(pss, bool):
         pss = "true" if pss else "false"
@@ -293,6 +296,8 @@ def _parse_capture(sec: dict[str, Any]) -> Capture:
         bgwriter_stats=_typed(sec, "capture", "bgwriter_stats", bool, True),
         io_stats=_typed(sec, "capture", "io_stats", bool, True),
         histogram=_typed(sec, "capture", "histogram", bool, True),
+        live_pg=_typed(sec, "capture", "live_pg", bool, True),
+        live_pg_interval_s=_typed(sec, "capture", "live_pg_interval_s", int, 5),
     )
 
 

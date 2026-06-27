@@ -741,6 +741,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
     log = run_dir / "harness.log"
     sent_log = 0
     sent_rows = 0
+    pg_sent = 0
     cur_file: Optional[str] = None
     budget_s = _planned_budget_s(run_dir)
     yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
@@ -759,6 +760,10 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
                 yield _event("samples", {"file": rel, "header": header,
                                          "offset": sent_rows, "rows": data[sent_rows:]})
                 sent_rows = len(data)
+        pg_header, pg_data = _read_csv(run_dir / "parsed" / "pg_timeseries.csv")
+        if pg_header and len(pg_data) > pg_sent:
+            yield _event("pg", {"header": pg_header, "offset": pg_sent, "rows": pg_data[pg_sent:]})
+            pg_sent = len(pg_data)
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
@@ -879,6 +884,15 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
     current = next((f"{lv.get('threads')}t" for lv in levels if lv.get("status") == "running"), "")
     return {"status": status, "elapsed_s": elapsed, "budget_s": budget_s,
             "levels_total": len(levels), "levels_done": done, "current": current}
+
+
+def _read_csv(path: Path) -> tuple[str, list[str]]:
+    """Return (header, data_rows) for a CSV file, or ('', []) if absent/empty."""
+    if path.exists():
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) > 1:
+            return lines[0], lines[1:]
+    return "", []
 
 
 def _read_samples(run_dir: Path) -> tuple[Optional[str], str, list[str]]:

@@ -29,6 +29,7 @@ export interface StreamHandlers {
   onHello?: (h: Hello) => void;
   onLog?: (chunk: string) => void;
   onSamples?: (b: SampleBatch) => void;
+  onPg?: (b: SampleBatch) => void;
   onProgress?: (p: Progress) => void;
   onDone?: (d: { status: string }) => void;
   onError?: () => void;
@@ -39,6 +40,7 @@ export function openStream(runId: string, h: StreamHandlers): EventSource {
   es.addEventListener("hello", (e) => h.onHello?.(JSON.parse((e as MessageEvent).data)));
   es.addEventListener("log", (e) => h.onLog?.(JSON.parse((e as MessageEvent).data)));
   es.addEventListener("samples", (e) => h.onSamples?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("pg", (e) => h.onPg?.(JSON.parse((e as MessageEvent).data)));
   es.addEventListener("progress", (e) => h.onProgress?.(JSON.parse((e as MessageEvent).data)));
   es.addEventListener("done", (e) => {
     h.onDone?.(JSON.parse((e as MessageEvent).data));
@@ -117,4 +119,35 @@ export function appendBatch(s: Series, batch: SampleBatch): void {
 function num(v: string | undefined): number {
   const n = v === undefined ? NaN : parseFloat(v);
   return Number.isNaN(n) ? 0 : n;
+}
+
+// ── engine-side PostgreSQL metrics (live sampler) ───────────────────────
+// pg_timeseries.csv columns: t,active,total_conn,xacts_s,cache_hit_pct,wal_mb_s
+
+export interface PgSeries {
+  t: number[];
+  active: number[];
+  cacheHit: number[];
+  walMbs: number[];
+  xactsS: number[];
+}
+
+export function emptyPg(): PgSeries {
+  return { t: [], active: [], cacheHit: [], walMbs: [], xactsS: [] };
+}
+
+export function appendPg(s: PgSeries, batch: SampleBatch): void {
+  const cols = batch.header.split(",");
+  const ix = (name: string) => cols.indexOf(name);
+  const it = ix("t"), ia = ix("active"), ic = ix("cache_hit_pct"), iw = ix("wal_mb_s"), ix_ = ix("xacts_s");
+  for (const line of batch.rows) {
+    const f = line.split(",");
+    const t = parseFloat(f[it]);
+    if (Number.isNaN(t)) continue;
+    s.t.push(t);
+    s.active.push(num(f[ia]));
+    s.cacheHit.push(num(f[ic]));
+    s.walMbs.push(num(f[iw]));
+    s.xactsS.push(num(f[ix_]));
+  }
 }

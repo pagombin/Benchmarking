@@ -353,3 +353,38 @@ def test_report_kpi_cards(fake_env, spec_file, results_dir) -> None:
     assert "Peak QPS" in html
     assert "p99 latency at peak" in html
     assert "Failed levels / SQL errors" in html
+
+
+# ── live PostgreSQL metrics sampler (Phase 5) ───────────────────────────
+
+def test_pg_delta_row_rates() -> None:
+    from pgbench_harness.capture import pg_delta_row
+    prev = {"_mono": 100.0, "blks_hit": 1000, "blks_read": 100, "xacts": 500,
+            "wal_bytes": 1_000_000, "active": 2, "total_conn": 5}
+    cur = {"_mono": 102.0, "blks_hit": 1900, "blks_read": 110, "xacts": 700,
+           "wal_bytes": 3_000_000, "active": 8, "total_conn": 12}
+    row = pg_delta_row(prev, cur, 2.0)              # dt = 2s
+    assert row["t"] == 2
+    assert row["active"] == 8 and row["total_conn"] == 12
+    assert row["xacts_s"] == 100.0                  # 200 xacts / 2s
+    assert abs(float(row["cache_hit_pct"]) - 98.9) < 0.2   # 900 / 910
+    assert abs(row["wal_mb_s"] - (2_000_000 / 1024 / 1024 / 2)) < 0.01  # MiB/s
+
+
+def test_live_pg_sampler_writes_timeseries(fake_env, spec_file, tmp_path) -> None:
+    import time
+    from pgbench_harness import capture
+    from pgbench_harness.spec import load_spec
+    spec = load_spec(spec_file)
+    run_dir = tmp_path / "run"
+    (run_dir / "parsed").mkdir(parents=True)
+    sampler = capture.LivePgSampler(spec, "any-nonempty-pw", run_dir, interval_s=1)
+    sampler.start()
+    time.sleep(2.4)
+    sampler.stop()
+    lines = (run_dir / "parsed" / "pg_timeseries.csv").read_text().splitlines()
+    assert lines[0] == ",".join(capture.LIVE_PG_COLUMNS)
+    assert len(lines) >= 2                          # at least one delta row
+    cols = dict(zip(capture.LIVE_PG_COLUMNS, lines[1].split(",")))
+    assert 0 <= float(cols["cache_hit_pct"]) <= 100
+    assert float(cols["wal_mb_s"]) >= 0

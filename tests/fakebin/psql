@@ -115,6 +115,13 @@ elif "pg_attribute" in low or "information_schema.columns" in low:
     print(os.environ.get("FAKE_PSQL_CANARY_COLS", str(names_in_list(low))))
 elif "max(id) from sbtest1" in low:
     print(os.environ.get("FAKE_PSQL_MAX_ID", "1000"))
+elif "pg_stat_activity" in low:
+    # live PG sampler: cumulative counters grow with wall-clock so deltas > 0.
+    import json as _json
+    n = int(time.time())
+    print(_json.dumps({"active": 8, "total_conn": 20, "xacts": n * 100,
+                       "blks_hit": n * 9000, "blks_read": n * 100,
+                       "wal_bytes": n * 500000}))
 elif "pg_database_size" in low:
     print("1073741824")
 elif "pg_stat_bgwriter" in low:
