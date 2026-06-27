@@ -55,6 +55,13 @@ stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
     (structured `check` events + `log`), and `POST /api/preflight|/api/prepare`,
     `GET /api/doctor`. New SPA views: a generic live Job view and a Diagnostics
     page; New-run gains Preflight / Prepare buttons.
+- **Phase 7 — installer visibility & one-command install:** `deploy.sh` now prints
+  the **operator-console URL (`/ui`)**, the **installed git SHA**, and whether the
+  prebuilt **console bundle is present** — on both fresh-install and `--update`
+  summaries — so "did my code actually land, and where's the new UI?" is
+  unambiguous. The console's built assets ship in the package (no Node on the
+  droplet); the sysbench pgsql-driver check already hard-fails the install. README
+  documents that the console lives at `/ui` (classic UI stays at `/`).
 
 ## 0.8.0
 

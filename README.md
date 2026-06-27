@@ -365,9 +365,15 @@ a droplet; the CLI keeps working standalone.
 
 ```bash
 sudo ./deploy.sh                 # fresh install (or: sudo ./deploy.sh --update)
-# prints the HTTPS URL (https://<public-ip>:8443), the self-signed cert
-# fingerprint to verify, and the DigitalOcean firewall rule to open the port.
+# prints the operator console URL (https://<public-ip>:8443/ui), the installed
+# git SHA, the self-signed cert fingerprint to verify, and the DigitalOcean
+# firewall rule to open the port.
 ```
+
+The modern **operator console** is served at **`/ui`** (the original server-rendered
+UI remains at `/` during the migration). `deploy.sh` ships the console's prebuilt
+assets, so the droplet needs no Node.js; it also prints the running git SHA so you
+can confirm an update actually landed.
 
 - **Stack:** FastAPI + Uvicorn (TLS), a SQLite control-plane (run index, job
   queue, audit) — the filesystem `results/` tree stays the source of truth — and

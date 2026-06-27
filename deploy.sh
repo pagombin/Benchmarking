@@ -659,6 +659,16 @@ write_version_marker() {
 }
 
 # ----------------------------------------------------------------------------
+# Git SHA actually installed under APP_DIR (so "did my code land?" is answerable).
+installed_sha() {
+  git -C "${APP_DIR}" rev-parse --short HEAD 2>/dev/null || echo "(not a git checkout)"
+}
+
+# Whether the built operator-console SPA bundle is present in the install.
+spa_present() {
+  [[ -f "${APP_DIR}/src/pgbench_webapp/static/spa/index.html" ]]
+}
+
 # Final summary printed after a fresh install / regen.
 # ----------------------------------------------------------------------------
 # NOTE: the banner lines below intentionally embed our own color-escape
@@ -677,12 +687,20 @@ print_install_summary() {
   printf   "${C_BOLD}${C_GRN} pgbench-harness web app is installed and running${C_RESET}\n"
   printf   "${C_BOLD}${C_GRN}========================================================${C_RESET}\n"
   printf "\n"
-  printf "  Version       : %s\n" "${ver}"
-  printf "  URL           : ${C_BOLD}https://%s:%s${C_RESET}\n" "${display_ip}" "${PORT}"
+  printf "  Version       : %s  (git %s)\n" "${ver}" "$(installed_sha)"
+  printf "  Console (UI)  : ${C_BOLD}https://%s:%s/ui${C_RESET}\n" "${display_ip}" "${PORT}"
+  printf "  Classic UI    : https://%s:%s/   (legacy; the console at /ui is the new UI)\n" "${display_ip}" "${PORT}"
   printf "  Admin user    : %s\n" "${ADMIN_USER}"
   printf "  Health check  : https://%s:%s/healthz\n" "${display_ip}" "${PORT}"
   printf "  Data dir      : %s\n" "${DATA_DIR}"
   printf "  Logs (journal): journalctl -u %s -f   |   journalctl -u %s -f\n" "${WEB_UNIT}" "${WORKER_UNIT}"
+  if spa_present; then
+    printf "  Console build : present\n"
+  else
+    printf "  ${C_YEL}Console build : MISSING — /ui will show a placeholder. The classic UI at /\n"
+    printf "                  still works. Build it (npm --prefix frontend ci && npm --prefix\n"
+    printf "                  frontend run build) or install a release that ships the assets.${C_RESET}\n"
+  fi
   printf "\n"
 
   printf "${C_BOLD}TLS certificate (SELF-SIGNED)${C_RESET}\n"
@@ -801,9 +819,14 @@ do_update() {
   else
     local ip; ip="$(detect_public_ip)"
     printf "\n${C_GRN}Update complete.${C_RESET} Services restarted.\n"
-    printf "  URL    : https://%s:%s\n" "${ip:-<droplet-ip>}" "${PORT}"
-    printf "  Health : https://%s:%s/healthz\n" "${ip:-<droplet-ip>}" "${PORT}"
-    printf "  Logs   : journalctl -u %s -f\n\n" "${WEB_UNIT}"
+    printf "  Version : %s  (git %s)\n" "${ver}" "$(installed_sha)"
+    printf "  Console : ${C_BOLD}https://%s:%s/ui${C_RESET}   (classic UI at /)\n" "${ip:-<droplet-ip>}" "${PORT}"
+    printf "  Health  : https://%s:%s/healthz\n" "${ip:-<droplet-ip>}" "${PORT}"
+    printf "  Logs    : journalctl -u %s -f\n" "${WEB_UNIT}"
+    if ! spa_present; then
+      printf "  ${C_YEL}Note: operator-console SPA bundle is missing; /ui will show a placeholder.${C_RESET}\n"
+    fi
+    printf "\n"
   fi
 }
 
