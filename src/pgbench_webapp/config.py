@@ -8,8 +8,21 @@ is one directory and updates never touch it.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def _default_harness_bin() -> str:
+    """Resolve the pgbench-harness CLI without relying on PATH.
+
+    The web/worker run under systemd with a minimal PATH that excludes the venv
+    bin, so a bare ``pgbench-harness`` would not resolve. The CLI is installed
+    next to the running interpreter, so prefer that absolute path; fall back to
+    the bare name (PATH) only if it isn't there.
+    """
+    candidate = Path(sys.executable).parent / "pgbench-harness"
+    return str(candidate) if candidate.exists() else "pgbench-harness"
 
 
 @dataclass(frozen=True)
@@ -42,7 +55,7 @@ def load_config() -> Config:
         tls_key=Path(os.environ.get("PGBENCH_TLS_KEY", str(certs / "key.pem"))),
         bind=os.environ.get("PGBENCH_BIND", "0.0.0.0"),
         port=int(os.environ.get("PGBENCH_PORT", "8443")),
-        harness_bin=os.environ.get("PGBENCH_HARNESS_BIN", "pgbench-harness"),
+        harness_bin=os.environ.get("PGBENCH_HARNESS_BIN") or _default_harness_bin(),
     )
 
 

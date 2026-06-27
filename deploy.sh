@@ -477,6 +477,10 @@ PGBENCH_BIND=${BIND}
 PGBENCH_PORT=${PORT}
 PGBENCH_TLS_CERT=${CERT_PEM}
 PGBENCH_TLS_KEY=${KEY_PEM}
+# Absolute path to the CLI the web/worker shell out to. systemd gives services a
+# minimal PATH that excludes the venv bin, so a bare "pgbench-harness" would not
+# resolve (doctor/preflight/runs would fail with "No such file or directory").
+PGBENCH_HARNESS_BIN=${BIN_HARNESS}
 EOF
   chmod 0644 "${ENV_FILE}"
   ok "Env file written (port=${PORT}, bind=${BIND})."
