@@ -10,6 +10,10 @@ import { Targets } from "./pages/Targets";
 import { NewRun } from "./pages/NewRun";
 import { JobView } from "./pages/JobView";
 import { Diagnostics } from "./pages/Diagnostics";
+import { Compare } from "./pages/Compare";
+import { Settings } from "./pages/Settings";
+import { Users } from "./pages/Users";
+import { Audit } from "./pages/Audit";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -43,6 +47,10 @@ export function App() {
           <Route path="/targets" element={<Targets me={me} />} />
           <Route path="/diagnostics" element={<Diagnostics />} />
           <Route path="/jobs/:jobId" element={<JobView />} />
+          <Route path="/compare" element={<Compare />} />
+          {me.role === "admin" && <Route path="/settings" element={<Settings />} />}
+          {me.role === "admin" && <Route path="/users" element={<Users me={me} />} />}
+          {me.role === "admin" && <Route path="/audit" element={<Audit />} />}
           <Route path="/runs/:runId" element={<RunDetail me={me} />} />
           <Route path="/runs/:runId/report" element={<ReportView />} />
           <Route path="*" element={<Navigate to="/" replace />} />

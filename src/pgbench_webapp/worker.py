@@ -15,9 +15,11 @@ Design choices that satisfy "survives UI/web restart and disconnects":
 from __future__ import annotations
 
 import os
+import re
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +61,16 @@ def _run_dir_names(results_dir: Path) -> set[str]:
         return set()
     return {p.name for p in results_dir.iterdir()
             if p.is_dir() and (p / "manifest.json").exists()}
+
+
+def _parse_run_id(output: str, results_dir: Path) -> Optional[str]:
+    """Extract the run id from the harness's own stdout (it logs ``... -> <run_dir>``).
+
+    This is exact per-job, so it attributes runs correctly even when several jobs
+    run concurrently (the global new-dir set-diff cannot). Returns None if not found.
+    """
+    m = re.search(re.escape(str(results_dir)) + r"/([A-Za-z0-9][A-Za-z0-9._-]*)", output)
+    return m.group(1) if m else None
 
 
 def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
@@ -104,6 +116,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             argv += ["--resume", "--run-dir", str(cfg.results_dir / job["resume_run_id"])]
     log_path = cfg.data_dir / "jobs" / f"job_{job['id']}.out"
     redact = get_redactor().redact
+    head: list[str] = []
     try:
         with open(log_path, "w", encoding="utf-8") as logf:
             proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
@@ -111,17 +124,22 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             queries.update_job(conn, job["id"], pid=proc.pid)
             assert proc.stdout is not None
             for line in proc.stdout:
-                logf.write(redact(line))
+                red = redact(line)
+                logf.write(red)
                 logf.flush()
+                if len(head) < 400:        # enough to capture the early "run -> <dir>" line
+                    head.append(red)
             rc = proc.wait()
 
-        # Only run/soak produce a run directory; detect it by the new manifest-
-        # bearing dir (resume reuses its existing one). preflight/prepare/doctor
-        # never set a run_id.
+        # Only run/soak produce a run directory. Prefer the id the harness printed
+        # (exact per-job, concurrency-safe); fall back to the new manifest-bearing
+        # dir, then to the resume dir. preflight/prepare/doctor never set a run_id.
         run_id: Optional[str] = None
         if kind in ("run", "soak"):
-            new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
-            run_id = new_dirs[-1] if new_dirs else (job["resume_run_id"] or None)
+            run_id = _parse_run_id("".join(head), cfg.results_dir)
+            if run_id is None:
+                new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
+                run_id = new_dirs[-1] if new_dirs else (job["resume_run_id"] or None)
         fresh = queries.get_job(conn, job["id"])
         canceling = fresh is not None and fresh["state"] == "canceling"
         if canceling or rc < 0:   # rc < 0 => killed by a signal (our cancel SIGTERM)
@@ -185,24 +203,52 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
                                error="interrupted (worker restart); resume from the run page")
 
 
+def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
+    """Execute one job on its own DB connection (used for concurrent runs)."""
+    conn = connect(cfg.db_path)
+    try:
+        job = queries.get_job(conn, job_id)
+        if job is not None:
+            run_job(cfg, conn, job, store)
+    except Exception as exc:  # noqa: BLE001  (one bad job must not kill the worker)
+        try:
+            queries.update_job(conn, job_id, state="failed", pid=None,
+                               finished_utc=utc_now_iso(), error=str(exc)[:500])
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        conn.close()
+
+
 def worker_loop(cfg: Optional[Config] = None) -> None:
-    """Long-running poll loop (the `pgbench-worker` service)."""
+    """Long-running poll loop (the ``pgbench-worker`` service).
+
+    Honors the admin-set ``max_concurrency``: up to N jobs run at once, each in
+    its own thread with its own SQLite connection. Only this loop claims jobs
+    (single claimer → no claim race); ``claim_next_job`` still gates on
+    ``running_count`` so the limit holds even if the setting changes mid-flight.
+    """
     cfg = cfg or load_config()
     ensure_dirs(cfg)
     conn = connect(cfg.db_path)
     reconcile_startup(cfg, conn)
     store = _store(cfg)
+    active: dict[int, threading.Thread] = {}
     while True:
-        max_conc = int(queries.get_setting(conn, "max_concurrency", "1") or "1")
+        for jid in [j for j, t in active.items() if not t.is_alive()]:
+            active.pop(jid).join()
+        max_conc = max(1, int(queries.get_setting(conn, "max_concurrency", "1") or "1"))
+        if len(active) >= max_conc:
+            time.sleep(POLL_SECONDS)
+            continue
         job = queries.claim_next_job(conn, max_conc)
         if job is None:
             time.sleep(POLL_SECONDS)
             continue
-        try:
-            run_job(cfg, conn, job, store)
-        except Exception as exc:  # noqa: BLE001  (one bad job must not kill the worker)
-            queries.update_job(conn, job["id"], state="failed", pid=None,
-                               finished_utc=utc_now_iso(), error=str(exc)[:500])
+        t = threading.Thread(target=_run_job_threaded, args=(cfg, store, job["id"]),
+                             name=f"job-{job['id']}", daemon=True)
+        active[job["id"]] = t
+        t.start()
 
 
 def cancel_job_process(conn: sqlite3.Connection, job_id: int) -> bool:

@@ -137,10 +137,10 @@ def test_rbac_matrix(web):
     # viewer: can validate, cannot start/cancel/admin
     assert client.post("/api/validate", json={"spec_yaml": spec}, auth=("viewer", "vpw")).status_code == 200
     assert client.post("/api/runs", json={"spec_yaml": spec}, auth=("viewer", "vpw")).status_code == 403
-    assert client.get("/admin/users", auth=("viewer", "vpw")).status_code == 403
-    assert client.get("/audit", auth=("op", "oppw")).status_code == 403          # operator not admin
+    assert client.get("/api/users", auth=("viewer", "vpw")).status_code == 403
+    assert client.get("/api/audit", auth=("op", "oppw")).status_code == 403       # operator not admin
     # operator: can start; admin: can admin
-    assert client.get("/admin/users", auth=("admin", "apw")).status_code == 200
+    assert client.get("/api/users", auth=("admin", "apw")).status_code == 200
     # unauthenticated
     assert client.post("/api/validate", json={"spec_yaml": spec}).status_code == 401
 
@@ -350,11 +350,11 @@ def test_provider_fetch_mocked_no_token_leak(web, monkeypatch, tmp_path):
 
 def test_settings_save_keeps_secrets_off_db(web):
     client, cfg = web
-    r = client.post("/admin/settings", data={
-        "csrf_token": "", "base_url": "https://h:8443", "do_cluster_id": "c1",
+    r = client.post("/api/admin/settings", json={
+        "base_url": "https://h:8443", "do_cluster_id": "c1",
         "do_api_token": "do-tok-SECRET", "slack_webhook": "https://hooks/secret",
-        "smtp_host": "", "smtp_port": "587"}, auth=("admin", "apw"))
-    assert r.status_code in (200, 303)
+        "smtp": {"host": "", "port": 587}, "slack": {}}, auth=("admin", "apw"))
+    assert r.status_code == 200
     from pgbench_webapp import provider, notify
     _, store = _conn_store(cfg)
     assert store.get(provider.DO_TOKEN_REF) == "do-tok-SECRET"
@@ -647,3 +647,45 @@ def test_reconcile_skips_malformed_manifest(web, tmp_path):
 
 def cfg_results(web):
     return web[1].results_dir
+
+
+# ── Phase 8: SPA admin APIs, concurrency, run-id parsing ────────────────
+
+def test_parse_run_id_from_output():
+    from pathlib import Path
+    from pgbench_webapp.worker import _parse_run_id
+    rd = Path("/var/lib/pgbench-harness/results")
+    rid = "advanced-8c32g-tpcc-20260101-000000"
+    assert _parse_run_id(f"run {rid} -> {rd}/{rid} (budget 5m)\n", rd) == rid
+    assert _parse_run_id("nothing here", rd) is None
+
+
+def test_admin_settings_api_and_concurrency(web):
+    client, _ = web
+    assert client.get("/api/admin/settings", auth=("op", "oppw")).status_code == 403
+    s = client.get("/api/admin/settings", auth=("admin", "apw")).json()
+    assert s["max_concurrency"] == 1 and "has_smtp_pw" in s
+    r = client.post("/api/admin/settings",
+                    json={"max_concurrency": 4, "smtp": {}, "slack": {}, "base_url": ""},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200
+    assert client.get("/api/admin/settings", auth=("admin", "apw")).json()["max_concurrency"] == 4
+
+
+def test_users_api_create_update_self_protect(web):
+    client, _ = web
+    assert client.get("/api/users", auth=("viewer", "vpw")).status_code == 403
+    assert client.post("/api/users", json={"username": "bob", "password": "pw", "role": "operator"},
+                       auth=("admin", "apw")).status_code == 200
+    assert any(u["username"] == "bob" for u in client.get("/api/users", auth=("admin", "apw")).json())
+    assert client.post("/api/users/bob", json={"role": "viewer"}, auth=("admin", "apw")).status_code == 200
+    # an admin cannot lock themselves out
+    assert client.post("/api/users/admin", json={"disabled": True}, auth=("admin", "apw")).status_code == 400
+
+
+def test_legacy_admin_paths_redirect_to_console(web):
+    client, _ = web
+    for path, target in [("/admin/users", "/ui/users"), ("/admin/settings", "/ui/settings"),
+                         ("/audit", "/ui/audit"), ("/compare", "/ui/compare")]:
+        r = client.get(path, auth=("admin", "apw"), follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == target

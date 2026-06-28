@@ -6,17 +6,17 @@ import { useTheme } from "../lib/theme";
 // During the migration some destinations are still server-rendered Jinja pages.
 // `external: true` routes do a full-page navigation; the rest are SPA routes.
 // As each phase lands, flip `external` off and point at the SPA path.
-// Internal routes are basename-relative (the router's basename is /ui); external
-// destinations are still server-rendered Jinja pages reached by full-page nav.
-const NAV: { to: string; label: string; external?: boolean; admin?: boolean; op?: boolean }[] = [
+// All console pages are SPA routes now (basename /ui). The legacy Jinja paths
+// redirect here, so the UI is fully self-contained.
+const NAV: { to: string; label: string; admin?: boolean; op?: boolean }[] = [
   { to: "/", label: "Runs" },
   { to: "/new", label: "New run" },
   { to: "/targets", label: "Targets" },
+  { to: "/compare", label: "Compare" },
   { to: "/diagnostics", label: "Diagnostics", op: true },
-  { to: "/compare", label: "Compare", external: true },
-  { to: "/admin/users", label: "Users", external: true, admin: true },
-  { to: "/admin/settings", label: "Settings", external: true, admin: true },
-  { to: "/audit", label: "Audit", external: true, admin: true },
+  { to: "/users", label: "Users", admin: true },
+  { to: "/settings", label: "Settings", admin: true },
+  { to: "/audit", label: "Audit", admin: true },
 ];
 
 export function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
@@ -30,15 +30,11 @@ export function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
           pgbench<span className="tick">/</span><span className="dim">harness</span>
         </div>
         <nav className="topnav">
-          {items.map((n) =>
-            n.external ? (
-              <a key={n.to} href={n.to}>{n.label}</a>
-            ) : (
-              <NavLink key={n.to} to={n.to} end className={({ isActive }) => (isActive ? "active" : "")}>
-                {n.label}
-              </NavLink>
-            )
-          )}
+          {items.map((n) => (
+            <NavLink key={n.to} to={n.to} end className={({ isActive }) => (isActive ? "active" : "")}>
+              {n.label}
+            </NavLink>
+          ))}
         </nav>
         <div className="spacer" />
         <div className="who">

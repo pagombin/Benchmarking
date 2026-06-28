@@ -535,12 +535,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return StreamingResponse(_sse(cfg, run_dir), media_type="text/event-stream")
 
     # ── compare ──
-    @app.get("/compare", response_class=HTMLResponse)
-    def compare_page(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        return page(request, "compare.html", user, runs=queries.list_runs(conn))
+    @app.get("/compare")
+    def compare_to_console() -> Response:
+        return RedirectResponse("/ui/compare", status_code=307)
 
     @app.get("/compare/view", response_class=HTMLResponse)
     def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
@@ -554,11 +551,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         path = harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
         return HTMLResponse(path.read_text(encoding="utf-8"))
 
-    # ── admin: users / audit ──
-    @app.get("/admin/users", response_class=HTMLResponse)
-    def users_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                   user: sqlite3.Row = Depends(require("admin"))) -> Response:
-        return page(request, "admin_users.html", user, users=queries.list_users(conn))
+    # ── admin: users / audit (legacy paths redirect into the console) ──
+    @app.get("/admin/users")
+    def users_to_console() -> Response:
+        return RedirectResponse("/ui/users", status_code=307)
 
     @app.post("/admin/users")
     def users_create(request: Request, username: str = Form(...), password: str = Form(...),
@@ -575,10 +571,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         queries.audit(conn, user["username"], "user_create", target=username, detail=role)
         return RedirectResponse("/admin/users", status_code=303)
 
-    @app.get("/audit", response_class=HTMLResponse)
-    def audit_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                   user: sqlite3.Row = Depends(require("admin"))) -> Response:
-        return page(request, "audit.html", user, rows=queries.list_audit(conn))
+    @app.get("/audit")
+    def audit_to_console() -> Response:
+        return RedirectResponse("/ui/audit", status_code=307)
 
     @app.get("/audit/export.csv")
     def audit_export(conn: sqlite3.Connection = Depends(get_conn),
@@ -592,45 +587,108 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return Response(buf.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
 
-    # ── admin settings: notifications + provider metrics (secrets server-side) ──
-    @app.get("/admin/settings", response_class=HTMLResponse)
-    def settings_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                      user: sqlite3.Row = Depends(require("admin"))) -> Response:
-        nc = notify.get_config(conn)
-        return page(request, "admin_settings.html", user,
-                    notify_cfg=nc, base_url=queries.get_setting(conn, "base_url", ""),
-                    do_cluster=queries.get_setting(conn, "do_cluster_id", ""),
-                    has_smtp_pw=bool(store.get(notify.SMTP_PASSWORD_REF)),
-                    has_slack=bool(store.get(notify.SLACK_WEBHOOK_REF)),
-                    has_do_token=bool(store.get(provider.DO_TOKEN_REF)))
+    @app.get("/admin/settings")
+    def settings_to_console() -> Response:
+        return RedirectResponse("/ui/settings", status_code=307)
 
-    @app.post("/admin/settings")
-    def settings_save(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                      user: sqlite3.Row = Depends(require("admin")),
-                      csrf_token: str = Form(""), base_url: str = Form(""),
-                      smtp_host: str = Form(""), smtp_port: str = Form("587"),
-                      smtp_user: str = Form(""), smtp_from: str = Form(""),
-                      smtp_to: str = Form(""), smtp_tls: str = Form("on"),
-                      smtp_password: str = Form(""), slack_enabled: str = Form(""),
-                      slack_webhook: str = Form(""), do_cluster_id: str = Form(""),
-                      do_api_token: str = Form("")) -> Response:
-        _check_csrf(request, csrf_token)
+    # ── JSON admin APIs (consumed by the SPA Users/Audit/Settings pages) ──
+    @app.get("/api/users")
+    def api_users(conn: sqlite3.Connection = Depends(get_conn),
+                  user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        return JSONResponse([dict(r) for r in queries.list_users(conn)])
+
+    @app.post("/api/users")
+    def api_create_user2(request: Request, payload: dict,
+                         conn: sqlite3.Connection = Depends(get_conn),
+                         user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        username = str(payload.get("username", "")).strip()
+        password = payload.get("password") or ""
+        role = str(payload.get("role", "viewer"))
+        if not username or not password:
+            raise HTTPException(400, "username and password are required")
+        if role not in ROLE_RANK:
+            raise HTTPException(400, "bad role")
+        try:
+            queries.create_user(conn, username, hash_password(password), role)
+        except sqlite3.IntegrityError:
+            raise HTTPException(400, "a user with that name already exists")
+        queries.audit(conn, user["username"], "user_create", target=username, detail=role)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/users/{username}")
+    def api_update_user(username: str, request: Request, payload: dict,
+                        conn: sqlite3.Connection = Depends(get_conn),
+                        user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        if queries.get_user(conn, username) is None:
+            raise HTTPException(404, "user not found")
+        if username == user["username"] and (payload.get("disabled")
+                                             or payload.get("role") not in (None, "admin")):
+            raise HTTPException(400, "you can't disable or demote your own admin account")
+        if "role" in payload:
+            if payload["role"] not in ROLE_RANK:
+                raise HTTPException(400, "bad role")
+            queries.set_user_role(conn, username, payload["role"])
+        if "disabled" in payload:
+            queries.set_user_disabled(conn, username, bool(payload["disabled"]))
+        if payload.get("password"):
+            queries.set_user_password(conn, username, hash_password(payload["password"]))
+        queries.audit(conn, user["username"], "user_update", target=username,
+                      detail=",".join(k for k in ("role", "disabled", "password") if k in payload))
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/audit")
+    def api_audit(limit: int = 500, conn: sqlite3.Connection = Depends(get_conn),
+                  user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        rows = queries.list_audit(conn, limit=min(max(limit, 1), 5000))
+        return JSONResponse([dict(r) for r in rows])
+
+    @app.get("/api/admin/settings")
+    def api_admin_settings(conn: sqlite3.Connection = Depends(get_conn),
+                           user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        return JSONResponse({
+            "notify": notify.get_config(conn),
+            "base_url": queries.get_setting(conn, "base_url", ""),
+            "do_cluster_id": queries.get_setting(conn, "do_cluster_id", ""),
+            "max_concurrency": int(queries.get_setting(conn, "max_concurrency", "1") or 1),
+            "has_smtp_pw": bool(store.get(notify.SMTP_PASSWORD_REF)),
+            "has_slack": bool(store.get(notify.SLACK_WEBHOOK_REF)),
+            "has_do_token": bool(store.get(provider.DO_TOKEN_REF))})
+
+    @app.post("/api/admin/settings")
+    def api_admin_settings_save(request: Request, payload: dict,
+                                conn: sqlite3.Connection = Depends(get_conn),
+                                user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        smtp = payload.get("smtp") or {}
+        slack = payload.get("slack") or {}
+        try:
+            port = int(smtp.get("port") or 587)
+        except (TypeError, ValueError):
+            port = 587
         notify.set_config(conn, {
-            "smtp": {"host": smtp_host, "port": int(smtp_port or 587), "user": smtp_user,
-                     "from": smtp_from, "to": smtp_to, "tls": smtp_tls == "on"},
-            "slack": {"enabled": slack_enabled == "on"}})
-        queries.set_setting(conn, "base_url", base_url)
-        queries.set_setting(conn, "do_cluster_id", do_cluster_id)
+            "smtp": {"host": str(smtp.get("host", "")), "port": port,
+                     "user": str(smtp.get("user", "")), "from": str(smtp.get("from", "")),
+                     "to": str(smtp.get("to", "")), "tls": bool(smtp.get("tls", True))},
+            "slack": {"enabled": bool(slack.get("enabled"))}})
+        queries.set_setting(conn, "base_url", str(payload.get("base_url", "")))
+        queries.set_setting(conn, "do_cluster_id", str(payload.get("do_cluster_id", "")))
+        if payload.get("max_concurrency") is not None:
+            try:
+                mc = max(1, min(16, int(payload["max_concurrency"])))
+                queries.set_setting(conn, "max_concurrency", str(mc))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "max_concurrency must be an integer 1–16")
         # Secrets only updated when a new value is supplied (blank leaves as-is).
-        if smtp_password:
-            store.set(notify.SMTP_PASSWORD_REF, smtp_password)
-        if slack_webhook:
-            store.set(notify.SLACK_WEBHOOK_REF, slack_webhook)
-        if do_api_token:
-            store.set(provider.DO_TOKEN_REF, do_api_token)
-        queries.audit(conn, user["username"], "settings_update",
-                      detail="notifications/provider config changed")
-        return RedirectResponse("/admin/settings", status_code=303)
+        if payload.get("smtp_password"):
+            store.set(notify.SMTP_PASSWORD_REF, payload["smtp_password"])
+        if payload.get("slack_webhook"):
+            store.set(notify.SLACK_WEBHOOK_REF, payload["slack_webhook"])
+        if payload.get("do_api_token"):
+            store.set(provider.DO_TOKEN_REF, payload["do_api_token"])
+        queries.audit(conn, user["username"], "settings_update", detail="via console settings")
+        return JSONResponse({"ok": True})
 
     @app.post("/api/notify/test")
     def notify_test(request: Request, conn: sqlite3.Connection = Depends(get_conn),

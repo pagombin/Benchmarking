@@ -2,6 +2,22 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Console parity (Jinja fully retired) + real concurrency.**
+  - **Compare, Users, Settings, Audit are now SPA pages** — the last server-
+    rendered pages are ported. The legacy paths (`/compare`, `/admin/users`,
+    `/admin/settings`, `/audit`) redirect into the console; new JSON APIs back
+    them (`GET/POST /api/users`, `POST /api/users/{u}`, `GET /api/audit`,
+    `GET/POST /api/admin/settings`). Users page guards against an admin locking
+    themselves out. Settings consolidates notifications + DigitalOcean + run
+    concurrency with inline help.
+  - **`max_concurrency` now actually parallelizes.** The worker runs up to N jobs
+    at once, each in its own thread with its own SQLite connection (only the loop
+    claims, so no claim race; `claim_next_job` still gates on `running_count`).
+    Run-id is now parsed from the harness's own stdout (`… -> <run_dir>`), which
+    is exact per job and therefore concurrency-safe. The value is configurable on
+    the **Settings** page with a clear description of what it does and the
+    trade-offs.
+
 - **Bug-bash hardening** (multi-subsystem review). Fixes:
   - **Security — path traversal** in `/api/diff` (`a`/`b`) and `/compare/view`
     (`runs`): these are query params (not constrained like path params), so a
