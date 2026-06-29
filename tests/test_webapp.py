@@ -174,6 +174,46 @@ def test_compare_same_type_only(web):
     assert r.status_code == 400 and "Internal Server Error" not in r.text
 
 
+def test_resume_reuses_saved_target(web):
+    """Resume must reuse the original run's saved target (it used to enqueue with
+    target=None, so resumed sweeps failed with no credentials)."""
+    import json as _json
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    client, cfg = web
+    tid = _make_target(client).json()["id"]
+    rid = "run-resumed"
+    rd = cfg.results_dir / rid
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(_json.dumps(
+        {"run_id": rid, "mode": "sweep", "status": "failed"}), encoding="utf-8")
+    (rd / "spec.yaml").write_text("run:\n  label: r\nworkload:\n  type: tpcc\n", encoding="utf-8")
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "run", "run:\n  label: r\n", tid, "op")
+    queries.update_job(conn, jid, run_id=rid)
+    conn.close()
+
+    r = client.post(f"/api/runs/{rid}/resume", auth=("op", "oppw"))
+    assert r.status_code == 200
+    conn = connect(cfg.db_path)
+    nj = queries.get_job(conn, r.json()["job_id"])
+    conn.close()
+    assert nj["target_id"] == tid and nj["resume_run_id"] == rid   # reused, not None
+
+
+def test_run_routes_reject_path_traversal(web):
+    """results/<run_id> path construction rejects '..'/separators (artifact tarball
+    used to be able to escape to the secrets store)."""
+    import pytest as _pt
+    from fastapi import HTTPException
+    from pgbench_webapp.app import _run_dir_safe
+    _, cfg = web
+    for bad in ("..", "../etc", "a/b", ".hidden", "..%2fsecret.key"):
+        with _pt.raises(HTTPException):
+            _run_dir_safe(cfg, bad)
+    assert _run_dir_safe(cfg, "run-ok").name == "run-ok"
+
+
 # ── migrations ──────────────────────────────────────────────────────
 
 def test_migrations_idempotent(tmp_path):

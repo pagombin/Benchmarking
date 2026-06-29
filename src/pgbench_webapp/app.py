@@ -352,7 +352,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                  conn: sqlite3.Connection = Depends(get_conn),
                  user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         etype = payload.get("type", "note")
@@ -365,11 +365,15 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                    conn: sqlite3.Connection = Depends(get_conn),
                    user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, request.headers.get("x-csrf-token"))
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         spec_path = run_dir / "spec.yaml"
         if not spec_path.exists():
             raise HTTPException(404, "run/spec not found")
-        job_id = queries.enqueue_job(conn, "run", spec_path.read_text(), None,
+        # Reuse the original run's saved target so the resumed job has credentials
+        # (enqueuing with target=None left resumed sweeps with no password).
+        prev = queries.job_for_run(conn, run_id)
+        target_id = prev["target_id"] if prev else None
+        job_id = queries.enqueue_job(conn, "run", spec_path.read_text(), target_id,
                                      user["username"], resume_run_id=run_id)
         queries.audit(conn, user["username"], "run_resume", target=run_id, detail=f"job={job_id}")
         return JSONResponse({"job_id": job_id})
@@ -380,7 +384,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                   store: SecretStore = Depends(get_store),
                   user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, request.headers.get("x-csrf-token"))
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         spec_path = run_dir / "spec.yaml"
         if not spec_path.exists():
             raise HTTPException(404, "run/spec not found")
@@ -528,7 +532,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/runs/{run_id}/report", response_class=HTMLResponse)
     def run_report(run_id: str, request: Request, regen: int = 0,
                    user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         out = run_dir / harness_api.report_filename(run_dir)
@@ -538,7 +542,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     @app.get("/runs/{run_id}/report/download")
     def run_report_download(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         out = run_dir / harness_api.report_filename(run_dir)
         if not out.exists():
             out = harness_api.generate_report(run_dir)
@@ -548,7 +552,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/api/runs/{run_id}/summary")
     def api_run_summary(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         """Parsed run data for the interactive in-app report (manifest + summary)."""
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         manifest = _manifest(run_dir)          # tolerant of a malformed manifest
@@ -574,7 +578,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         rel = _CSV_FILES.get(which)
         if rel is None:
             raise HTTPException(400, f"unknown csv '{which}'")
-        p = cfg.results_dir / run_id / rel
+        p = _run_dir_safe(cfg, run_id) / rel
         if not p.exists():
             raise HTTPException(404, "no such data for this run")
         return Response(p.read_text(encoding="utf-8"), media_type="text/csv",
@@ -582,15 +586,15 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     @app.get("/runs/{run_id}/spec")
     def run_spec(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        p = cfg.results_dir / run_id / "spec.yaml"
+        p = _run_dir_safe(cfg, run_id) / "spec.yaml"
         if not p.exists():
             raise HTTPException(404, "spec not found")
         return PlainTextResponse(p.read_text(encoding="utf-8"))
 
     @app.get("/runs/{run_id}/artifact")
     def run_artifact(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        run_dir = cfg.results_dir / run_id
-        if not run_dir.exists():
+        run_dir = _run_dir_safe(cfg, run_id)
+        if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -602,7 +606,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/runs/{run_id}/stream")
     def run_stream(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
                    user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         return StreamingResponse(_sse(cfg, run_dir), media_type="text/event-stream")
 
     @app.delete("/api/runs/{run_id}")
