@@ -91,11 +91,23 @@ export function RunDetail({ me }: { me: Me }) {
       alert((e as Error).message);
     }
   }
-  async function cancel() {
-    if (!activeJob || !confirm(`Cancel job ${activeJob.id}?`)) return;
+  async function stop() {
+    if (!activeJob || !confirm(
+      `Stop run ${runId}? sysbench is sent SIGTERM for a graceful partial finalize, `
+      + `then SIGKILL if it doesn't exit in time.`)) return;
     try {
-      await api.post(`/api/jobs/${activeJob.id}/cancel`);
-      setStreamState("canceling…");
+      await api.post(`/api/jobs/${activeJob.id}/stop`);
+      setStreamState("stopping…");
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
+  async function del() {
+    if (!confirm(`Permanently delete ${runId} and all of its data on disk `
+      + `(results, report, raw logs)? This cannot be undone.`)) return;
+    try {
+      await api.del(`/api/runs/${runId}`);
+      window.location.href = "/ui";
     } catch (e) {
       alert((e as Error).message);
     }
@@ -157,7 +169,8 @@ export function RunDetail({ me }: { me: Me }) {
         {canRun && !isSoak && ["partial", "failed", "running"].includes(run?.status || "") && (
           <button onClick={resume}>Resume</button>
         )}
-        {canRun && activeJob && <button onClick={cancel}>Cancel</button>}
+        {canRun && activeJob && <button className="btn danger" onClick={stop}>■ Stop run</button>}
+        {canRun && !activeJob && <button className="btn danger" onClick={del}>Delete</button>}
       </div>
 
       {progress && (

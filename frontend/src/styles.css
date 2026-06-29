@@ -169,6 +169,8 @@ button, .btn {
 button:hover, .btn:hover { background: var(--surface-3); text-decoration: none; }
 button.primary, .btn.primary { background: var(--brand); color: var(--brand-ink); border-color: transparent; font-weight: 600; }
 button.primary:hover, .btn.primary:hover { filter: brightness(1.08); }
+button.danger, .btn.danger { background: transparent; border-color: #c0392b; color: #e06b5d; font-weight: 600; }
+button.danger:hover, .btn.danger:hover { background: #c0392b; color: #fff; }
 button.ghost { background: transparent; border-color: transparent; color: var(--ink-dim); padding: 6px 9px; }
 button.ghost:hover { background: var(--surface-3); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
