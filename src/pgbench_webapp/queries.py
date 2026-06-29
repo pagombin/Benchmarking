@@ -233,10 +233,12 @@ def save_template(conn: sqlite3.Connection, name: str, spec_yaml: str, created_b
     row = conn.execute("SELECT COALESCE(MAX(version),0)+1 AS v FROM templates WHERE name=?",
                        (name,)).fetchone()
     version = int(row["v"])
-    cur = conn.execute(
+    conn.execute(
         "INSERT INTO templates(name, version, spec_yaml, created_utc, created_by) VALUES (?,?,?,?,?)",
         (name, version, spec_yaml, utc_now_iso(), created_by))
-    return int(cur.lastrowid or 0)
+    # Return the per-name version we just assigned — NOT cur.lastrowid (the table's
+    # autoincrement rowid), which would make the API/audit report a bogus version.
+    return version
 
 
 def list_templates(conn: sqlite3.Connection) -> list[sqlite3.Row]:

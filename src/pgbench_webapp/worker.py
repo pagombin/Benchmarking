@@ -219,7 +219,11 @@ def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
     try:
         from pgbench_webapp import notify as _n
         run = queries.get_run(conn, run_id) if run_id else None
-        _n.notify(conn, _store(cfg), state=state, run_id=run_id,
+        # Report the run's indexed status ("complete"/"partial"/...), not the queue
+        # job state ("done"), so a successful run doesn't alert as "done". The run
+        # row was just converged/upserted before this call, so its status is current.
+        notify_state = run["status"] if run and run["status"] else state
+        _n.notify(conn, _store(cfg), state=notify_state, run_id=run_id,
                   label=(run["label"] if run else ""),
                   peak_qps=(run["peak_qps"] if run else None))
     except Exception:  # noqa: BLE001  (notifications must never break a run)

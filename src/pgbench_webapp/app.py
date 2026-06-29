@@ -879,12 +879,21 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         if not man.exists():
             raise HTTPException(404, "run not found")
         m = json.loads(man.read_text())
+        start_epoch = _epoch(m.get("created_utc"))
+        finished_epoch = _epoch(m.get("finished_utc"))
+        # An in-progress run has no finished_utc yet (epoch 0), which would request
+        # an inverted [start, 0] window. Fall back to "now" so live runs still get a
+        # valid window — and only cache once the run is terminal, since a mid-run
+        # window is partial and must not be frozen as the final provider metrics.
+        terminal = m.get("status") in ("complete", "partial", "failed", "canceled")
+        end_epoch = finished_epoch or int(time.time())
         data = provider.fetch_metrics(conn, store, queries.get_setting(conn, "do_cluster_id", ""),
-                                      _epoch(m.get("created_utc")), _epoch(m.get("finished_utc")))
+                                      start_epoch, end_epoch)
         if data is None:
             return JSONResponse({"available": False, "reason": "provider fetch failed"})
-        cached.parent.mkdir(parents=True, exist_ok=True)
-        cached.write_text(json.dumps(data))
+        if terminal and finished_epoch:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_text(json.dumps(data))
         return JSONResponse(data)
 
     # ── SPA shell (served under /ui/*; assets via the /static mount) ──
@@ -949,6 +958,22 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
+            # Final drain before `done`: the harness writes its last log lines and
+            # the terminal manifest status in the same instant, so bytes can land
+            # AFTER this tick's reads above. Re-read log (incl. a trailing partial
+            # line), samples and pg so the cockpit never loses the final fragment.
+            if log.exists():
+                chunk, sent_log = _read_tail(log, sent_log, include_partial=True)
+                if chunk:
+                    yield _event("log", chunk)
+            rel, header, data = _read_samples(run_dir)
+            if rel is not None and rel == cur_file and len(data) > sent_rows:
+                yield _event("samples", {"file": rel, "header": header,
+                                         "offset": sent_rows, "rows": data[sent_rows:]})
+            pg_header, pg_data = _read_csv(run_dir / "parsed" / "pg_timeseries.csv")
+            if pg_header and len(pg_data) > pg_sent:
+                yield _event("pg", {"header": pg_header, "offset": pg_sent,
+                                    "rows": pg_data[pg_sent:]})
             yield _event("done", {"status": status})
             return
         time.sleep(1)
@@ -1123,12 +1148,16 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
             "levels_total": len(levels), "levels_done": done, "current": current}
 
 
-def _read_tail(path: Path, offset: int) -> tuple[str, int]:
+def _read_tail(path: Path, offset: int, include_partial: bool = False) -> tuple[str, int]:
     """Read complete new lines past *offset* bytes (incremental log streaming).
 
     Returns (text, new_offset). Avoids re-reading the whole (potentially huge,
     multi-hour) log each tick; only emits up to the last newline so a partial
     in-progress line waits for its terminator.
+
+    On the terminal flush (``include_partial=True``) the process has exited and
+    will write no more, so emit everything past the offset — including a trailing
+    line with no newline — otherwise the cockpit loses the final log fragment.
     """
     try:
         with open(path, "rb") as fh:
@@ -1136,6 +1165,10 @@ def _read_tail(path: Path, offset: int) -> tuple[str, int]:
             data = fh.read()
     except OSError:
         return "", offset
+    if include_partial:
+        if not data:
+            return "", offset
+        return data.decode("utf-8", "replace"), offset + len(data)
     nl = data.rfind(b"\n")
     if nl == -1:
         return "", offset

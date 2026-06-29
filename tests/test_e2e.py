@@ -109,6 +109,31 @@ def test_prepare_recreate_tables_reloads(fake_env, spec_file, monkeypatch, tmp_p
     assert run_cli("prepare", "--spec", str(spec_file), "--recreate", "tables", "--confirm", "sbtest") == 0
 
 
+def test_prepare_create_db_unreachable_after_create_fails(fake_env, spec_file, results_dir, monkeypatch) -> None:
+    """CREATE DATABASE succeeds but the new DB never accepts a connection: prepare
+    must fail loudly (it used to discard wait_for_db and load against a dead cluster)."""
+    from pgbench_harness import capture, runner
+    from pgbench_harness.errors import RunError
+    monkeypatch.setattr(capture, "maintenance_db", lambda spec, pw: "defaultdb")
+    monkeypatch.setattr(capture, "database_exists", lambda spec, pw, maint: False)
+    monkeypatch.setattr(capture, "create_database", lambda spec, pw, maint: (True, ""))
+    monkeypatch.setattr(capture, "wait_for_db", lambda spec, pw, **k: False)
+    with pytest.raises(RunError, match="not reachable"):
+        runner.cmd_prepare(spec_file, results_dir, create_db=True)
+
+
+def test_prepare_no_maintenance_db_and_target_unreachable_is_explicit(
+        fake_env, spec_file, results_dir, monkeypatch) -> None:
+    """No maintenance DB reachable AND the target itself doesn't answer -> an
+    explicit error naming the cause, not a generic downstream connectivity failure."""
+    from pgbench_harness import capture, runner
+    from pgbench_harness.errors import RunError
+    monkeypatch.setattr(capture, "maintenance_db", lambda spec, pw: None)
+    monkeypatch.setattr(capture, "wait_for_db", lambda spec, pw, **k: False)
+    with pytest.raises(RunError, match="maintenance database"):
+        runner.cmd_prepare(spec_file, results_dir, create_db=True)
+
+
 def test_dry_run_prints_commands_and_budget(fake_env, spec_file, capsys) -> None:
     assert run_cli("run", "--spec", str(spec_file), "--dry-run") == 0
     out = capsys.readouterr().out

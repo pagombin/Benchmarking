@@ -507,6 +507,19 @@ def test_notifications_best_effort_swallow(web, monkeypatch):
     assert notify.notify(conn, store, state="failed", run_id=None, label="x") == []  # no raise
 
 
+def test_notify_reports_only_delivered_channels(web):
+    """A configured-but-unsendable channel (SMTP host but no recipient; Slack
+    enabled but no webhook stored) must NOT be reported as delivered."""
+    from pgbench_webapp import notify
+    client, cfg = web
+    conn, store = _conn_store(cfg)
+    notify.set_config(conn, {"smtp": {"host": "smtp.x", "to": ""},   # no recipient
+                             "slack": {"enabled": True}})            # but no webhook set
+    # Both helpers short-circuit before any network call, so no monkeypatching is
+    # needed — and neither channel should appear in the delivered list.
+    assert notify.notify(conn, store, state="complete", run_id="r1", label="lbl") == []
+
+
 # ── scheduling ──────────────────────────────────────────────────────
 
 def test_scheduled_future_job_not_claimed(web):
@@ -535,6 +548,21 @@ def test_templates_and_diff(web):
                        auth=("op", "oppw")).json()["version"] == 2     # versioned
     names = [t["name"] for t in client.get("/api/templates", auth=("viewer", "vpw")).json()]
     assert "t1" in names
+
+
+def test_template_version_is_per_name_not_rowid(web):
+    """The saved version must be per-NAME (1, 2, …), not the table's autoincrement
+    rowid — which diverges from the version the moment other templates exist."""
+    client, cfg = web
+    spec = _spec_yaml()
+    # Bump the table rowid with an unrelated template first (rowid 1).
+    assert client.post("/api/templates", json={"name": "other", "spec_yaml": spec},
+                       auth=("op", "oppw")).json()["version"] == 1
+    # t1's first save is version 1 even though its rowid is 2, and 2 next (rowid 3).
+    assert client.post("/api/templates", json={"name": "t1", "spec_yaml": spec},
+                       auth=("op", "oppw")).json()["version"] == 1
+    assert client.post("/api/templates", json={"name": "t1", "spec_yaml": spec},
+                       auth=("op", "oppw")).json()["version"] == 2
     assert "label: web-test" in client.get("/api/templates/t1", auth=("viewer", "vpw")).json()["spec_yaml"]
     # diff two template versions / a tweaked spec
     spec2 = spec.replace("tshirt_size: 4c16g", "tshirt_size: 8c32g")
@@ -566,6 +594,33 @@ def test_provider_fetch_mocked_no_token_leak(web, monkeypatch, tmp_path):
     assert data and data["source"] == "digitalocean" and data["metrics"]["cpu"]
     out = json.dumps(data)
     assert "do-secret-token-XYZ" not in out      # token never in the stored payload
+
+
+def test_provider_metrics_in_progress_uses_now_and_skips_cache(web, monkeypatch):
+    """An in-progress run (no finished_utc) must request a valid [start, now] window
+    — not the inverted [start, 0] — and must NOT cache the partial result."""
+    import json as _json
+    from pgbench_webapp import provider, queries
+    client, cfg = web
+    conn, store = _conn_store(cfg)
+    store.set(provider.DO_TOKEN_REF, "tok")
+    queries.set_setting(conn, "do_cluster_id", "abc-123")
+    rid = "r-prov-live"
+    rd = cfg.results_dir / rid
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(_json.dumps(
+        {"run_id": rid, "status": "running", "created_utc": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8")
+    captured: dict = {}
+
+    def fake_fetch(conn, store, cluster, start, end):
+        captured["start"], captured["end"] = start, end
+        return {"source": "digitalocean", "window": [start, end], "metrics": {}}
+    monkeypatch.setattr(provider, "fetch_metrics", fake_fetch)
+    d = client.get(f"/runs/{rid}/provider-metrics", auth=("viewer", "vpw")).json()
+    assert captured["end"] > captured["start"] > 0        # a real window, not [start, 0]
+    assert d["window"] == [captured["start"], captured["end"]]
+    assert not (rd / "env" / "provider_metrics.json").exists()   # partial window not cached
 
 
 def test_settings_save_keeps_secrets_off_db(web):
@@ -748,6 +803,25 @@ def test_sse_emits_hello_progress_and_incremental_samples(web):
     assert "event: done" in body
     # samples are sent incrementally with a row offset (not a 300-row re-send)
     assert "event: samples" in body and '"offset"' in body
+
+
+def test_sse_flushes_final_log_fragment(web):
+    """A terminal run whose harness.log ends WITHOUT a trailing newline must still
+    stream that final fragment before `done` — it used to be dropped because the
+    incremental reader only emits up to the last newline."""
+    import json as _json
+    client, cfg = web
+    rid = "run-finalflush"
+    rd = cfg.results_dir / rid
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(_json.dumps(
+        {"run_id": rid, "mode": "sweep", "status": "complete",
+         "created_utc": "2026-06-29T01:00:00Z", "finished_utc": "2026-06-29T01:05:00Z"}),
+        encoding="utf-8")
+    (rd / "spec.yaml").write_text("run:\n  label: r\nworkload:\n  type: tpcc\n", encoding="utf-8")
+    (rd / "harness.log").write_text("first line\nFINAL-NO-NEWLINE", encoding="utf-8")
+    body = client.get(f"/runs/{rid}/stream", auth=("viewer", "vpw")).text
+    assert "FINAL-NO-NEWLINE" in body and "event: done" in body
 
 
 # ── targets & re-run (Phase 3) ──────────────────────────────────────────

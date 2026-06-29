@@ -184,12 +184,18 @@ function parseSamples(payload) {
 function startStream(runId) {
   const log = $("log");
   const es = new EventSource(`/runs/${runId}/stream`);
+  // Each `samples` payload carries only the NEW rows past payload.offset, not the
+  // whole series, so accumulate across ticks; reset on offset===0 (a new/swapped
+  // file or an EventSource auto-reconnect that catches up from the start).
+  let sampleRows = [];
   es.addEventListener("log", (e) => {
     if (log) { log.textContent += JSON.parse(e.data); log.scrollTop = log.scrollHeight; }
   });
   es.addEventListener("samples", (e) => {
-    const rows = parseSamples(JSON.parse(e.data));
-    drawChart(rows); flash(`${rows.length} samples`);
+    const payload = JSON.parse(e.data);
+    if (payload.offset === 0) sampleRows = [];
+    sampleRows = sampleRows.concat(parseSamples(payload));
+    drawChart(sampleRows); flash(`${sampleRows.length} samples`);
   });
   es.addEventListener("done", (e) => {
     flash("finished: " + JSON.parse(e.data).status); es.close();

@@ -273,11 +273,27 @@ def cmd_prepare(spec_path: Path, results_dir: Path, recreate: str = "",
             ok, err = capture.create_database(spec, password, maint)
             if not ok:
                 raise RunError(f"CREATE DATABASE {db} failed: {err}")
-            capture.wait_for_db(spec, password)
+            # Don't proceed to load against a cluster that isn't reachable yet:
+            # a created DB can lag before it accepts connections on managed PG.
+            if not capture.wait_for_db(spec, password):
+                raise RunError(
+                    f"database '{db}' was created but is not reachable yet",
+                    hint="managed PG can lag just after a create — retry prepare.")
         else:
             raise RunError(
                 f"database '{db}' does not exist on {spec.target.host}",
                 hint="re-run prepare with 'create database' enabled to create it first.")
+    elif maint is None and not capture.wait_for_db(spec, password, attempts=1):
+        # No maintenance database (defaultdb/postgres) was reachable, so we could
+        # neither verify nor create the target — AND the target itself does not
+        # answer. Report this explicitly instead of falling through to check_dataset
+        # and surfacing a generic connectivity error with no actionable cause.
+        raise RunError(
+            f"cannot reach a maintenance database to create '{db}', and '{db}' "
+            f"itself is not reachable on {spec.target.host}",
+            hint=("creating a database needs a reachable maintenance DB where the "
+                  "user has CREATEDB; check credentials/SSL." if create_db
+                  else "check credentials/SSL and that the database exists."))
 
     check = capture.check_dataset(spec, password)
     if check.ok and not recreate:

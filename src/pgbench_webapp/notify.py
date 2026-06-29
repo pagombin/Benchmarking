@@ -46,11 +46,16 @@ def _message(state: str, run_id: Optional[str], label: str, base_url: str,
     return subject, "\n".join(lines)
 
 
-def _send_email(c: dict[str, Any], password: Optional[str], subject: str, body: str) -> None:
+def _send_email(c: dict[str, Any], password: Optional[str], subject: str, body: str) -> bool:
+    """Send the email; return True only if a message was actually dispatched.
+
+    Returns False (not raises) when there's no recipient/host so the caller can
+    avoid reporting "email" as delivered when nothing was sent.
+    """
     smtp = c.get("smtp") or {}
     host, to = smtp.get("host"), smtp.get("to")
     if not host or not to:
-        return
+        return False
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = smtp.get("from") or smtp.get("user") or "pgbench-harness@localhost"
@@ -63,15 +68,18 @@ def _send_email(c: dict[str, Any], password: Optional[str], subject: str, body: 
         if smtp.get("user") and password:
             s.login(smtp["user"], password)
         s.send_message(msg)
+    return True
 
 
-def _send_slack(webhook: Optional[str], text: str) -> None:
+def _send_slack(webhook: Optional[str], text: str) -> bool:
+    """Post to the webhook; return True only if a request was actually made."""
     if not webhook:
-        return
+        return False
     data = json.dumps({"text": text}).encode()
     req = urllib.request.Request(webhook, data=data,
                                  headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10).close()  # nosec - operator-supplied webhook
+    return True
 
 
 def notify(conn: sqlite3.Connection, store: SecretStore, *, state: str,
@@ -83,14 +91,14 @@ def notify(conn: sqlite3.Connection, store: SecretStore, *, state: str,
     sent: list[str] = []
     if (c.get("smtp") or {}).get("host"):
         try:
-            _send_email(c, store.get(SMTP_PASSWORD_REF), subject, body)
-            sent.append("email")
+            if _send_email(c, store.get(SMTP_PASSWORD_REF), subject, body):
+                sent.append("email")   # only report channels we actually delivered to
         except Exception:  # noqa: BLE001  (best-effort; must not fail the run)
             pass
     if (c.get("slack") or {}).get("enabled"):
         try:
-            _send_slack(store.get(SLACK_WEBHOOK_REF), f"*{subject}*\n{body}")
-            sent.append("slack")
+            if _send_slack(store.get(SLACK_WEBHOOK_REF), f"*{subject}*\n{body}"):
+                sent.append("slack")
         except Exception:  # noqa: BLE001
             pass
     return sent
