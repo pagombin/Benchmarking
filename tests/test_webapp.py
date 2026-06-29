@@ -382,6 +382,66 @@ def test_reconcile_indexes_filesystem(web, tmp_path):
     conn.close()
 
 
+def _stuck_run(cfg, rid: str) -> Path:
+    rd = cfg.results_dir / rid
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(json.dumps({
+        "run_id": rid, "label": "stuck", "edition": "advanced", "tshirt_size": "8c32g",
+        "mode": "soak", "status": "running", "created_utc": "2026-01-01T00:00:00Z"}))
+    return rd
+
+
+def test_terminal_job_converges_stuck_running_run(web):
+    """A run left non-terminal on disk whose owning job has ended must be driven
+    to a terminal status — no run shows 'live' after its job is failed/canceled."""
+    client, cfg = web
+    from pgbench_webapp import index, queries
+    from pgbench_webapp.db import connect
+    rid = "stuck-20260101T000000Z"
+    rd = _stuck_run(cfg, rid)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "soak", "run:\n  label: stuck\n", None, "op")
+    queries.update_job(conn, jid, state="failed", run_id=rid)
+    index.reconcile(conn, cfg.results_dir)              # app/worker startup path
+    assert queries.get_run(conn, rid)["status"] == "failed"   # not 'running'
+    man = json.loads((rd / "manifest.json").read_text())
+    assert man["status"] == "failed" and man["finished_utc"]
+    conn.close()
+
+
+def test_running_job_not_converged(web):
+    """A genuinely live run (owning job still running) must stay 'running'."""
+    client, cfg = web
+    from pgbench_webapp import index, queries
+    from pgbench_webapp.db import connect
+    rid = "live-20260101T000000Z"
+    _stuck_run(cfg, rid)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "soak", "run:\n  label: live\n", None, "op")
+    queries.update_job(conn, jid, state="running", run_id=rid)
+    index.reconcile(conn, cfg.results_dir)
+    assert queries.get_run(conn, rid)["status"] == "running"
+    conn.close()
+
+
+def test_failed_soak_run_is_terminal_via_worker(web, monkeypatch):
+    """End-to-end through the queue: a soak whose load generator fails leaves the
+    run row terminal (the A4 'Tasks=failed but Runs=live' regression)."""
+    client, cfg = web
+    monkeypatch.setenv("FAKE_SYSBENCH_RUN_FAIL_THREADS", "2")  # soak spec uses 2 threads
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml("soak"), "password": WEB_PW},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    jid, state, _ = _run_worker_once(cfg)
+    assert state == "failed"
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    rid = queries.get_job(conn, jid)["run_id"]
+    assert rid and queries.get_run(conn, rid)["status"] == "failed"   # NOT 'running'
+    conn.close()
+
+
 # ── SPA console (Phase 1: JSON bootstrap APIs + shell serving) ──────────
 
 def test_api_me_reports_role_and_version(web):

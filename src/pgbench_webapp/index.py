@@ -11,7 +11,42 @@ from typing import Any, Optional
 
 import yaml
 
+from pgbench_harness.util import atomic_write_json
 from pgbench_webapp import queries
+from pgbench_webapp.util import utc_now_iso
+
+# A run is in a terminal state once it has finished (or been stopped). These are
+# the only statuses the live cockpit treats as "done"; anything else streams as
+# "live", so a stuck non-terminal manifest must be converged (see below).
+TERMINAL_RUN = ("complete", "partial", "failed", "canceled")
+
+
+def converge_run_status(results_dir: Path, run_id: str, job_state: str) -> bool:
+    """Drive a run's manifest to a terminal status when its owning job has ended.
+
+    The filesystem manifest stays the source of truth; a terminal *job* only
+    OVERRIDES a manifest that is stuck non-terminal (e.g. the harness was
+    SIGKILLed before it could finalize, or a pre-fix run left 'running' on disk).
+    A healthy run finalizes its own manifest, so this is a no-op for it. Returns
+    True if the manifest was rewritten.
+    """
+    if job_state not in ("done", "failed", "canceled"):
+        return False
+    man = results_dir / run_id / "manifest.json"
+    if not man.exists():
+        return False
+    try:
+        m = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(m, dict) or m.get("status") in TERMINAL_RUN:
+        return False
+    # job done-but-manifest-running is a stuck run -> failed; an explicit cancel -> canceled.
+    m["status"] = "canceled" if job_state == "canceled" else "failed"
+    if not m.get("finished_utc"):
+        m["finished_utc"] = utc_now_iso()
+    atomic_write_json(man, m)
+    return True
 
 
 def _peak_qps(run_dir: Path, mode: str) -> Optional[float]:
@@ -88,6 +123,13 @@ def reconcile(conn: sqlite3.Connection, results_dir: Path) -> int:
         except Exception:         # noqa: BLE001
             row = None
         if row is not None:
+            # Precedence: a terminal owning job converges a run whose manifest is
+            # stuck non-terminal, so no run shows 'live' after its job has ended.
+            if row["status"] not in TERMINAL_RUN:
+                job = queries.job_for_run(conn, row["run_id"])
+                if job is not None and job["state"] in ("done", "failed", "canceled"):
+                    if converge_run_status(results_dir, row["run_id"], job["state"]):
+                        row = _run_row(d) or row
             queries.upsert_run(conn, row)
             n += 1
     return n

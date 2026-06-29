@@ -458,6 +458,11 @@ def cmd_run(
         sampler.start()
     try:
         _sweep(spec, password, run_dir, manifest, logger)
+    except Exception:  # noqa: BLE001 — never leave the manifest at 'running' on an abort
+        manifest.status = "failed"
+        manifest.wall_time_s = _wall_time_s(manifest)
+        manifest.save(run_dir)
+        raise
     finally:
         if sampler:
             sampler.stop()
@@ -471,7 +476,10 @@ def cmd_run(
     report.generate_report(run_dir)
     logger.info("run %s finished with status '%s'; report: %s",
                 manifest.run_id, status, run_dir / "report.html")
-    return 0 if status == "complete" else 1
+    # Exit code drives the worker's job state: complete->0 (done), partial->1
+    # (done, a real result), failed/other->2 (failed). A genuine failure must
+    # never read as a completed job in the Tasks tab.
+    return {"complete": 0, "partial": 1}.get(status, 2)
 
 
 def _iso_micros() -> str:
@@ -776,7 +784,10 @@ def cmd_soak(
                             aborted=supervisor_error is not None)
     if supervisor_error is not None:
         raise supervisor_error
-    return 0 if status == "complete" else 1
+    # Exit code drives the worker's job state: complete->0 (done), partial->1
+    # (done, a real result), failed/other->2 (failed). A genuine failure must
+    # never read as a completed job in the Tasks tab.
+    return {"complete": 0, "partial": 1}.get(status, 2)
 
 
 def _sweep(

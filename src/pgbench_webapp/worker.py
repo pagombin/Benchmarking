@@ -166,6 +166,12 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             fields["run_id"] = run_id
         queries.update_job(conn, job["id"], **fields)
         if run_id:
+            # A terminal job must drive its run to a consistent terminal status —
+            # even when the harness was killed before it could finalize (e.g. a
+            # SIGKILLed stop) — so the run is never re-indexed as 'running' and the
+            # cockpit can leave 'live'. The manifest stays source of truth; this
+            # only overrides a stuck non-terminal one.
+            index.converge_run_status(cfg.results_dir, run_id, state)
             row = index._run_row(cfg.results_dir / run_id)
             if row:
                 row["source"] = "web"
@@ -198,7 +204,8 @@ def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
 
 def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     """On worker start, mark orphaned 'running'/'canceling' jobs whose process is
-    gone as interrupted, so the queue isn't wedged after a crash/restart."""
+    gone as interrupted, so the queue isn't wedged after a crash/restart, then
+    converge any run left non-terminal on disk whose owning job has ended."""
     for job in queries.list_jobs(conn, states=("running", "canceling")):
         pid = job["pid"]
         alive = False
@@ -209,9 +216,16 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
             except OSError:
                 alive = False
         if not alive:
-            queries.update_job(conn, job["id"], state="failed", pid=None,
+            # 'canceling' with a dead pid was a stop in flight -> canceled; a
+            # 'running' orphan crashed -> failed (and is resumable for sweeps).
+            terminal = "canceled" if job["state"] == "canceling" else "failed"
+            queries.update_job(conn, job["id"], state=terminal, pid=None,
                                finished_utc=utc_now_iso(),
-                               error="interrupted (worker restart); resume from the run page")
+                               error=("stopped (worker restart)" if terminal == "canceled"
+                                      else "interrupted (worker restart); resume from the run page"))
+    # Converge stuck-running runs against their now-terminal jobs and re-index
+    # the filesystem so no run survives a restart still showing 'live'.
+    index.reconcile(conn, cfg.results_dir)
 
 
 def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
