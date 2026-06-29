@@ -305,6 +305,28 @@ def test_soak_surfaces_failure_and_finalizes(fake_env, tmp_path, monkeypatch) ->
                 if p.is_file() and TEST_PASSWORD.encode() in p.read_bytes()]
 
 
+def test_soak_rides_through_outage_after_producing_samples(fake_env, tmp_path, monkeypatch) -> None:
+    """Once a soak has produced samples, an outage (0-sample segments) must NOT
+    trip the fast-fail — the whole point of a failover soak is to survive it."""
+    monkeypatch.setenv("FAKE_SYSBENCH_COUNT_FILE", str(tmp_path / "cnt"))
+    monkeypatch.setenv("FAKE_SYSBENCH_FAIL_AFTER", "1")   # seg 1 OK, seg 2+ = outage
+    results = tmp_path / "results"
+    spec_path = tmp_path / "soak.yaml"
+    doc = _soak_doc(soak={"threads": 4, "duration_s": 6, "tolerate_errors": True,
+                          "fast_fail_segments": 2, "segment_kill_grace_s": 1,
+                          "hard_ceiling_grace_s": 2}, events=[])
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    rc = main(["soak", "--spec", str(spec_path), "--results-dir", str(results)])
+    assert rc in (0, 1)                       # rode through -> finalized, NOT fast-failed (rc 2)
+    run_dir = sorted(d for d in results.iterdir() if (d / "manifest.json").exists())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] in ("partial", "complete")          # terminal, not failed-fast
+    segs = manifest["soak"]["segments"]
+    assert any(s["intervals"] > 0 for s in segs)                  # produced samples first
+    assert len(segs) >= 3                                         # then relaunched through the outage
+
+
 def test_soak_segment_watchdog_kills_hung_child(fake_env, tmp_path, monkeypatch) -> None:
     """A segment that connects then hangs (no output, never exits) must be killed
     by the per-segment watchdog so the supervisor stays bounded and finalizes."""

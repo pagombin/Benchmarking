@@ -669,13 +669,17 @@ def _soak_supervisor(
             manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
             manifest.save(run_dir)
             total_intervals += n_intervals
-            # Decoupled from total_intervals: a single stray interval line in any one
-            # segment must NOT permanently disable the zero-sample cutoff.
             consecutive_zero_sample = consecutive_zero_sample + 1 if n_intervals == 0 else 0
             consecutive_short = consecutive_short + 1 if seg_wall < min(5, remaining) else 0
             if rc == 0 and time.monotonic() >= deadline - 1:
                 break  # completed the window cleanly
-            if consecutive_zero_sample >= soak.fast_fail_segments:
+            # The fast-fail / churn guards apply ONLY before the soak has produced
+            # any samples (total_intervals == 0) — i.e. a load generator that is
+            # broken from the start. Once it HAS produced samples, zero-sample or
+            # short segments are an OUTAGE to ride through (the whole point of a
+            # failover soak); the per-segment timeout + hard ceiling + deadline +
+            # max_relaunches bound it without truncating the test.
+            if total_intervals == 0 and consecutive_zero_sample >= soak.fast_fail_segments:
                 raise RunError(
                     f"soak produced no samples in {consecutive_zero_sample} consecutive launches "
                     f"at {soak.threads} threads — the load generator cannot sustain load against "
@@ -686,9 +690,9 @@ def _soak_supervisor(
                             "that the target accepts this concurrency. NOTE: preflight's idle-holder "
                             "ceiling probe passing does not guarantee tpcc's heavier per-thread init "
                             "succeeds at this thread count."))
-            if consecutive_short >= 15:
+            if total_intervals == 0 and consecutive_short >= 15:
                 logger.error("soak: load generator exited almost immediately %d times in a "
-                             "row; stopping to avoid a relaunch hot-loop.", consecutive_short)
+                             "row without ever producing a sample; stopping.", consecutive_short)
                 break
             if relaunches >= soak.max_relaunches:
                 logger.error("soak: reached max_relaunches=%d; stopping early.", soak.max_relaunches)

@@ -352,9 +352,10 @@ def build_run_profile(tl: dict[int, dict[str, Any]], horizon: int,
     span = horizon + 1
     med = statistics.median(tps) if tps else 0.0
     dip_thresh = 0.5 * med
-    # contiguous zero/gap run length (an outage), longest wins
+    # contiguous zero/gap run length (an outage), longest wins. Iterate the SAME
+    # 0..horizon range as zero_or_gap_seconds so the two stay consistent.
     longest = cur = 0
-    for o in range(present[0] if present else 0, span):
+    for o in range(span):
         if o not in tl or tl[o]["tps"] <= EPS:
             cur += 1
             longest = max(longest, cur)
@@ -419,9 +420,12 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
     events = read_events(run_dir)
     for e in events:
         e["_offset"] = max(0, int(round((e["_dt"] - soak_start).total_seconds())))
+    # loadgen_restart markers are internal (supervisor relaunches), not user
+    # events; they must NOT shrink the auto baseline window.
+    analysis = [e for e in events if e["type"] in ANALYSIS_TYPES]
 
     warnings: list[str] = []
-    bw = resolve_baseline_window(tl, horizon, events, spec.report.baseline_window_s)
+    bw = resolve_baseline_window(tl, horizon, analysis, spec.report.baseline_window_s)
     baseline_samples = sum(1 for o in range(bw[0], bw[1] + 1) if o in tl)
     baseline_tps = _median_over(tl, bw[0], bw[1], "tps") or 0.0
     baseline_lat = _median_over(tl, bw[0], bw[1], "lat_p99") or 0.0
@@ -433,9 +437,7 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
             "window fell in a gap). Recovery, latency-spike and missed-vs-baseline "
             "metrics are not computed — set report.baseline_window_s to a clean span.")
 
-    # loadgen_restart markers are internal (supervisor relaunches), not user events:
-    # they annotate the overview but get no disruption metrics or zoom.
-    analysis = [e for e in events if e["type"] in ANALYSIS_TYPES]
+    # restart markers annotate the overview but get no disruption metrics or zoom.
     restart_markers = [{"at_s": e["_offset"], "ts_utc": e["ts_utc"], "label": e.get("label", "")}
                        for e in events if e["type"] == "loadgen_restart"]
 

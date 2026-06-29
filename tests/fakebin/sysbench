@@ -74,6 +74,18 @@ if threads in _threadset("FAKE_SYSBENCH_RUN_FAIL_THREADS"):
     print("FATAL: `thread_init' function failed: tpcc.lua:...: SQL error")
     sys.exit(2)
 
+# Succeed for the first N `run`s, then fail with 0 samples — simulates an OUTAGE
+# that begins AFTER the soak has already produced samples (must NOT trip fast-fail).
+_fail_after = os.environ.get("FAKE_SYSBENCH_FAIL_AFTER")
+if _fail_after and count_file:
+    try:
+        _n_runs = sum(1 for _ in open(count_file))
+    except OSError:
+        _n_runs = 0
+    if _n_runs > int(_fail_after):
+        print("FATAL: connection to server lost (simulated outage)")
+        sys.exit(2)
+
 # Connect then hang: no output, never exits — the supervisor watchdog must kill it.
 if threads in _threadset("FAKE_SYSBENCH_HANG_THREADS"):
     print("Threads started!\n", flush=True)
