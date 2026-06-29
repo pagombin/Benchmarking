@@ -404,15 +404,33 @@ def test_report_kpi_cards(fake_env, spec_file, results_dir) -> None:
 def test_pg_delta_row_rates() -> None:
     from pgbench_harness.capture import pg_delta_row
     prev = {"_mono": 100.0, "blks_hit": 1000, "blks_read": 100, "xacts": 500,
-            "wal_bytes": 1_000_000, "active": 2, "total_conn": 5}
+            "wal_bytes": 1_000_000, "active": 2, "total_conn": 5,
+            "xact_commit": 480, "xact_rollback": 20, "tup_inserted": 100}
     cur = {"_mono": 102.0, "blks_hit": 1900, "blks_read": 110, "xacts": 700,
-           "wal_bytes": 3_000_000, "active": 8, "total_conn": 12}
+           "wal_bytes": 3_000_000, "active": 8, "total_conn": 12,
+           "xact_commit": 660, "xact_rollback": 40, "tup_inserted": 400}
     row = pg_delta_row(prev, cur, 2.0)              # dt = 2s
     assert row["t"] == 2
     assert row["active"] == 8 and row["total_conn"] == 12
     assert row["xacts_s"] == 100.0                  # 200 xacts / 2s
+    assert row["commits_s"] == 90.0 and row["rollbacks_s"] == 10.0
+    assert row["tup_inserted_s"] == 150.0          # 300 / 2s
     assert abs(float(row["cache_hit_pct"]) - 98.9) < 0.2   # 900 / 910
     assert abs(row["wal_mb_s"] - (2_000_000 / 1024 / 1024 / 2)) < 0.01  # MiB/s
+
+
+def test_pg_delta_row_reset_is_a_gap_not_a_spike() -> None:
+    """A counter that went backwards (server restart/failover/reset) yields a
+    blank gap — never a misleading 0 or a huge first-delta spike (the WAL
+    15,000 MB/s artifact)."""
+    from pgbench_harness.capture import pg_delta_row
+    prev = {"_mono": 100.0, "wal_bytes": 9_000_000_000, "xacts": 1_000_000,
+            "blks_hit": 500, "blks_read": 50}
+    cur = {"_mono": 102.0, "wal_bytes": 1_000, "xacts": 10,     # reset to tiny values
+           "blks_hit": 5, "blks_read": 1}
+    row = pg_delta_row(prev, cur, 2.0)
+    assert row["wal_mb_s"] == "" and row["xacts_s"] == ""       # gap, not spike/0
+    assert row["cache_hit_pct"] == ""                            # negative access delta
 
 
 def test_live_pg_sampler_writes_timeseries(fake_env, spec_file, tmp_path) -> None:
@@ -432,3 +450,7 @@ def test_live_pg_sampler_writes_timeseries(fake_env, spec_file, tmp_path) -> Non
     cols = dict(zip(capture.LIVE_PG_COLUMNS, lines[1].split(",")))
     assert 0 <= float(cols["cache_hit_pct"]) <= 100
     assert float(cols["wal_mb_s"]) >= 0
+    # B4: the richer engine-side set reaches the CSV
+    assert float(cols["commits_s"]) > 0 and float(cols["tup_inserted_s"]) > 0
+    assert float(cols["blks_read_s"]) >= 0 and float(cols["ckpt_write_ms_s"]) >= 0
+    assert cols["repl_replay_lag_s"] == ""           # no replica -> blank, not 0

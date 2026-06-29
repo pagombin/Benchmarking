@@ -121,9 +121,15 @@ elif "pg_stat_activity" in low:
     # live PG sampler: cumulative counters grow with wall-clock so deltas > 0.
     import json as _json
     n = int(time.time())
-    print(_json.dumps({"active": 8, "total_conn": 20, "xacts": n * 100,
-                       "blks_hit": n * 9000, "blks_read": n * 100,
-                       "wal_bytes": n * 500000}))
+    print(_json.dumps({
+        "active": 8, "total_conn": 20,
+        "xact_commit": n * 90, "xact_rollback": n * 10, "xacts": n * 100,
+        "blks_hit": n * 9000, "blks_read": n * 100, "wal_bytes": n * 500000,
+        "tup_returned": n * 5000, "tup_fetched": n * 4000, "tup_inserted": n * 300,
+        "tup_updated": n * 200, "tup_deleted": n * 50,
+        "deadlocks": 0, "conflicts": 0, "temp_bytes": n * 1000, "temp_files": n * 1,
+        "ckpt_timed": n // 10, "ckpt_req": 0, "ckpt_write_ms": n * 5, "ckpt_sync_ms": n * 1,
+        "bgw_clean": n * 20, "bgw_alloc": n * 100, "repl_replay_lag": None}))
 elif "from pg_database where datname" in low:
     # database existence check for prepare create/recreate
     print(os.environ.get("FAKE_PSQL_DB_EXISTS", "1"))

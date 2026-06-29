@@ -807,19 +807,58 @@ def _check_ceiling(
 # (already injected by the worker / read from the spec env var); only numbers are
 # ever written to disk, so nothing secret can land in the timeseries.
 
-# One round-trip: cumulative counters + instantaneous gauges, as a JSON row.
-_LIVE_PG_SELECT = (
-    "(SELECT count(*) FROM pg_stat_activity WHERE state='active') AS active, "
-    "(SELECT count(*) FROM pg_stat_activity) AS total_conn, "
-    "(SELECT COALESCE(sum(xact_commit+xact_rollback),0) FROM pg_stat_database) AS xacts, "
-    "(SELECT COALESCE(sum(blks_hit),0) FROM pg_stat_database) AS blks_hit, "
-    "(SELECT COALESCE(sum(blks_read),0) FROM pg_stat_database) AS blks_read"
+_PG_MB = 1024 * 1024
+# One round-trip per sample: a flat JSON row of cumulative counters + gauges,
+# all engine-side (pg_stat_* views) so it works on managed PG; only numbers ever
+# reach disk. Counter ALIASES are stable across PG versions even though the
+# checkpoint source moved from pg_stat_bgwriter to pg_stat_checkpointer in PG17,
+# so pg_delta_row stays version-agnostic.
+_DB_SUMS = ("xact_commit", "xact_rollback", "blks_read", "blks_hit",
+            "tup_returned", "tup_fetched", "tup_inserted", "tup_updated", "tup_deleted",
+            "deadlocks", "conflicts", "temp_bytes", "temp_files")
+_DB_SELECT = ", ".join(f"COALESCE(sum({c}),0) AS {c}" for c in _DB_SUMS)
+_CKPT_PG17 = ("COALESCE(num_timed,0) AS ckpt_timed, COALESCE(num_requested,0) AS ckpt_req, "
+              "COALESCE(write_time,0) AS ckpt_write_ms, COALESCE(sync_time,0) AS ckpt_sync_ms "
+              "FROM pg_stat_checkpointer")
+_CKPT_PRE17 = ("COALESCE(checkpoints_timed,0) AS ckpt_timed, COALESCE(checkpoints_req,0) AS ckpt_req, "
+               "COALESCE(checkpoint_write_time,0) AS ckpt_write_ms, "
+               "COALESCE(checkpoint_sync_time,0) AS ckpt_sync_ms FROM pg_stat_bgwriter")
+_WAL_SRC = "SELECT COALESCE(wal_bytes,0) AS wal_bytes FROM pg_stat_wal"
+_WAL_NONE = "SELECT 0 AS wal_bytes"
+
+
+def _build_live_sql(ckpt: str, wal_src: str) -> str:
+    return (
+        "SELECT row_to_json(t) FROM (SELECT "
+        "(SELECT count(*) FROM pg_stat_activity WHERE state='active') AS active, "
+        "(SELECT count(*) FROM pg_stat_activity) AS total_conn, "
+        "d.*, (d.xact_commit + d.xact_rollback) AS xacts, "
+        "w.wal_bytes, c.ckpt_timed, c.ckpt_req, c.ckpt_write_ms, c.ckpt_sync_ms, "
+        "b.bgw_clean, b.bgw_alloc, "
+        "(SELECT EXTRACT(EPOCH FROM max(replay_lag)) FROM pg_stat_replication) AS repl_replay_lag "
+        f"FROM (SELECT {_DB_SELECT} FROM pg_stat_database) d, ({wal_src}) w, (SELECT {ckpt}) c, "
+        "(SELECT COALESCE(buffers_clean,0) AS bgw_clean, COALESCE(buffers_alloc,0) AS bgw_alloc "
+        "FROM pg_stat_bgwriter) b) t"
+    )
+
+
+# Try newest-first; the first variant whose views all exist wins (the PG18 target
+# uses pg_stat_checkpointer; older servers fall back to pg_stat_bgwriter / no WAL view).
+LIVE_PG_SQLS = (
+    _build_live_sql(_CKPT_PG17, _WAL_SRC),
+    _build_live_sql(_CKPT_PRE17, _WAL_SRC),
+    _build_live_sql(_CKPT_PG17, _WAL_NONE),
+    _build_live_sql(_CKPT_PRE17, _WAL_NONE),
 )
-LIVE_PG_SQL = f"SELECT row_to_json(t) FROM (SELECT {_LIVE_PG_SELECT}, " \
-              "(SELECT COALESCE(wal_bytes,0) FROM pg_stat_wal) AS wal_bytes) t"
-LIVE_PG_SQL_NOWAL = f"SELECT row_to_json(t) FROM (SELECT {_LIVE_PG_SELECT}, " \
-                    "0 AS wal_bytes) t"
-LIVE_PG_COLUMNS = ("t", "active", "total_conn", "xacts_s", "cache_hit_pct", "wal_mb_s")
+LIVE_PG_COLUMNS = (
+    "t", "active", "total_conn",
+    "xacts_s", "commits_s", "rollbacks_s",
+    "cache_hit_pct", "blks_read_s", "blks_hit_s", "wal_mb_s",
+    "tup_returned_s", "tup_fetched_s", "tup_inserted_s", "tup_updated_s", "tup_deleted_s",
+    "deadlocks_s", "conflicts_s", "temp_bytes_s", "temp_files_s",
+    "ckpt_timed_s", "ckpt_req_s", "ckpt_write_ms_s", "ckpt_sync_ms_s",
+    "bgw_clean_s", "bgw_alloc_s", "repl_replay_lag_s",
+)
 # Live samples use a short timeout: a stuck sample (e.g. during a failover) must
 # not block the sampler for 30s or leave an orphan psql after the run ends.
 LIVE_PG_TIMEOUT_S = 8
@@ -828,10 +867,11 @@ LIVE_PG_TIMEOUT_S = 8
 def live_pg_query(spec: Spec, password: str) -> Optional[dict[str, Any]]:
     """One engine-side sample (cumulative counters + gauges); None if unavailable.
 
-    Tries the WAL-aware query first; falls back without ``pg_stat_wal`` on older
-    servers. Never raises. Uses a short timeout so a stalled sample is skipped.
+    Tries variants newest-first (PG17 checkpointer, then pre-17 bgwriter; with
+    then without pg_stat_wal), so the richest query a server supports wins. Never
+    raises; a short timeout means a stalled sample is skipped, not blocking.
     """
-    for sql in (LIVE_PG_SQL, LIVE_PG_SQL_NOWAL):
+    for sql in LIVE_PG_SQLS:
         ok, out = psql_query_soft(spec, password, sql, timeout=LIVE_PG_TIMEOUT_S)
         if ok and out.strip():
             try:
@@ -843,27 +883,74 @@ def live_pg_query(spec: Spec, password: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _pg_rate(prev: dict[str, Any], cur: dict[str, Any], key: str, dt: float,
+             scale: float = 1.0) -> Any:
+    """Per-second rate of a cumulative counter, RESET-AWARE: a counter that went
+    backwards (server restart / failover to a new primary / pg_stat_reset) yields
+    "" (a chart gap), never a misleading 0 or a huge first-delta spike — which is
+    the WAL ~15,000 MB/s artifact this fixes."""
+    a, b = prev.get(key), cur.get(key)
+    if a is None or b is None or a == "" or b == "":
+        return ""
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return ""
+    if b < a:
+        return ""
+    return round((b - a) / scale / dt, 3)
+
+
+def _pg_gauge(cur: dict[str, Any], key: str) -> Any:
+    v = cur.get(key)
+    if v is None or v == "":
+        return ""
+    try:
+        return round(float(v), 3)
+    except (TypeError, ValueError):
+        return ""
+
+
 def pg_delta_row(prev: dict[str, Any], cur: dict[str, Any], t: float) -> dict[str, Any]:
     """Build one timeseries row from two cumulative samples (rates over the gap).
 
     Cache-hit % is computed *over the interval* (delta hits / delta accesses), so
-    it reflects current cache behaviour — the key signal for re-warm after a
-    storage reattach — not the since-startup average.
+    it reflects current cache behaviour — the key re-warm signal after a storage
+    reattach — not the since-startup average. All rates are reset-aware.
     """
     dt = max(1e-9, float(cur["_mono"]) - float(prev["_mono"]))
-    d_hit = max(0.0, float(cur["blks_hit"]) - float(prev["blks_hit"]))
-    d_read = max(0.0, float(cur["blks_read"]) - float(prev["blks_read"]))
+    d_hit = float(cur.get("blks_hit", 0)) - float(prev.get("blks_hit", 0))
+    d_read = float(cur.get("blks_read", 0)) - float(prev.get("blks_read", 0))
     accesses = d_hit + d_read
-    hit_pct = round(100.0 * d_hit / accesses, 2) if accesses > 0 else ""
-    d_xact = max(0.0, float(cur["xacts"]) - float(prev["xacts"]))
-    d_wal = max(0.0, float(cur.get("wal_bytes", 0)) - float(prev.get("wal_bytes", 0)))
+    hit_pct = (round(100.0 * d_hit / accesses, 2)
+               if accesses > 0 and d_hit >= 0 and d_read >= 0 else "")
     return {
         "t": int(round(t)),
-        "active": int(cur.get("active", 0)),
-        "total_conn": int(cur.get("total_conn", 0)),
-        "xacts_s": round(d_xact / dt, 1),
+        "active": int(cur.get("active", 0) or 0),
+        "total_conn": int(cur.get("total_conn", 0) or 0),
+        "xacts_s": _pg_rate(prev, cur, "xacts", dt),
+        "commits_s": _pg_rate(prev, cur, "xact_commit", dt),
+        "rollbacks_s": _pg_rate(prev, cur, "xact_rollback", dt),
         "cache_hit_pct": hit_pct,
-        "wal_mb_s": round(d_wal / 1024 / 1024 / dt, 3),
+        "blks_read_s": _pg_rate(prev, cur, "blks_read", dt),
+        "blks_hit_s": _pg_rate(prev, cur, "blks_hit", dt),
+        "wal_mb_s": _pg_rate(prev, cur, "wal_bytes", dt, scale=_PG_MB),
+        "tup_returned_s": _pg_rate(prev, cur, "tup_returned", dt),
+        "tup_fetched_s": _pg_rate(prev, cur, "tup_fetched", dt),
+        "tup_inserted_s": _pg_rate(prev, cur, "tup_inserted", dt),
+        "tup_updated_s": _pg_rate(prev, cur, "tup_updated", dt),
+        "tup_deleted_s": _pg_rate(prev, cur, "tup_deleted", dt),
+        "deadlocks_s": _pg_rate(prev, cur, "deadlocks", dt),
+        "conflicts_s": _pg_rate(prev, cur, "conflicts", dt),
+        "temp_bytes_s": _pg_rate(prev, cur, "temp_bytes", dt),
+        "temp_files_s": _pg_rate(prev, cur, "temp_files", dt),
+        "ckpt_timed_s": _pg_rate(prev, cur, "ckpt_timed", dt),
+        "ckpt_req_s": _pg_rate(prev, cur, "ckpt_req", dt),
+        "ckpt_write_ms_s": _pg_rate(prev, cur, "ckpt_write_ms", dt),
+        "ckpt_sync_ms_s": _pg_rate(prev, cur, "ckpt_sync_ms", dt),
+        "bgw_clean_s": _pg_rate(prev, cur, "bgw_clean", dt),
+        "bgw_alloc_s": _pg_rate(prev, cur, "bgw_alloc", dt),
+        "repl_replay_lag_s": _pg_gauge(cur, "repl_replay_lag"),
     }
 
 
