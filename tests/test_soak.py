@@ -243,6 +243,8 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert any(e["type"] == "failover" for e in summary["events"])
     # B1: the always-on run profile is present and populated even on a tiny run
     assert summary["run_profile"]["tps"] and "detected" in summary
+    # B7: auto-generated narrative verdict leads the report
+    assert summary["tldr"].startswith("Soak:") and "status:" in summary["tldr"]
 
     # mark adds a live event, report regenerates and is mode-aware
     assert main(["mark", "--run-dir", str(run_dir), "--type", "scale_up",

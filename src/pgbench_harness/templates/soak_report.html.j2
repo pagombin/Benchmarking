@@ -20,6 +20,7 @@
 </div>
 
 <main>
+{% if summary.tldr %}<div class="note" style="font-size:15px;font-weight:600">{{ summary.tldr }}</div>{% endif %}
 <div class="toc">
   <a href="#overview">Overview</a><a href="#detected">Detected</a><a href="#events">Per-event detail</a>
   <a href="#timeline">Timeline</a><a href="#method">Methodology</a>

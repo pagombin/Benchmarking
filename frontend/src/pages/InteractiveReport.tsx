@@ -169,6 +169,9 @@ function SoakReport({ summary, prov }: { summary: Record<string, unknown>; prov:
   const ev = (o: Record<string, unknown>) => (o.evidence || {}) as Record<string, unknown>;
   return (
     <>
+      {typeof summary.tldr === "string" && summary.tldr && (
+        <div className="card" style={{ marginBottom: 16, fontWeight: 600 }}>{summary.tldr}</div>
+      )}
       <div className="kpi-row" style={{ marginBottom: 16 }}>
         <div className="kpi"><div className="label">Median TPS</div><div className="value">{tps.median != null ? fmtInt(tps.median) : "—"}</div></div>
         <div className="kpi"><div className="label">p99 latency (run)</div><div className="value">{lat.p99 != null ? fmtNum(lat.p99) : "—"}<small> ms</small></div></div>
