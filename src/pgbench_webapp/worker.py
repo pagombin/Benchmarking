@@ -155,9 +155,14 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                         queries.update_job(conn, job["id"], run_id=rid)
                         # Index the run now (its manifest already exists) so it also
                         # shows up in the Runs list live, not only the cockpit link.
+                        # The just-written manifest may still say "created"; force a
+                        # non-terminal status to "running" so the list shows it live
+                        # instead of stuck at "created" until the job finishes.
                         row = index._run_row(cfg.results_dir / rid)
                         if row:
                             row["source"] = "web"
+                            if row.get("status", "") not in index.TERMINAL_RUN:
+                                row["status"] = "running"
                             queries.upsert_run(conn, row)
             rc = proc.wait()
 

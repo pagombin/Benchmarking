@@ -36,6 +36,8 @@ export function RunDetail({ me }: { me: Me }) {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [streamState, setStreamState] = useState("connecting…");
   const [activeJob, setActiveJob] = useState<Job | null>(null);
+  const [budget, setBudget] = useState(0);   // planned wall-clock budget (from hello)
+  const [mode, setMode] = useState("");      // sweep | soak (from hello)
   const seriesRef = useRef<Series>(emptySeries());
   const pgRef = useRef<PgSeries>(emptyPg());
   const canRun = me.role === "operator" || me.role === "admin";
@@ -49,12 +51,14 @@ export function RunDetail({ me }: { me: Me }) {
 
   useEffect(() => {
     const es = openStream(runId, {
-      onHello: () => {
+      onHello: (h) => {
         seriesRef.current = emptySeries();
         pgRef.current = emptyPg();
         setSeries(seriesRef.current);
         setPg(pgRef.current);
         setLog("");
+        setBudget(h.budget_s);
+        setMode(h.mode);
         setStreamState("live");
       },
       onLog: (chunk) => setLog((prev) => prev + chunk),
@@ -71,6 +75,7 @@ export function RunDetail({ me }: { me: Me }) {
       onProgress: (p) => setProgress(p),
       onDone: (d) => {
         setStreamState(`finished: ${d.status}`);
+        setActiveJob(null);   // run is terminal -> hide Stop/Cancel
         api.get<Run>(`/api/runs/${runId}`).then(setRun).catch(() => {});
       },
       onError: () => setStreamState("reconnecting…"),
@@ -139,7 +144,10 @@ export function RunDetail({ me }: { me: Me }) {
   const pct = progress && progress.budget_s
     ? Math.min(100, Math.round((progress.elapsed_s / progress.budget_s) * 100))
     : 0;
-  const chartMax = progress?.budget_s || undefined;   // running time axis from t=0
+  // Anchor the x-axis to the planned budget ONLY for soaks (a fixed-duration window,
+  // t=0..budget). Sweeps advance through levels and reset the per-second offset each
+  // step, so a fixed budget axis is wrong there — let those charts auto-scale to data.
+  const chartMax = mode === "soak" ? (budget || undefined) : undefined;
 
   return (
     <>

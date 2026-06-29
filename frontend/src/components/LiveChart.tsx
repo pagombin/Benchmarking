@@ -24,6 +24,13 @@ interface Props {
 const AXIS = "#8b97a6";
 const GRID = "rgba(139,151,166,0.16)";
 
+// uPlot renders `null` as a clean gap but NaN/Infinity corrupt the auto-range
+// math (min/max go NaN and the whole axis collapses). A loadgen restart resets
+// the series to offset 0, which can briefly leave NaN holes — map them to null
+// so the line breaks cleanly instead of blanking the chart.
+const clean = (vals: number[]): (number | null)[] =>
+  vals.map((v) => (Number.isFinite(v) ? v : null));
+
 export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, xMax }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
@@ -78,7 +85,7 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, x
         })),
       ],
     };
-    const data: uPlot.AlignedData = [xs, ...series.map((s) => s.values)];
+    const data: uPlot.AlignedData = [xs, ...series.map((s) => clean(s.values))];
     plot.current = new uPlot(opts, data, el);
 
     const ro = new ResizeObserver(() => {
@@ -96,7 +103,7 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, x
   // Stream data in on every update without rebuilding the plot.
   useEffect(() => {
     if (plot.current) {
-      plot.current.setData([xs, ...series.map((s) => s.values)] as uPlot.AlignedData);
+      plot.current.setData([xs, ...series.map((s) => clean(s.values))] as uPlot.AlignedData);
     }
   }, [xs, series]);
 
