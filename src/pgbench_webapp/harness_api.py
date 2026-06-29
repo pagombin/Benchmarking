@@ -5,7 +5,7 @@ duplicating any parsing/validation/report logic. Pure functions, no I/O state.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -78,6 +78,23 @@ def compare(run_dirs: list[Path], out_path: Path) -> Path:
 
 def mark_event(run_dir: Path, etype: str, label: str, note: str) -> None:
     runner.cmd_mark(run_dir, etype, label, note)
+
+
+def prepare_stats(spec_yaml: str, results_dir: Path) -> Optional[dict[str, Any]]:
+    """Load-metrics a prepare job recorded (wall time, DB size, MB/s), or None.
+
+    prepare writes one ``prepare_<host>-<db>.json`` per (host, database) under
+    results/; resolve it from the job's spec. Best-effort.
+    """
+    import json
+    try:
+        spec = _spec_from_yaml(spec_yaml)
+        p = runner.prepare_stats_path(spec, results_dir)
+        if p.exists():
+            return dict(json.loads(p.read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 __all__ = ["validate_yaml", "dry_run", "generate_report", "report_filename", "compare",

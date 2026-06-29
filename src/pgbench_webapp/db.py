@@ -80,6 +80,10 @@ MIGRATIONS: list[tuple[int, str]] = [
     (2, """
     ALTER TABLE runs ADD COLUMN target_host TEXT;
     """),
+    # 3: per-job options (JSON) — prepare's create-db / recreate / confirm flags.
+    (3, """
+    ALTER TABLE jobs ADD COLUMN options TEXT;
+    """),
 ]
 
 

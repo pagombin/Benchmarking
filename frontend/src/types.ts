@@ -46,5 +46,20 @@ export interface Job {
   requested_by: string;
   scheduled_utc: string | null;
   created_utc: string;
+  started_utc?: string | null;
+  finished_utc?: string | null;
+  exit_code?: number | null;
   error: string | null;
+}
+
+export interface PrepareStats {
+  loaded_units?: string;
+  wall_s?: number;
+  db_size_pretty?: string;
+  load_mb_s?: number | null;
+  load_threads?: number;
+  started_utc?: string;
+  finished_utc?: string;
+  database?: string;
+  target_host?: string;
 }

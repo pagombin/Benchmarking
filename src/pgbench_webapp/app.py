@@ -260,8 +260,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       detail=str(value))
         return JSONResponse({"max_concurrency": value})
 
-    _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by",
-                   "scheduled_utc", "created_utc", "started_utc", "finished_utc", "error")
+    _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by", "scheduled_utc",
+                   "created_utc", "started_utc", "finished_utc", "exit_code", "error")
 
     @app.get("/api/jobs")
     def api_list_jobs(conn: sqlite3.Connection = Depends(get_conn),
@@ -271,6 +271,18 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         rows = queries.list_jobs(conn, states=states)
         # Never expose spec_yaml here (large, and the source for password_env names).
         return JSONResponse([{k: r[k] for k in _JOB_FIELDS} for r in rows])
+
+    @app.get("/api/jobs/{job_id}")
+    def api_job_detail(job_id: int, conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        job = queries.get_job(conn, job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        out = {k: job[k] for k in _JOB_FIELDS}
+        # For a prepare job, surface its data-load metrics (wall time, size, MB/s).
+        if job["kind"] == "prepare":
+            out["prepare_stats"] = harness_api.prepare_stats(job["spec_yaml"], cfg.results_dir)
+        return JSONResponse(out)
 
     # ── JSON API: validate / dry-run ──
     @app.post("/api/validate")
@@ -410,6 +422,30 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
         return JSONResponse({"deleted": True})
 
+    @app.post("/api/targets/{target_id}")
+    def api_update_target(target_id: int, request: Request, payload: dict,
+                          conn: sqlite3.Connection = Depends(get_conn),
+                          store: SecretStore = Depends(get_store),
+                          user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Update a saved target's connection and/or rotate its password."""
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        tgt = queries.get_target(conn, target_id)
+        if tgt is None:
+            raise HTTPException(404, "target not found")
+        fields = {k: payload[k] for k in ("host", "port", "dbname", "dbuser", "sslmode")
+                  if k in payload and payload[k] not in (None, "")}
+        if "port" in fields:
+            try:
+                fields["port"] = int(fields["port"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "port must be an integer")
+        queries.update_target(conn, target_id, **fields)
+        if payload.get("password"):                 # rotate credential, reusing the ref
+            store.set(tgt["password_ref"], payload["password"])
+        queries.audit(conn, user["username"], "target_update", target=tgt["name"],
+                      detail=",".join(list(fields) + (["password"] if payload.get("password") else [])))
+        return JSONResponse({"ok": True})
+
     # ── lifecycle tasks: preflight / prepare / doctor (live via the job queue) ──
     @app.post("/api/preflight")
     def api_preflight(request: Request, payload: dict,
@@ -432,12 +468,25 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
-        job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"])
+        options = None
+        if kind == "prepare":
+            doc = yaml.safe_load(clean_yaml) or {}
+            db = (doc.get("target") or {}).get("database", "")
+            recreate = payload.get("recreate") or ""
+            if recreate not in ("", "database", "tables"):
+                raise HTTPException(400, "recreate must be 'database' or 'tables'")
+            if recreate and str(payload.get("confirm", "")) != db:
+                raise HTTPException(400, "type the exact database name to confirm a destructive recreate")
+            opt = {"create_db": bool(payload.get("create_db")),
+                   "recreate": recreate, "confirm": payload.get("confirm", "")}
+            options = json.dumps(opt)
+        job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
+                                     options=options)
         password = payload.get("password")
         if password:
             store.set(job_password_ref(job_id), password)
         queries.audit(conn, user["username"], f"{kind}_enqueue", target=v["label"],
-                      detail=f"job={job_id}")
+                      detail=f"job={job_id}" + (f" {payload.get('recreate')}" if payload.get("recreate") else ""))
         return JSONResponse({"job_id": job_id, "kind": kind})
 
     @app.get("/api/doctor")

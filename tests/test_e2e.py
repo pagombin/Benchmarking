@@ -60,9 +60,23 @@ def test_preflight_connection_ceiling(fake_env, spec_file, monkeypatch, capsys) 
     assert "connection #3" in err
 
 
-def test_prepare_idempotent(fake_env, spec_file, monkeypatch, tmp_path) -> None:
+def test_prepare_already_present_errors_clearly(fake_env, spec_file, monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
-    assert run_cli("prepare", "--spec", str(spec_file)) == 0  # dataset already present
+    rc = run_cli("prepare", "--spec", str(spec_file))   # dataset already present
+    assert rc != 0                                        # no longer a silent no-op
+    assert "already present" in capsys.readouterr().err.lower()
+
+
+def test_prepare_recreate_requires_matching_confirm(fake_env, spec_file, monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert run_cli("prepare", "--spec", str(spec_file), "--recreate", "tables", "--confirm", "wrong") != 0
+    assert "confirmation" in capsys.readouterr().err.lower()
+
+
+def test_prepare_recreate_tables_reloads(fake_env, spec_file, monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    # correct confirmation -> drops benchmark tables and reloads (sysbench prepare runs)
+    assert run_cli("prepare", "--spec", str(spec_file), "--recreate", "tables", "--confirm", "sbtest") == 0
 
 
 def test_dry_run_prints_commands_and_budget(fake_env, spec_file, capsys) -> None:

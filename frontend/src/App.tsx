@@ -10,6 +10,7 @@ import { Targets } from "./pages/Targets";
 import { NewRun } from "./pages/NewRun";
 import { JobView } from "./pages/JobView";
 import { Diagnostics } from "./pages/Diagnostics";
+import { Tasks } from "./pages/Tasks";
 import { Compare } from "./pages/Compare";
 import { Settings } from "./pages/Settings";
 import { Users } from "./pages/Users";
@@ -46,6 +47,7 @@ export function App() {
           <Route path="/new" element={<NewRun me={me} />} />
           <Route path="/targets" element={<Targets me={me} />} />
           <Route path="/diagnostics" element={<Diagnostics />} />
+          <Route path="/tasks" element={<Tasks />} />
           <Route path="/jobs/:jobId" element={<JobView />} />
           <Route path="/compare" element={<Compare />} />
           {me.role === "admin" && <Route path="/settings" element={<Settings />} />}

@@ -49,6 +49,9 @@ export function NewRun({ me }: { me: Me }) {
   const [soak, setSoak] = useState({ threads: 64, duration_s: 3600, tolerate_errors: true });
   const [schedule, setSchedule] = useState("");
   const [tplName, setTplName] = useState("");
+  const [createDb, setCreateDb] = useState(false);
+  const [recreateScope, setRecreateScope] = useState("");   // "" | "database" | "tables"
+  const [confirmDb, setConfirmDb] = useState("");
 
   const [yaml, setYaml] = useState("");
   const [autoSync, setAutoSync] = useState(true);
@@ -128,10 +131,24 @@ export function NewRun({ me }: { me: Me }) {
       window.location.href = "/ui";
     } catch (e) { setErr("could not start: " + (e as Error).message); }
   }
+  // Target database the prepare options act on (for the typed-confirm guard).
+  const targetDb = targetMode === "saved"
+    ? (targets.find((t) => t.id === targetId)?.dbname ?? "")
+    : inline.database;
+
   async function task(kind: "preflight" | "prepare") {
     setErr(null);
     try {
-      const d = await api.post<{ job_id: number }>(`/api/${kind}`, { spec_yaml: yaml, ...credBody() });
+      const body: Record<string, unknown> = { spec_yaml: yaml, ...credBody() };
+      if (kind === "prepare") {
+        if (createDb) body.create_db = true;
+        if (recreateScope) {
+          if (confirmDb !== targetDb) throw new Error(`type the database name "${targetDb}" to confirm the drop`);
+          body.recreate = recreateScope;
+          body.confirm = confirmDb;
+        }
+      }
+      const d = await api.post<{ job_id: number }>(`/api/${kind}`, body);
       navigate(`/jobs/${d.job_id}`);
     } catch (e) { setErr(`could not start ${kind}: ` + (e as Error).message); }
   }
@@ -248,6 +265,29 @@ export function NewRun({ me }: { me: Me }) {
               : <span className="subtle">viewer role: read-only</span>}
           </div>
           {dryOut && <pre className="out mono dry">{dryOut}</pre>}
+
+          {canRun && (
+            <details className="prep-opts">
+              <summary className="subtle">Prepare options (create / recreate database)</summary>
+              <label className="follow"><input type="checkbox" checked={createDb} onChange={(e) => setCreateDb(e.target.checked)} /> Create the database <code>{targetDb || "—"}</code> if it doesn't exist</label>
+              <label className="follow"><input type="checkbox" checked={!!recreateScope} onChange={(e) => { setRecreateScope(e.target.checked ? "database" : ""); setConfirmDb(""); }} /> Drop existing data first (DESTRUCTIVE)</label>
+              {recreateScope && (
+                <div className="recreate-box">
+                  <label>What to drop
+                    <select value={recreateScope} onChange={(e) => setRecreateScope(e.target.value)}>
+                      <option value="database">the whole database ({targetDb})</option>
+                      <option value="tables">only the benchmark tables</option>
+                    </select>
+                  </label>
+                  <label>Type <code>{targetDb}</code> to confirm
+                    <input value={confirmDb} onChange={(e) => setConfirmDb(e.target.value)} placeholder={targetDb} autoComplete="off" /></label>
+                  <p className="subtle" style={{ fontSize: 12 }}>
+                    This permanently deletes {recreateScope === "database" ? "the entire database and everything in it" : "the sysbench/tpcc tables"} before reloading. Applies when you click <b>Prepare data</b>.
+                  </p>
+                </div>
+              )}
+            </details>
+          )}
         </div>
       </div>
     </>

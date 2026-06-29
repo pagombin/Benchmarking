@@ -689,3 +689,47 @@ def test_legacy_admin_paths_redirect_to_console(web):
                          ("/audit", "/ui/audit"), ("/compare", "/ui/compare")]:
         r = client.get(path, auth=("admin", "apw"), follow_redirects=False)
         assert r.status_code == 307 and r.headers["location"] == target
+
+
+# ── Phase 9: prepare safety, target creds, job detail/prepare stats ─────
+
+def test_prepare_recreate_requires_confirm_api(web):
+    client, _ = web
+    spec = _spec_yaml()
+    # destructive recreate without a matching typed confirmation is rejected
+    r = client.post("/api/prepare", json={"spec_yaml": spec, "password": WEB_PW,
+                                          "recreate": "database"}, auth=("op", "oppw"))
+    assert r.status_code == 400
+    r = client.post("/api/prepare", json={"spec_yaml": spec, "password": WEB_PW,
+                                          "recreate": "database", "confirm": "sbtest"}, auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["kind"] == "prepare"
+
+
+def test_target_update_rotates_credentials(web):
+    client, cfg = web
+    client.post("/api/targets", json={"name": "t1", "host": "h", "dbname": "sbtest",
+                                      "dbuser": "olduser", "password": "oldpw"}, auth=("op", "oppw"))
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    r = client.post(f"/api/targets/{tid}", json={"dbuser": "newuser", "password": "newpw"}, auth=("op", "oppw"))
+    assert r.status_code == 200
+    t = [t for t in client.get("/api/targets", auth=("op", "oppw")).json() if t["id"] == tid][0]
+    assert t["dbuser"] == "newuser"
+    from pgbench_webapp.secrets_store import SecretStore
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    assert store.get("target:t1:password") == "newpw"
+    # viewer cannot update
+    assert client.post(f"/api/targets/{tid}", json={"dbuser": "x"}, auth=("viewer", "vpw")).status_code == 403
+
+
+def test_job_detail_includes_prepare_stats(web):
+    client, cfg = web
+    jid = client.post("/api/prepare", json={"spec_yaml": _spec_yaml(), "password": WEB_PW},
+                      auth=("op", "oppw")).json()["job_id"]
+    # write the load-metrics file prepare would produce (slug = host-database)
+    cfg.results_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.results_dir / "prepare_db-example-invalid-sbtest.json").write_text(
+        '{"loaded_units":"300 warehouses","wall_s":1234.5,"db_size_pretty":"38.2 GiB",'
+        '"load_mb_s":31.2,"started_utc":"2026-06-28T10:00:00Z","finished_utc":"2026-06-28T10:20:34Z"}')
+    d = client.get(f"/api/jobs/{jid}", auth=("viewer", "vpw")).json()
+    assert d["kind"] == "prepare" and d["prepare_stats"]["loaded_units"] == "300 warehouses"
+    assert client.get("/api/jobs/99999", auth=("viewer", "vpw")).status_code == 404

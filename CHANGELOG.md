@@ -2,6 +2,32 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Prepare visibility, safety, and pg_stat_statements.**
+  - **Tasks view** — a new page listing every job (runs, soaks, and the lifecycle
+    jobs prepare/preflight/doctor) with state, who, start, **duration**, and the
+    failure reason inline. prepare/preflight/doctor no longer "disappear": each
+    links to its detail. `GET /api/jobs/{id}` returns the job + (for prepare) its
+    **load metrics** (loaded units, wall time, DB size, MB/s, threads, start/end),
+    shown as KPI cards on the task detail.
+  - **prepare no longer fails/​no-ops silently.** An already-loaded dataset is a
+    clear, actionable error (offers recreate); a missing database is a clear error
+    (offers create). New `prepare` options (CLI flags + console):
+    - **create the database if missing** (ask-first checkbox; connects via a
+      maintenance DB — defaultdb/postgres — to `CREATE DATABASE`).
+    - **recreate** — drop the whole database *or* just the benchmark tables, then
+      reload. Destructive, so it requires typing the database name to confirm
+      (enforced in the UI and server and harness). After a drop it waits for the
+      DB to come back and **retries the load once on a fresh connection** to
+      absorb the known post-drop flakiness.
+    - `run --prepare` / `soak --prepare` stay idempotent (skip when present).
+  - **pg_stat_statements**: preflight now reports it as enabled, or **tries to
+    enable it** (`CREATE EXTENSION IF NOT EXISTS`) and reports success/failure —
+    every preflight re-checks. (It powers the per-query stats already captured at
+    end of run.)
+  - **Targets**: edit a saved cluster's connection and **rotate its username /
+    password** (`POST /api/targets/{id}`); the password reuses the encrypted ref.
+  - Carried via a new per-job `options` column (migration 3).
+
 - **Console parity (Jinja fully retired) + real concurrency.**
   - **Compare, Users, Settings, Audit are now SPA pages** — the last server-
     rendered pages are ported. The legacy paths (`/compare`, `/admin/users`,

@@ -119,10 +119,20 @@ def cmd_doctor() -> int:
 
 def _maybe_prepare(spec_path: Path, results_dir: Path, do_prepare: bool,
                    logger: logging.Logger) -> None:
-    """For run/soak --prepare: load the dataset first if it's missing (idempotent)."""
-    if do_prepare:
-        logger.info("--prepare: ensuring the dataset is loaded before the run")
-        cmd_prepare(spec_path, results_dir)
+    """For run/soak --prepare: load the dataset first if it's missing (idempotent).
+
+    Unlike a bare `prepare` (which now errors on an already-loaded dataset so the
+    operator must opt into a recreate), the run/soak convenience flag is a no-op
+    when the data is already present.
+    """
+    if not do_prepare:
+        return
+    spec = load_spec(spec_path)
+    if capture.check_dataset(spec, spec.password()).ok:
+        logger.info("--prepare: dataset already present; skipping load")
+        return
+    logger.info("--prepare: dataset missing — loading it before the run")
+    cmd_prepare(spec_path, results_dir)
 
 
 def cmd_preflight(spec_path: Path, json_output: bool = False) -> int:
@@ -207,18 +217,74 @@ def _log_tail(path: Path, lines: int = 15) -> str:
     return "\n".join("    " + line for line in tail) or "  (log is empty)"
 
 
-def cmd_prepare(spec_path: Path, results_dir: Path) -> int:
-    """`prepare` subcommand: load the dataset idempotently, recording load metrics."""
+def cmd_prepare(spec_path: Path, results_dir: Path, recreate: str = "",
+                create_db: bool = False, confirm: str = "") -> int:
+    """`prepare` subcommand: load the dataset, with explicit, non-silent outcomes.
+
+    Options (used by the web console; CLI flags too):
+    * ``create_db``   — create the target database first if it does not exist.
+    * ``recreate``    — "database" (drop+recreate the DB) or "tables" (drop just
+                        the benchmark tables) before loading. Destructive, so it
+                        requires ``confirm`` to equal the database name.
+    Distinct, actionable errors instead of a silent no-op: already-present and
+    missing-database are reported clearly.
+    """
     spec = load_spec(spec_path)
     password = spec.password()
     get_redactor().register(password)
     logger = setup_logging()
+    db = spec.target.database
+    if recreate and recreate not in ("database", "tables"):
+        raise RunError(f"unknown recreate mode '{recreate}'", hint="use 'database' or 'tables'.")
+    if recreate and confirm != db:
+        raise RunError(
+            f"refusing to recreate: typed confirmation '{confirm}' does not match "
+            f"database '{db}'", hint="type the exact database name to confirm.")
+
+    maint = capture.maintenance_db(spec, password)   # for DB-level admin ops (may be None)
+    exists = capture.database_exists(spec, password, maint) if maint else None
+
+    if recreate == "database":
+        if maint is None:
+            raise RunError("cannot recreate the database: no maintenance database "
+                           "(defaultdb/postgres) is reachable",
+                           hint="check credentials/SSL; the user needs CREATEDB.")
+        logger.info("recreate=database: dropping and recreating %s", db)
+        ok, err = capture.drop_database(spec, password, maint)
+        if not ok:
+            raise RunError(f"DROP DATABASE {db} failed: {err}",
+                           hint="ensure no other sessions hold it and the user owns it.")
+        ok, err = capture.create_database(spec, password, maint)
+        if not ok:
+            raise RunError(f"CREATE DATABASE {db} failed: {err}")
+        if not capture.wait_for_db(spec, password):
+            raise RunError("database is not reachable after recreate",
+                           hint="managed PG can lag just after a drop/create — retry prepare.")
+    elif recreate == "tables":
+        logger.info("recreate=tables: dropping benchmark tables in %s", db)
+        ok, err = capture.drop_benchmark_tables(spec, password)
+        if not ok:
+            raise RunError(f"dropping benchmark tables failed: {err}")
+    elif exists is False:
+        assert maint is not None   # exists is False only when a maintenance DB resolved
+        if create_db:
+            logger.info("database %s does not exist; creating it", db)
+            ok, err = capture.create_database(spec, password, maint)
+            if not ok:
+                raise RunError(f"CREATE DATABASE {db} failed: {err}")
+            capture.wait_for_db(spec, password)
+        else:
+            raise RunError(
+                f"database '{db}' does not exist on {spec.target.host}",
+                hint="re-run prepare with 'create database' enabled to create it first.")
+
     check = capture.check_dataset(spec, password)
-    if check.ok:
-        logger.info("dataset already present and matches the spec (%s); nothing to do.",
-                    check.detail)
-        return 0
-    if check.status != "missing":
+    if check.ok and not recreate:
+        raise RunError(
+            f"dataset already present and matches the spec ({check.detail})",
+            hint="re-run prepare with 'drop existing data first' (recreate) to reload it, "
+                 "or just run the benchmark against the existing data.")
+    if check.status not in ("missing", "ok") and not recreate:
         raise _dataset_error(check, spec_path)
     results_dir.mkdir(parents=True, exist_ok=True)
     cmd = sysbench.build_prepare_command(spec)
@@ -226,6 +292,12 @@ def cmd_prepare(spec_path: Path, results_dir: Path) -> int:
     logger.info("preparing dataset: %s", cmd.display())
     started, t0 = utc_now_iso(), time.monotonic()
     rc = sysbench.run_streaming(cmd, sysbench.child_env(spec, password), log_path, logger)
+    if rc != 0 and recreate:
+        # absorb the well-known post-drop connection flakiness with one fresh retry
+        logger.warning("prepare exited %d right after recreate; retrying once on a fresh "
+                       "connection", rc)
+        capture.wait_for_db(spec, password)
+        rc = sysbench.run_streaming(cmd, sysbench.child_env(spec, password), log_path, logger)
     if rc != 0:
         raise RunError(
             f"sysbench prepare exited with code {rc} (full output in {log_path})",

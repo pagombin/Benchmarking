@@ -22,6 +22,16 @@ export function fmtWhen(iso: string | null | undefined): string {
   return `${mon} ${day}, ${hh}:${mm} UTC`;
 }
 
+/** Human duration between two ISO timestamps (e.g. "20m 34s", "1h 05m"). */
+export function durBetween(start?: string | null, end?: string | null): string {
+  if (!start || !end) return "—";
+  const s = (new Date(end).getTime() - new Date(start).getTime()) / 1000;
+  if (Number.isNaN(s) || s < 0) return "—";
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+
 export function relAge(iso: string | null | undefined): string {
   if (!iso) return "";
   const t = new Date(iso).getTime();

@@ -450,6 +450,99 @@ def detect_pg_stat_statements(spec: Spec, password: str) -> bool:
     return ok and out.strip() == "1"
 
 
+# ── database administration (create / drop / recreate for prepare) ───────────
+MAINTENANCE_DBS = ("defaultdb", "postgres", "template1")
+
+
+def _ident(name: str) -> str:
+    """Quote a SQL identifier (database/table name)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _lit(value: str) -> str:
+    """Quote a SQL string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _psql_on(spec: Spec, sql: str, dbname: str) -> list[str]:
+    t = spec.target
+    return ["psql", "-h", t.host, "-p", str(t.port), "-U", t.user, "-d", dbname,
+            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql]
+
+
+def psql_on(spec: Spec, password: str, dbname: str, sql: str,
+            timeout: int = PSQL_TIMEOUT_S) -> tuple[bool, str]:
+    """Run one statement against a *specific* database (for admin ops). (ok, out|err)."""
+    try:
+        proc = subprocess.run(_psql_on(spec, sql, dbname), env=child_env(spec, password),
+                              capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, get_redactor().redact(proc.stderr.strip())
+    return True, proc.stdout.strip()
+
+
+def maintenance_db(spec: Spec, password: str) -> Optional[str]:
+    """First reachable admin database (for CREATE/DROP DATABASE), or None."""
+    for db in MAINTENANCE_DBS:
+        if db == spec.target.database:
+            continue
+        ok, _ = psql_on(spec, password, db, "SELECT 1")
+        if ok:
+            return db
+    return None
+
+
+def database_exists(spec: Spec, password: str, maint_db: str) -> bool:
+    ok, out = psql_on(spec, password, maint_db,
+                      f"SELECT 1 FROM pg_database WHERE datname = {_lit(spec.target.database)}")
+    return ok and out.strip() == "1"
+
+
+def create_database(spec: Spec, password: str, maint_db: str) -> tuple[bool, str]:
+    return psql_on(spec, password, maint_db, f"CREATE DATABASE {_ident(spec.target.database)}")
+
+
+def drop_database(spec: Spec, password: str, maint_db: str) -> tuple[bool, str]:
+    """Terminate other backends on the target DB, then DROP DATABASE IF EXISTS."""
+    psql_on(spec, password, maint_db,
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname = {_lit(spec.target.database)} AND pid <> pg_backend_pid()")
+    return psql_on(spec, password, maint_db, f"DROP DATABASE IF EXISTS {_ident(spec.target.database)}")
+
+
+def drop_benchmark_tables(spec: Spec, password: str) -> tuple[bool, str]:
+    """Drop just the workload's benchmark tables (leaves other objects intact)."""
+    names = expected_table_names(spec)
+    if not names:
+        return True, "no benchmark tables to drop"
+    stmt = "DROP TABLE IF EXISTS " + ", ".join(_ident(n) for n in names) + " CASCADE"
+    return psql_query_soft(spec, password, stmt)
+
+
+def wait_for_db(spec: Spec, password: str, attempts: int = 8, delay: float = 1.5) -> bool:
+    """Poll the target DB until it accepts a trivial query (post create/drop flakiness)."""
+    for _ in range(attempts):
+        ok, _ = psql_query_soft(spec, password, "SELECT 1")
+        if ok:
+            return True
+        time.sleep(delay)
+    return False
+
+
+def enable_pg_stat_statements(spec: Spec, password: str) -> tuple[bool, str]:
+    """Try to enable the pg_stat_statements extension. Returns (ok, detail).
+
+    ``CREATE EXTENSION IF NOT EXISTS`` is idempotent. On managed PostgreSQL the
+    extension is preloaded, so this usually succeeds for a privileged user;
+    otherwise it returns the server's (redacted) reason.
+    """
+    ok, out = psql_query_soft(
+        spec, password, "CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+    return (ok, "extension enabled" if ok else out)
+
+
 def snapshot_bgwriter(spec: Spec, password: str) -> str:
     """One-row JSON snapshot of pg_stat_bgwriter (column-set agnostic)."""
     ok, out = psql_query_soft(
@@ -611,9 +704,15 @@ def preflight_steps(spec: Spec, password: str,
     except Exception as exc:  # noqa: BLE001
         yield ev("Pooler probe", "info", str(exc))
     try:
-        present = detect_pg_stat_statements(spec, password)
-        yield ev("pg_stat_statements", "ok" if present else "warn",
-                 "installed" if present else "not installed (per-query stats unavailable)")
+        if detect_pg_stat_statements(spec, password):
+            yield ev("pg_stat_statements", "ok", "enabled (per-query latency/calls captured)")
+        else:
+            ok, detail = enable_pg_stat_statements(spec, password)
+            if ok and detect_pg_stat_statements(spec, password):
+                yield ev("pg_stat_statements", "ok", "was disabled — enabled it now")
+            else:
+                yield ev("pg_stat_statements", "warn",
+                         f"not enabled and could not enable it ({detail})")
     except Exception as exc:  # noqa: BLE001
         yield ev("pg_stat_statements", "warn", str(exc))
     try:

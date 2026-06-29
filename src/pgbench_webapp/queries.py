@@ -104,6 +104,17 @@ def delete_target(conn: sqlite3.Connection, target_id: int) -> None:
     conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
 
 
+def update_target(conn: sqlite3.Connection, target_id: int, **fields: Any) -> None:
+    """Update connection fields (host/port/dbname/dbuser/sslmode). Never the password
+    (that lives in the secret store under password_ref)."""
+    allowed = {"host", "port", "dbname", "dbuser", "sslmode"}
+    sets = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not sets:
+        return
+    clause = ",".join(f"{k}=?" for k in sets)
+    conn.execute(f"UPDATE targets SET {clause} WHERE id=?", (*sets.values(), target_id))
+
+
 def job_for_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
     """The most recent job that produced this run (for re-run target lookup)."""
     return conn.execute("SELECT * FROM jobs WHERE run_id=? ORDER BY id DESC LIMIT 1",
@@ -144,12 +155,12 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
 
 def enqueue_job(conn: sqlite3.Connection, kind: str, spec_yaml: str, target_id: Optional[int],
                 requested_by: str, scheduled_utc: Optional[str] = None,
-                resume_run_id: Optional[str] = None) -> int:
+                resume_run_id: Optional[str] = None, options: Optional[str] = None) -> int:
     cur = conn.execute(
         "INSERT INTO jobs(kind, state, spec_yaml, target_id, scheduled_utc, created_utc, "
-        "requested_by, resume_run_id) VALUES (?,?,?,?,?,?,?,?)",
+        "requested_by, resume_run_id, options) VALUES (?,?,?,?,?,?,?,?,?)",
         (kind, "queued", spec_yaml, target_id, scheduled_utc, utc_now_iso(),
-         requested_by, resume_run_id))
+         requested_by, resume_run_id, options))
     return int(cur.lastrowid or 0)
 
 

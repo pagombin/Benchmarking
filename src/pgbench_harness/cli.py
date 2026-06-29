@@ -28,6 +28,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--spec", required=True, type=Path)
     pr.add_argument("--results-dir", type=Path, default=Path("results"),
                     help="where prepare logs/load-metrics are stored (default: results/)")
+    pr.add_argument("--create-db", action="store_true",
+                    help="create the target database first if it does not exist")
+    pr.add_argument("--recreate", choices=["database", "tables"], default="",
+                    help="DESTRUCTIVE: drop the database or just the benchmark tables, then load")
+    pr.add_argument("--confirm", default="",
+                    help="must equal the target database name to allow --recreate")
 
     va = sub.add_parser("validate", help="validate a spec without connecting (CI-friendly)")
     va.add_argument("--spec", required=True, type=Path)
@@ -145,7 +151,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_preflight(args.spec, json_output=args.json)
         if args.command == "prepare":
             from pgbench_harness.runner import cmd_prepare
-            return cmd_prepare(args.spec, args.results_dir)
+            return cmd_prepare(args.spec, args.results_dir, recreate=args.recreate,
+                               create_db=args.create_db, confirm=args.confirm)
         if args.command == "validate":
             from pgbench_harness.runner import cmd_validate
             return cmd_validate(args.spec)

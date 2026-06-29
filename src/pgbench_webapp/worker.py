@@ -14,6 +14,7 @@ Design choices that satisfy "survives UI/web restart and disconnects":
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -109,6 +110,16 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     elif kind == "prepare":                    # dataset load (no run dir produced)
         argv = [cfg.harness_bin, "prepare", "--spec", str(spec_file),
                 "--results-dir", str(cfg.results_dir)]
+        opts = {}
+        if job["options"]:
+            try:
+                opts = json.loads(job["options"])
+            except (ValueError, TypeError):
+                opts = {}
+        if opts.get("create_db"):
+            argv.append("--create-db")
+        if opts.get("recreate") in ("database", "tables"):
+            argv += ["--recreate", opts["recreate"], "--confirm", str(opts.get("confirm", ""))]
     else:                                       # run | soak
         argv = [cfg.harness_bin, kind, "--spec", str(spec_file),
                 "--results-dir", str(cfg.results_dir)]

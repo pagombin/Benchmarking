@@ -11,6 +11,7 @@ import { useTheme } from "../lib/theme";
 const NAV: { to: string; label: string; admin?: boolean; op?: boolean }[] = [
   { to: "/", label: "Runs" },
   { to: "/new", label: "New run" },
+  { to: "/tasks", label: "Tasks" },
   { to: "/targets", label: "Targets" },
   { to: "/compare", label: "Compare" },
   { to: "/diagnostics", label: "Diagnostics", op: true },
