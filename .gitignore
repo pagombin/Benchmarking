@@ -19,3 +19,4 @@ frontend/.vite/
 secrets.enc
 secret.key
 certs/
+frontend/*.tsbuildinfo
