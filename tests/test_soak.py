@@ -266,6 +266,33 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert not leaks
 
 
+def test_interactive_payload_live_without_summary(tmp_path) -> None:
+    """The in-app timeseries builder works MID-RUN: series come from a (partially
+    written) soak_timeseries.csv, and markers are recomputed live from events.jsonl
+    against the manifest soak start — with NO soak_summary.json present yet."""
+    from pgbench_harness import report_soak, runner
+    run_dir = tmp_path / "run-live"
+    (run_dir / "parsed").mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(json.dumps(
+        {"run_id": "run-live", "mode": "soak",
+         "soak": {"start_utc": "2026-06-30T00:00:00.000000Z", "target_duration_s": 600}}),
+        encoding="utf-8")
+    cols = "t,ts_utc,tps,qps,lat_p99,err_s,reconn_s,threads,seg,qps_r,qps_w,qps_o,lat_p99_pct"
+    rows = [cols,
+            "0,2026-06-30T00:00:00.000000Z,100,2000,40,0,0,4,soak_seg01,1000,700,300,99",
+            "1,2026-06-30T00:00:01.000000Z,110,2200,41,0,0,4,soak_seg01,1100,770,330,99",
+            "2,2026-06-30T00:00:02.000000Z,120,2400,42,0,0,4,soak_seg01,1200,840,360,99",
+            "x-partial-trailing-line"]   # truncated live append -> must be skipped, not crash
+    (run_dir / "parsed" / "soak_timeseries.csv").write_text("\n".join(rows), encoding="utf-8")
+    # operator stamps a failover at t=2 while the run is still in flight
+    assert runner.cmd_mark(run_dir, "failover", "primary", "", at_s=2) == 0
+    payload = report_soak.interactive_payload(run_dir)
+    assert payload is not None
+    assert payload["t"] == [0, 1, 2] and len(payload["tps"]) == 3
+    assert any(mk["t"] == 2 and mk["kind"] == "event" for mk in payload["markers"])
+    assert not (run_dir / "parsed" / "soak_summary.json").exists()
+
+
 def test_soak_surfaces_failure_and_finalizes(fake_env, tmp_path, monkeypatch) -> None:
     """A soak whose load generator can't run must FAIL FAST, surface sysbench's
     own error, and leave a TERMINAL manifest — never an indistinguishable blank,

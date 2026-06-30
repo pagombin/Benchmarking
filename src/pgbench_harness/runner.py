@@ -8,7 +8,7 @@ import logging
 import re
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -539,12 +539,45 @@ def _append_event(run_dir: Path, etype: str, label: str, note: str, source: str,
     return ev
 
 
-def cmd_mark(run_dir: Path, etype: str, label: str, note: str) -> int:
-    """`mark` subcommand: stamp a timeline event into a running/finished soak."""
+def _soak_start_dt(run_dir: Path) -> Optional[datetime]:
+    """The soak's t=0 anchor (manifest.soak.start_utc) as a datetime, or None."""
+    try:
+        doc = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    s = (doc.get("soak") or {}).get("start_utc") if isinstance(doc, dict) else None
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def cmd_mark(run_dir: Path, etype: str, label: str, note: str,
+             at_s: Optional[float] = None) -> int:
+    """`mark` subcommand: stamp a timeline event into a running/finished soak.
+
+    ``at_s`` stamps the event at a specific offset (seconds from the soak start)
+    instead of 'now' — used by the report's click-to-annotate. The offset is
+    converted to the absolute shared-clock ts so the analysis places it correctly.
+    """
     setup_logging()
     if not (run_dir / "manifest.json").exists():
         raise RunError(f"no manifest.json in {run_dir}", hint="pass the soak run directory.")
-    ev = _append_event(run_dir, etype, label, note, source="mark")
+    ts_utc: Optional[str] = None
+    if at_s is not None:
+        if at_s < 0:
+            raise RunError("cannot stamp an event before the run start (at_s < 0)")
+        start = _soak_start_dt(run_dir)
+        if start is None:
+            raise RunError("cannot stamp at an offset: this run has no soak start time",
+                           hint="offset stamping is only available for soak runs.")
+        ts = start + timedelta(seconds=float(at_s))
+        ts_utc = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    ev = _append_event(run_dir, etype, label, note, source="mark", ts_utc=ts_utc)
     get_logger().info("marked %s '%s' at %s in %s", etype, label, ev["ts_utc"], run_dir)
     return 0
 
@@ -634,6 +667,13 @@ def _soak_supervisor(
             ts = (base_dt.timestamp() + ev.at_s)
             iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             _append_event(run_dir, ev.type, ev.label, ev.note, source="spec", ts_utc=iso)
+
+    # Persist the soak anchor (start_utc) to the manifest immediately — BEFORE the
+    # first (possibly hours-long) segment — so live consumers can resolve t=0 from
+    # second one: offset event-stamping from the report and the in-app timeline
+    # markers both need start_utc on disk while the run is still in flight.
+    manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
+    manifest.save(run_dir)
 
     # Live per-second series for the cockpit, appended as each interval arrives
     # (soak.analyze rebuilds the canonical file atomically at finalize).
