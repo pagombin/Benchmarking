@@ -40,7 +40,6 @@ workload:
 """
     if mode == "soak":
         base += "soak:\n  threads: 2\n  duration_s: 2\n  tolerate_errors: true\n"
-        base += "events:\n  - {at_s: 1, type: failover, label: fail}\n"
     else:
         base += "sweep:\n  threads: [1]\n  duration_s: 2\n  warmup_s: 1\n  cooldown_s: 0\n  repetitions: 1\n"
     return base
@@ -911,11 +910,14 @@ def _make_soak(client, cfg) -> str:
 def test_soak_timeseries_endpoint_serves_series_and_markers(web):
     client, cfg = web
     rid = _make_soak(client, cfg)
+    # events are no longer spec-seeded — stamp one so there's a confirmed marker
+    client.post(f"/api/runs/{rid}/mark", json={"type": "failover", "at_s": 1, "label": "f"},
+                auth=("op", "oppw"))
     d = client.get(f"/api/runs/{rid}/timeseries", auth=("viewer", "vpw")).json()
     assert d["available"] is True and d["terminal"] is True
     assert isinstance(d["t"], list) and len(d["t"]) >= 1
     assert len(d["tps"]) == len(d["t"])
-    # the spec-seeded failover at 1s renders as a confirmed (event) marker
+    # the stamped failover renders as a confirmed (event) marker
     assert any(mk["kind"] == "event" for mk in d["markers"])
 
 

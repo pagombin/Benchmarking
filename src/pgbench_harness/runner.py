@@ -87,8 +87,8 @@ def cmd_validate(spec_path: Path) -> int:
     print(f"  mode     : {mode}")
     if spec.is_soak:
         assert spec.soak is not None
-        print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)}, "
-              f"{len(spec.events)} planned event(s)")
+        print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)} "
+              f"(events: auto-detected or operator-marked)")
     else:
         assert spec.sweep is not None
         print(f"  sweep    : threads {list(spec.sweep.threads)}, {spec.sweep.duration_s}s/level, "
@@ -660,13 +660,10 @@ def _soak_supervisor(
     consecutive_short = consecutive_zero_sample = 0
     last_excerpt = ""
 
-    # Seed planned (spec-declared) events that have an explicit offset.
+    # Shared-clock anchor for the live per-second writer. Timeline events are NOT
+    # pre-declared in the spec: they arrive only via auto-detection (soak.analyze)
+    # or operator marks (the live cockpit / report stamping, appended to events.jsonl).
     base_dt = datetime.strptime(start_utc, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-    for ev in spec.events:
-        if ev.at_s is not None:
-            ts = (base_dt.timestamp() + ev.at_s)
-            iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            _append_event(run_dir, ev.type, ev.label, ev.note, source="spec", ts_utc=iso)
 
     # Persist the soak anchor (start_utc) to the manifest immediately — BEFORE the
     # first (possibly hours-long) segment — so live consumers can resolve t=0 from
@@ -822,9 +819,8 @@ def cmd_soak(
         print(cmd.display())
         print(f"# fixed concurrency {spec.soak.threads}, duration "
               f"{fmt_duration(spec.soak.duration_s)} (supervisor relaunches on early exit)")
-        for ev in spec.events:
-            at = f"at {ev.at_s}s" if ev.at_s is not None else "live via `mark`"
-            print(f"# planned event: {ev.type} ({at}) — {ev.note or ev.label}")
+        print("# events: auto-detected by the analysis, or marked live via the console / "
+              "`pgbench-harness mark` — none are pre-declared in the spec")
         print(f"# password source: env var {spec.target.password_env} -> PGPASSWORD")
         return 0
     password = spec.password()

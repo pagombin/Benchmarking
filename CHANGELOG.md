@@ -2,6 +2,12 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Removed spec-declared timeline events.** A soak spec can no longer
+  pre-declare events (the `events:` section, including `at_s` timing) — an
+  `events:` key is now rejected with a hint. Timeline events come only from the
+  analysis's **auto-detection** or from **operator marks** (the live cockpit /
+  report stamping, or `pgbench-harness mark`). **Breaking:** remove any
+  `events:` section from existing soak specs/presets.
 - **Switched query-stats capture from pg_stat_statements to pg_stat_monitor.**
   The `capture.pg_stat_statements` spec key is now `capture.pg_stat_monitor`
   (same `auto`/`true`/`false` semantics); preflight detects/enables the
