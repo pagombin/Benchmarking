@@ -510,9 +510,9 @@ def cmd_run(
     manifest.wall_time_s = _wall_time_s(manifest)
     manifest.save(run_dir)
     write_parsed(run_dir, spec, manifest)
-    if spec.capture.pg_stat_statements != "false" and pf.pg_stat_statements:
-        atomic_write_text(run_dir / "env" / "pg_stat_statements.json",
-                          capture.snapshot_pg_stat_statements(spec, password) + "\n")
+    if spec.capture.pg_stat_monitor != "false" and pf.pg_stat_monitor:
+        atomic_write_text(run_dir / "env" / "pg_stat_monitor.json",
+                          capture.snapshot_pg_stat_monitor(spec, password) + "\n")
     report.generate_report(run_dir)
     logger.info("run %s finished with status '%s'; report: %s",
                 manifest.run_id, status, run_dir / "report.html")

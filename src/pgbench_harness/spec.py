@@ -63,7 +63,7 @@ class Sweep:
 @dataclass(frozen=True)
 class Capture:
     pg_settings: bool = True
-    pg_stat_statements: str = "auto"  # "auto" | "true" | "false"
+    pg_stat_monitor: str = "auto"  # "auto" | "true" | "false"
     bgwriter_stats: bool = True
     io_stats: bool = True
     histogram: bool = True
@@ -297,16 +297,16 @@ def _parse_sweep(sec: dict[str, Any]) -> Sweep:
 
 def _parse_capture(sec: dict[str, Any]) -> Capture:
     _check_keys(sec, "capture", set(),
-                {"pg_settings", "pg_stat_statements", "bgwriter_stats", "io_stats", "histogram",
+                {"pg_settings", "pg_stat_monitor", "bgwriter_stats", "io_stats", "histogram",
                  "live_pg", "live_pg_interval_s"})
-    pss = sec.get("pg_stat_statements", "auto")
-    if isinstance(pss, bool):
-        pss = "true" if pss else "false"
-    if pss not in ("auto", "true", "false"):
-        raise SpecError("'capture.pg_stat_statements' must be true, false or 'auto'")
+    psm = sec.get("pg_stat_monitor", "auto")
+    if isinstance(psm, bool):
+        psm = "true" if psm else "false"
+    if psm not in ("auto", "true", "false"):
+        raise SpecError("'capture.pg_stat_monitor' must be true, false or 'auto'")
     return Capture(
         pg_settings=_typed(sec, "capture", "pg_settings", bool, True),
-        pg_stat_statements=pss,
+        pg_stat_monitor=psm,
         bgwriter_stats=_typed(sec, "capture", "bgwriter_stats", bool, True),
         io_stats=_typed(sec, "capture", "io_stats", bool, True),
         histogram=_typed(sec, "capture", "histogram", bool, True),
