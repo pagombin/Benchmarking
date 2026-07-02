@@ -34,9 +34,9 @@ export function Compare() {
     () => new Set((runs ?? []).filter((r) => sel.has(r.run_id)).map((r) => r.mode)),
     [runs, sel]);
   const mixed = selModes.size > 1;
-  // Live compare overlays two runs on a shared real-time axis — soak-only (a
-  // sweep's per-level timeline can't be wall-clock aligned) and exactly two.
-  const bothSoak = sel.size === 2 && selModes.size === 1 && [...selModes][0] === "soak";
+  // Live compare overlays runs on a shared real-time axis — soak-only (a sweep's
+  // per-level timeline can't be wall-clock aligned), 2–6 runs.
+  const canLive = sel.size >= 2 && sel.size <= 6 && selModes.size === 1 && [...selModes][0] === "soak";
 
   if (viewing) {
     return (
@@ -60,8 +60,8 @@ export function Compare() {
         <span className="subtle">{sel.size} selected</span>
         {mixed && <span className="subtle" style={{ color: "var(--bad, #c0392b)" }}>
           same type only (sweep or soak)</span>}
-        <button disabled={!bothSoak}
-          title={bothSoak ? "Overlay both soaks live on a shared real-time axis" : "Select exactly two soak runs"}
+        <button disabled={!canLive}
+          title={canLive ? "Overlay these soaks live on a shared real-time axis" : "Select 2–6 soak runs"}
           onClick={() => navigate(`/compare/live?runs=${[...sel].map(encodeURIComponent).join(",")}`)}>
           ▶ Live compare
         </button>

@@ -316,9 +316,11 @@ pre.out.dry { background: #0a0e14; color: #cdd9e5; padding: 10px 12px; border-ra
 .tl-bar { position: absolute; top: 0; height: 12px; border-radius: 6px; min-width: 2px; }
 .tl-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted);
   margin-left: 104px; margin-top: 2px; }
-.kpi-compare .cmp-vals { display: flex; align-items: baseline; gap: 10px; font-size: 22px;
+.kpi-compare .cmp-vals { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px; font-size: 20px;
   font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
 .kpi-compare .cmp-vals .subtle { font-size: 13px; font-weight: 400; }
+.kpi-compare .cmp-vals .sep { margin: 0 2px; }
+.kpi-compare .cmp-vals .best { text-decoration: underline; text-underline-offset: 3px; }
 .kpi-compare .delta { margin-left: auto; font-size: 13px; font-weight: 600; padding: 1px 7px; border-radius: 10px; }
 .kpi-compare .delta.up { color: var(--good, #1e8449); background: rgba(30,132,73,.12); }
 .kpi-compare .delta.down { color: var(--bad, #c0392b); background: rgba(192,57,43,.12); }
