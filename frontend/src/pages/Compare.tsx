@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { Run } from "../types";
 import { fmtInt, fmtWhen } from "../lib/format";
@@ -9,6 +10,7 @@ export function Compare() {
   const [viewing, setViewing] = useState<string[] | null>(null);
   const [q, setQ] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     api.get<Run[]>("/api/runs").then(setRuns).catch((e) => setErr(e.message));
@@ -32,6 +34,9 @@ export function Compare() {
     () => new Set((runs ?? []).filter((r) => sel.has(r.run_id)).map((r) => r.mode)),
     [runs, sel]);
   const mixed = selModes.size > 1;
+  // Live compare overlays two runs on a shared real-time axis — soak-only (a
+  // sweep's per-level timeline can't be wall-clock aligned) and exactly two.
+  const bothSoak = sel.size === 2 && selModes.size === 1 && [...selModes][0] === "soak";
 
   if (viewing) {
     return (
@@ -55,6 +60,11 @@ export function Compare() {
         <span className="subtle">{sel.size} selected</span>
         {mixed && <span className="subtle" style={{ color: "var(--bad, #c0392b)" }}>
           same type only (sweep or soak)</span>}
+        <button disabled={!bothSoak}
+          title={bothSoak ? "Overlay both soaks live on a shared real-time axis" : "Select exactly two soak runs"}
+          onClick={() => navigate(`/compare/live?runs=${[...sel].map(encodeURIComponent).join(",")}`)}>
+          ▶ Live compare
+        </button>
         <button className="primary" disabled={sel.size < 2 || mixed} onClick={() => setViewing([...sel])}>
           Compare selected
         </button>
