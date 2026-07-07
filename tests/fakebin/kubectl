@@ -253,9 +253,11 @@ def run_sql(st, sql):
     if "pg_stat_reset_shared" in s:
         return ""
     if "pg_stat_wal" in s or "wal_bytes" in s:
-        return f"{int(now())},{(int(now()) % 100000) * 1048576},128"
+        if "extract(epoch" in s:
+            return f"{int(now())},{(int(now()) % 100000) * 1048576},128"
+        return str((int(now()) % 100000) * 1048576)
     if "checkpoints" in s or "pg_stat_checkpointer" in s or "pg_stat_bgwriter" in s:
-        return f"{int(now())},{int(now()) % 500},{int(now()) % 37}"
+        return f"{int(now()) % 500},{int(now()) % 37}"
     if "pg_stat_replication" in s:
         lines = []
         for i in st["instances"]:

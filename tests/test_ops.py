@@ -761,3 +761,77 @@ def test_ops_sse_streams_scenario_run(opsweb):
         assert "event: hello" in got
         assert "event: events" in got
         assert "event: status" in got
+
+
+# ── Phase 5: telemetry monitor ──
+
+def test_monitor_samples_and_survives_failover(opsweb):
+    """The monitor re-detects the leader every cycle: a switchover mid-run
+    must show BOTH leaders across cycles, with no blank rows (split queries)."""
+    client, cfg = opsweb
+    import subprocess as sp
+    import threading
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}/monitor",
+                    json={"params": {"interval_s": 0.4, "max_duration_s": 5}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    # trigger a switchover ~2s into the monitor window, from a side thread
+    state_dir = cfg.data_dir.parent / "fakekube"
+
+    def switch_later():
+        import time as _t
+        _t.sleep(2)
+        env = dict(os.environ)
+        sp.run([str(FAKEBIN / "kubectl"), "exec", "cluster1-instance1-abcd-0",
+                "-c", "database", "--", "patronictl", "switchover",
+                "cluster1-ha", "--force"], env=env, capture_output=True)
+    th = threading.Thread(target=switch_later)
+    th.start()
+    _drain_queue(cfg)
+    th.join()
+    run = _last_ops_run(client, "monitor")
+    assert run["status"] == "complete", run
+    assert run["headline"]["cycles"] >= 6
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    mon = (run_dir / "parsed" / "monitor.csv").read_text().splitlines()
+    assert mon[0].startswith("epoch_s,leader,timeline")
+    leaders = {ln.split(",")[1] for ln in mon[1:] if ln.split(",")[1]}
+    assert len(leaders) == 2                      # saw both leaders
+    tls = {ln.split(",")[2] for ln in mon[1:] if ln.split(",")[2]}
+    assert {"5", "6"} <= tls                      # TL bump captured
+    # split queries: wal + archiver + queue populated on leader rows
+    data_rows = [ln.split(",") for ln in mon[1:]]
+    assert any(rw[3] for rw in data_rows)         # wal_bytes
+    assert any(rw[6] for rw in data_rows)         # archived_count
+    assert any(rw[8] for rw in data_rows)         # archive_queue
+    repl = (run_dir / "parsed" / "replication.csv").read_text().splitlines()
+    assert len(repl) >= 3                         # 2 replicas per cycle
+    disk = (run_dir / "parsed" / "disk.csv").read_text().splitlines()
+    assert any("38G" in ln for ln in disk[1:])
+
+
+def test_monitor_lane_does_not_consume_concurrency(opsweb):
+    """An ops_monitor job must not block benchmark jobs (its own lane)."""
+    client, cfg = opsweb
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    tid = _ready_target(client, cfg)
+    client.post(f"/api/kube-targets/{tid}/monitor",
+                json={"params": {"interval_s": 0.5, "max_duration_s": 60}},
+                auth=("op", "oppw"))
+    conn = connect(cfg.db_path)
+    try:
+        job = queries.claim_next_job(conn, 1)
+        assert job is not None and job["kind"] == "ops_monitor"
+        queries.update_job(conn, job["id"], state="running")
+        # with max_concurrency=1 and a monitor 'running', a benchmark job
+        # must still be claimable
+        assert queries.running_count(conn) == 0
+        # duplicate monitor on the same target refused
+        r = client.post(f"/api/kube-targets/{tid}/monitor",
+                        json={"params": {}}, auth=("op", "oppw"))
+        assert r.status_code == 409
+        queries.update_job(conn, job["id"], state="canceled")
+    finally:
+        conn.close()
