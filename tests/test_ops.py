@@ -295,3 +295,178 @@ def test_ops_actions_audited(opsweb):
     assert "kube_target_create" in actions
     assert "ops_validate_enqueue" in actions
     assert "ops_discover_enqueue" in actions
+
+
+# ── Phase 2: CR configuration ──
+
+def _apply_cr(client, cfg, target_id, params, confirm="cluster1", label=""):
+    r = client.post(f"/api/kube-targets/{target_id}/cr-apply",
+                    json={"params": params, "confirm": confirm, "label": label},
+                    auth=("admin", "apw"))
+    return r
+
+
+def _ready_target(client, cfg):
+    created = _create_target(client)
+    _drain_queue(cfg)                            # auto-validate prefills cr_name
+    return created["id"]
+
+
+def _last_ops_run(client, kind=None):
+    runs = client.get("/api/ops/runs", auth=("viewer", "vpw")).json()
+    if kind:
+        runs = [r for r in runs if r["kind"] == kind]
+    assert runs, f"no ops runs of kind {kind}"
+    return runs[0]
+
+
+def test_cr_apply_dry_run_shows_diff_without_patching(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params", "dry_run": True,
+                                     "parameters": {"max_wal_size": "49152",
+                                                    "checkpoint_timeout": "900"}})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete"
+    assert run["headline"]["dry_run"] is True
+    assert run["headline"]["changed"]["max_wal_size"] == ["4096", "49152"]
+    # nothing was patched
+    state = json.loads((cfg.data_dir.parent / "fakekube" / "state.json").read_text())
+    params = state["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]
+    assert params["max_wal_size"] == "4096"
+    # artifacts present: exact patch + value diff + CR snapshot
+    detail = client.get(f"/api/ops/runs/{run['op_run_id']}", auth=("viewer", "vpw")).json()
+    assert "patch.json" in detail["files"] and "diff.json" in detail["files"]
+    assert "cr_snapshot.yaml" in detail["files"]
+
+
+def test_cr_apply_requires_typed_confirmation(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "49152"}},
+                  confirm="WRONG")
+    assert r.status_code == 400
+    assert "cluster1" in r.json()["detail"]
+    # dry-run needs no confirmation
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params", "dry_run": True,
+                                     "parameters": {"max_wal_size": "49152"}},
+                  confirm="")
+    assert r.status_code == 200
+
+
+def test_cr_apply_verifies_live_values(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "49152",
+                                                    "min_wal_size": "2048"},
+                                     "verify_timeout_s": 10})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True
+    assert run["headline"]["pending_restart"] == []
+    detail = client.get(f"/api/ops/runs/{run['op_run_id']}", auth=("viewer", "vpw")).json()
+    assert "verify.json" in detail["files"]
+    assert "patronictl_show_config.txt" in detail["raw_files"]
+
+
+def test_cr_apply_pending_restart_fails_loudly(opsweb, monkeypatch):
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_PENDING_PARAMS", "max_wal_size")
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "49152"},
+                                     "verify_timeout_s": 6})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "warning"            # NOT silent success
+    assert run["headline"]["pending_restart"] == ["max_wal_size"]
+    # the event feed carries the operator-facing warning
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "EXPECT A FAILOVER" in events
+
+
+def test_cr_apply_pgbackrest_global_rendered_verify(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "pgbackrest_global",
+                                     "global": {"process-max": "4",
+                                                "archive-async": "y",
+                                                "spool-path": "/pgdata"},
+                                     "verify_timeout_s": 10})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True
+    assert run["headline"]["changed"]["process-max"] == [None, "4"]
+
+
+def test_cr_apply_rollback_restores_previous_values(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                 "parameters": {"max_wal_size": "49152"},
+                                 "verify_timeout_s": 10})
+    _drain_queue(cfg)
+    first = _last_ops_run(client, "cr-apply")
+    assert first["headline"]["changed"]["max_wal_size"] == ["4096", "49152"]
+    r = _apply_cr(client, cfg, tid, {"action": "rollback",
+                                     "rollback_of": first["op_run_id"],
+                                     "verify_timeout_s": 10})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    rb = _last_ops_run(client, "cr-apply")
+    assert rb["status"] == "complete", rb
+    assert rb["headline"]["changed"]["max_wal_size"] == ["49152", "4096"]
+    state = json.loads((cfg.data_dir.parent / "fakekube" / "state.json").read_text())
+    params = state["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]
+    assert params["max_wal_size"] == "4096"
+
+
+def test_schedules_pause_and_restore_with_nag(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # pause: snapshot recorded, CR schedules removed, nag flag set
+    r = client.post(f"/api/kube-targets/{tid}/schedules/pause",
+                    json={"confirm": "cluster1"}, auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    kt = client.get(f"/api/kube-targets/{tid}", auth=("viewer", "vpw")).json()
+    assert kt["schedules_paused"] is True and kt["schedules_paused_utc"]
+    state = json.loads((cfg.data_dir.parent / "fakekube" / "state.json").read_text())
+    repos = state["cr"]["spec"]["backups"]["pgbackrest"]["repos"]
+    assert "schedules" not in repos[0]
+    # restore puts the snapshot back and clears the nag
+    r = client.post(f"/api/kube-targets/{tid}/schedules/restore",
+                    json={"confirm": "cluster1"}, auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    kt = client.get(f"/api/kube-targets/{tid}", auth=("viewer", "vpw")).json()
+    assert kt["schedules_paused"] is False
+    state = json.loads((cfg.data_dir.parent / "fakekube" / "state.json").read_text())
+    repos = state["cr"]["spec"]["backups"]["pgbackrest"]["repos"]
+    assert repos[0]["schedules"]["incremental"] == "0 * * * *"
+
+
+def test_cr_apply_prep_actions(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "8192"},
+                                     "verify_timeout_s": 10,
+                                     "prep": {"reset_checkpointer": True,
+                                              "recreate_db": "sbtest",
+                                              "confirm": "sbtest"}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "checkpointer stats reset" in events
+    assert "recreated" in events
