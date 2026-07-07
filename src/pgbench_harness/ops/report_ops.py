@@ -102,9 +102,10 @@ def _benchmark_overlay(run_dir: Path, meta: dict[str, Any]) -> Optional[dict[str
     if start is None:
         return None
     header, rows = _read_csv_cols(ts_path)
-    if "t_offset" not in header or "tps" not in header:
+    t_col = "t" if "t" in header else "t_offset"   # soak vs sweep column name
+    if t_col not in header or "tps" not in header:
         return None
-    ti, tpsi = header.index("t_offset"), header.index("tps")
+    ti, tpsi = header.index(t_col), header.index("tps")
     p99i = header.index("lat_p99") if "lat_p99" in header else None
     b_start = (meta.get("backup_start_epoch_ms") or 0) / 1000
     b_end = (meta.get("backup_end_epoch_ms") or 0) / 1000

@@ -446,12 +446,14 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         run.event("stitch", "timeline stitched",
                   f"downtime {headline['downtime_ms']} ms, "
                   f"flip={headline['flip']} ({headline['kind']})")
+        # Finalize BEFORE rendering: the report reads meta.json from disk, so
+        # the headline/status must be terminal or the KPI tiles render empty.
+        run.finalize("complete", headline=headline)
         try:
             from pgbench_harness.ops.report_ops import generate_ops_report
             generate_ops_report(run.run_dir)
         except Exception as exc:  # noqa: BLE001 — report is derived, never fatal
             log.warning("report generation failed: %s", exc)
-        run.finalize("complete", headline=headline)
         return EXIT_OK
     except KubeError as exc:
         log.error("scenario failed: %s", exc)
