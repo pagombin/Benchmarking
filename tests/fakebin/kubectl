@@ -182,7 +182,20 @@ def patronictl_list(st):
 
 def backup_running(st):
     return (os.environ.get("FAKE_KUBE_BACKUP_LOCKED") == "1"
-            or now() < st.get("backup_until", 0))
+            or now() < st.get("backup_until", 0)
+            or (st.get("manual_started", 0)
+                and now() < st["manual_started"] + BACKUP_S))
+
+
+def settle_manual(st):
+    """Complete an operator-path (manual annotation) backup once its window ends."""
+    if st.get("manual_started", 0) and now() >= st["manual_started"] + BACKUP_S:
+        btype = st.get("manual_type", "incr")
+        label = time.strftime("%Y%m%d-%H%M%S") + \
+            {"full": "F", "diff": "D", "incr": "I"}.get(btype, "I")
+        st["backups"].append({"label": label, "type": btype})
+        st["manual_started"] = 0
+        save(st)
 
 
 def pgbackrest_info(st):
@@ -406,6 +419,8 @@ def main():
         return 2
     st = load()
     maybe_elect(st)
+    settle_manual(st)
+    st = load()
     cmd = args[0]
 
     if cmd == "version":
@@ -491,7 +506,20 @@ def main():
                  "spec": {"type": "ClusterIP", "clusterIP": "10.245.0.11"}}]}))
             return 0
         if kind == "jobs":
-            out(json.dumps({"items": []}))
+            settle_manual(st)
+            st = load()
+            items = []
+            if st.get("manual_started", 0):
+                items.append({"metadata": {"name": f"{st['cluster']}-backup-abcd",
+                                           "labels": {"postgres-operator.crunchydata.com/"
+                                                      "pgbackrest-backup": "manual"}},
+                              "status": {"active": 1}})
+            elif st.get("manual_done_job"):
+                items.append({"metadata": {"name": st["manual_done_job"],
+                                           "labels": {"postgres-operator.crunchydata.com/"
+                                                      "pgbackrest-backup": "manual"}},
+                              "status": {"succeeded": 1}})
+            out(json.dumps({"items": items}))
             return 0
         if kind == "events":
             if "-w" in rest or "--watch" in rest:
@@ -533,6 +561,16 @@ def main():
         out(f"{CR_KIND}.pgv2.percona.com/{st['cluster']} patched")
         return 0
     if cmd == "annotate":
+        if any("pgbackrest-backup" in a for a in args):
+            st["manual_started"] = now()
+            st["manual_type"] = (st["cr"]["spec"]["backups"]["pgbackrest"]
+                                 .get("manual", {}) or {})
+            opts = st["manual_type"].get("options", []) if isinstance(
+                st["manual_type"], dict) else []
+            st["manual_type"] = next((o.split("=", 1)[1] for o in opts
+                                      if o.startswith("--type=")), "incr")
+            st["manual_done_job"] = f"{st['cluster']}-backup-abcd"
+            save(st)
         out("annotated")
         return 0
     if cmd == "delete":

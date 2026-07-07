@@ -470,3 +470,139 @@ def test_cr_apply_prep_actions(opsweb):
     events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
     assert "checkpointer stats reset" in events
     assert "recreated" in events
+
+
+# ── Phase 3: backups ──
+
+def test_archiver_parse_nonempty_against_real_output():
+    """The bash sampler's query came back empty in the field (quoting bug);
+    the Python parser must produce a full row from real psql -A -t -F, output."""
+    from pgbench_harness.ops.backup import parse_archiver_row
+    real = "1751848201,4821,0,0000000500000000000000AB,3,,-1\n"
+    row = parse_archiver_row(real)
+    assert row is not None and row[1] == "4821" and row[3].startswith("00000005")
+    assert parse_archiver_row("") is None
+    assert parse_archiver_row("garbage|not|csv") is None
+
+
+def test_pgbackrest_info_json_parse():
+    from pgbench_harness.ops.backup import lock_held, parse_pgbackrest_info_json
+    doc = json.dumps([{"name": "db", "status": {"code": 0, "message": "ok"},
+                       "backup": [{"label": "20260707-010203F", "type": "full",
+                                   "info": {"size": 13100000000, "delta": 13100000000,
+                                            "repository": {"size": 2040000000,
+                                                           "delta": 2040000000}},
+                                   "timestamp": {"start": 1, "stop": 1800}}]}])
+    parsed = parse_pgbackrest_info_json(doc)
+    assert parsed["backups"][0]["label"] == "20260707-010203F"
+    assert parsed["backups"][0]["repo_backup_size"] == 2040000000
+    assert not lock_held("stanza: db\n    status: ok\n")
+    assert lock_held("stanza: db\n    status: ok (backup/expire running)\n")
+
+
+def _fire_backup(client, tid, params, confirm="cluster1"):
+    return client.post(f"/api/kube-targets/{tid}/backup",
+                       json={"params": params, "confirm": confirm},
+                       auth=("admin", "apw"))
+
+
+def test_backup_direct_full_with_samplers(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "full", "path": "direct",
+                                   "sample_interval_s": 0.2, "settle_s": 0.5})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["type"] == "full" and h["path"] == "direct"
+    assert h["source_role"] == "leader"
+    assert h["label"].endswith("F")
+    assert h["backup_start_epoch_ms"] and h["backup_end_epoch_ms"]
+    assert h["peak_archive_queue"] >= 3          # sampler saw the queue
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    arch = (run_dir / "parsed" / "archiver.csv").read_text().splitlines()
+    assert arch[0].startswith("epoch_s,archived_count")
+    assert len(arch) >= 2                         # non-empty samples (the bug fix)
+    assert (run_dir / "raw" / "pgbackrest_info_before.txt").exists()
+    assert (run_dir / "raw" / "pgbackrest_info_after.json").exists()
+
+
+def test_backup_aborts_on_held_lock(opsweb, monkeypatch):
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_LOCKED", "1")
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "incr", "path": "direct",
+                                   "sample_interval_s": 0.2, "settle_s": 0.2})
+    assert r.status_code == 200
+    states = _drain_queue(cfg)
+    assert states[-1] == "failed"                 # rc=4 aborted
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "aborted"
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "ABORT: stanza lock held" in events
+    assert "rc=50" in events                      # explains the field bug
+
+
+def test_backup_operator_path_tracks_job(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "diff", "path": "operator",
+                                   "sample_interval_s": 0.2, "settle_s": 0.3,
+                                   "timeout_s": 30})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "complete", run
+    assert run["headline"]["path"] == "operator"
+    assert run["headline"]["label"].endswith("D")
+    out = (cfg.results_dir / "ops" / run["op_run_id"] / "raw" /
+           "trigger_output.txt").read_text()
+    assert "Job succeeded" in out
+
+
+def test_backup_from_replica_records_source(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "incr", "path": "direct",
+                                   "source": "replica",
+                                   "sample_interval_s": 0.2, "settle_s": 0.3})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["source_role"] == "replica"
+    assert h["source"] != h["leader"]             # the work landed on a replica
+    # load sampler covered BOTH nodes
+    load = (cfg.results_dir / "ops" / run["op_run_id"] / "parsed" /
+            "load.csv").read_text()
+    assert h["leader"] in load and h["source"] in load
+
+
+def test_backup_requires_confirmation_and_mutex(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "incr"}, confirm="nope")
+    assert r.status_code == 400
+    r = _fire_backup(client, tid, {"type": "incr", "sample_interval_s": 0.2,
+                                   "settle_s": 0.2})
+    assert r.status_code == 200
+    # second backup on the same target while one is queued -> 409
+    r = _fire_backup(client, tid, {"type": "incr"})
+    assert r.status_code == 409
+    _drain_queue(cfg)
+
+
+def test_backup_linked_run_id_recorded(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "incr", "path": "direct",
+                                   "sample_interval_s": 0.2, "settle_s": 0.2,
+                                   "linked_run_id": "soak-xyz-123"})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["linked_run_id"] == "soak-xyz-123"
+    assert run["headline"]["linked_run_id"] == "soak-xyz-123"
