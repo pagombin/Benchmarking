@@ -606,3 +606,158 @@ def test_backup_linked_run_id_recorded(opsweb):
     run = _last_ops_run(client, "backup")
     assert run["linked_run_id"] == "soak-xyz-123"
     assert run["headline"]["linked_run_id"] == "soak-xyz-123"
+
+
+# ── Phase 4: failover scenarios (full simulated runs vs the fake cluster) ──
+
+def _fire_scenario(client, tid, case, extra=None, confirm="cluster1"):
+    params = {"case": case, "baseline_s": 0.5, "settle_s": 6,
+              "recovery_hold_s": 1,
+              "probe": {"mode": "direct", "host": "127.0.0.1", "port": 5432,
+                        "hz": 5, "sslmode": "disable"}}
+    params.update(extra or {})
+    return client.post(f"/api/kube-targets/{tid}/scenario",
+                       json={"params": params, "confirm": confirm},
+                       auth=("admin", "apw"))
+
+
+def test_scenario_case_b_pgkill_restart_in_place(opsweb):
+    """Case B: kill -9 the postmaster. Patroni restarts Postgres in place —
+    NOT a failover. Classification must say so (leader name unchanged)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "pgkill")
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["case"] == "pgkill"
+    assert h["flip"] is False and h["kind"] == "restart-in-place"
+    assert h["leader_before"] == h["leader_after"]
+    assert h["tl_before"] == h["tl_after"]
+    assert 500 <= h["downtime_ms"] <= 6000       # ~1.5s simulated restart
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    raw = {p.name for p in (run_dir / "raw").iterdir()}
+    assert "fire.marker" in raw and "probe.log" in raw
+    assert "patroni_samples.jsonl" in raw and "pods_watch.log" in raw
+    assert any(n.startswith("patroni_cluster1-instance1") for n in raw)
+    assert any(n.startswith("pgbouncer_") for n in raw)
+    probe_log = (run_dir / "raw" / "probe.log").read_text()
+    assert "FAIL" in probe_log and "OK" in probe_log
+    tl = (run_dir / "TIMELINE.txt").read_text()
+    assert "NO — restart in place" in tl
+    assert (run_dir / "report.html").exists()
+    assert (run_dir / "events.csv").exists()
+    # the pguser password from the k8s secret never lands in any artifact
+    for p in run_dir.rglob("*"):
+        if p.is_file():
+            assert K8S_PW not in p.read_text(errors="replace"), p
+
+
+def test_scenario_case_a_switchover_is_election(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "switchover")
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["flip"] is True and h["kind"] == "election"
+    assert h["leader_after"] != h["leader_before"]
+    assert h["tl_after"] == h["tl_before"] + 1
+    tl = (cfg.results_dir / "ops" / run["op_run_id"] / "TIMELINE.txt").read_text()
+    assert "YES — real election" in tl
+
+
+def test_scenario_case_c1_pod_delete_election(opsweb, monkeypatch):
+    """C1 under election mode: force-deleted leader loses the lock; a replica
+    is promoted. (Default C1 is restart-in-place, covered by the fake's
+    non-elect mode via case B semantics.)"""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_C1_ELECT", "1")
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "pod-delete", extra={"settle_s": 8})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["flip"] is True and h["kind"] == "election"
+    assert h["tl_after"] == h["tl_before"] + 1
+    assert h["downtime_ms"] >= 1000
+
+
+def test_scenario_refuses_to_fire_during_backup(opsweb, monkeypatch):
+    """Safety rail: the lock preflight is reused — no fire while a backup
+    holds the stanza lock."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_LOCKED", "1")
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "pgkill")
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "aborted"
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    assert not (run_dir / "raw" / "fire.marker").exists()   # never fired
+    events = (run_dir / "events.jsonl").read_text()
+    assert "ABORT: pgBackRest lock held" in events
+
+
+def test_scenario_mutex_and_confirmation(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    assert _fire_scenario(client, tid, "pgkill", confirm="wrong").status_code == 400
+    assert _fire_scenario(client, tid, "pgkill").status_code == 200
+    # concurrent scenario on the same target refused
+    assert _fire_scenario(client, tid, "switchover").status_code == 409
+    # operator (non-admin) cannot fire
+    r = client.post(f"/api/kube-targets/{tid}/scenario",
+                    json={"params": {"case": "pgkill"}, "confirm": "cluster1"},
+                    auth=("op", "oppw"))
+    assert r.status_code == 403
+    _drain_queue(cfg)
+
+
+def test_ops_compare_across_scenarios(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    _fire_scenario(client, tid, "pgkill")
+    _drain_queue(cfg)
+    _fire_scenario(client, tid, "switchover")
+    _drain_queue(cfg)
+    runs = [r["op_run_id"] for r in
+            client.get("/api/ops/runs", auth=("viewer", "vpw")).json()
+            if r["kind"] == "scenario"]
+    assert len(runs) == 2
+    r = client.get(f"/api/ops/compare?runs={','.join(runs)}", auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    rows = r.json()["runs"]
+    by_case = {row["case"]: row for row in rows}
+    assert by_case["pgkill"]["classification"] == "restart-in-place"
+    assert by_case["switchover"]["classification"] == "election"
+    assert by_case["switchover"]["new_primary"] != "—"
+
+
+def test_ops_sse_streams_scenario_run(opsweb):
+    """The live cockpit: hello -> status/events/log -> done over SSE."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    _fire_scenario(client, tid, "pgkill", extra={"settle_s": 3})
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    with client.stream("GET", f"/ops/runs/{run['op_run_id']}/stream",
+                       auth=("viewer", "vpw")) as resp:
+        assert resp.status_code == 200
+        got = ""
+        for chunk in resp.iter_text():
+            got += chunk
+            if "event: done" in got:
+                break
+        assert "event: hello" in got
+        assert "event: events" in got
+        assert "event: status" in got
