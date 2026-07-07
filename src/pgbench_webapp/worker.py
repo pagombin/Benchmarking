@@ -268,7 +268,13 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     """On worker start, mark orphaned 'running'/'canceling' jobs whose process is
     gone as interrupted, so the queue isn't wedged after a crash/restart, then
     converge any run left non-terminal on disk whose owning job has ended."""
+    # Cluster Ops jobs are converged by ops_support (which also drives their
+    # results/ops meta.json + index terminal). Skip them here so the generic
+    # loop can't mark an ops job 'failed' BEFORE that runs — which would leave
+    # the ops reconcile with nothing to converge and the run stuck 'running'.
     for job in queries.list_jobs(conn, states=("running", "canceling")):
+        if ops_support.is_ops_kind(job["kind"]):
+            continue
         pid = job["pid"]
         alive = False
         if pid:
@@ -288,6 +294,8 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     # Converge stuck-running runs against their now-terminal jobs and re-index
     # the filesystem so no run survives a restart still showing 'live'.
     index.reconcile(conn, cfg.results_dir)
+    # Same for Cluster Ops jobs/runs, which index.reconcile does not cover.
+    ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=True)
 
 
 def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
@@ -320,12 +328,22 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
     conn = connect(cfg.db_path)
     reconcile_startup(cfg, conn)
     store = _store(cfg)
-    active: dict[int, threading.Thread] = {}
+    # value = (thread, kind); the kind lets the monitor lane run WITHOUT
+    # occupying a benchmark/ops concurrency slot. Gating the loop on
+    # len(active) alone would let one long-lived monitor wedge the queue —
+    # claim_next_job's running_count already excludes monitors, so the outer
+    # gate must exclude them too, or the exclusion is a no-op.
+    active: dict[int, tuple[threading.Thread, str]] = {}
+    # Absolute backstop so a fleet of per-target monitors can't spawn unbounded
+    # threads even though each is admissible on its own lane.
+    monitor_cap = 32
     while True:
-        for jid in [j for j, t in active.items() if not t.is_alive()]:
-            active.pop(jid).join()
+        for jid in [j for j, (t, _k) in active.items() if not t.is_alive()]:
+            active.pop(jid)[0].join()
         max_conc = max(1, int(queries.get_setting(conn, "max_concurrency", "1") or "1"))
-        if len(active) >= max_conc:
+        slotted = sum(1 for _t, k in active.values() if k != "ops_monitor")
+        monitors = len(active) - slotted
+        if slotted >= max_conc or monitors >= monitor_cap:
             time.sleep(POLL_SECONDS)
             continue
         job = queries.claim_next_job(conn, max_conc)
@@ -334,7 +352,7 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
             continue
         t = threading.Thread(target=_run_job_threaded, args=(cfg, store, job["id"]),
                              name=f"job-{job['id']}", daemon=True)
-        active[job["id"]] = t
+        active[job["id"]] = (t, job["kind"])
         t.start()
 
 

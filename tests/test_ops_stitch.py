@@ -227,3 +227,46 @@ def test_report_renders_for_stitched_scenario(tmp_path):
     assert "restart in place" in html
     assert "uPlot" in html                    # chart lib inlined (self-contained)
     assert "probe IP is deliberately ignored" in html
+
+
+# ── bug-bash regressions (stitcher) ──
+
+def test_pre_fire_flap_does_not_inflate_downtime(tmp_path):
+    """A transient FAIL during baseline (before fire) must NOT become first_fail
+    — that produced a negative detection and over-counted downtime in the field."""
+    fire = BASE_MS + 100000
+    run = tmp_path / "r"
+    raw = run / "raw"; raw.mkdir(parents=True)
+    (run / "meta.json").write_text(json.dumps(
+        {"op_run_id": "r", "op": "scenario", "status": "complete",
+         "target": {"name": "t"}, "label": "pgkill", "params": {}, "headline": {}}))
+    (raw / "fire.marker").write_text(json.dumps(
+        {"ts_utc": iso(fire), "ts_epoch_ms": fire, "scenario": "pgkill",
+         "target_pod": "pod-a", "leader_before": "pod-a", "tl_before": 5}))
+    lines = []
+    for ms in range(fire - 20000, fire + 40000, 200):
+        # one baseline blip 2s BEFORE the fire, then the real outage after fire
+        blip = fire - 2000 <= ms < fire - 1800
+        outage = fire + 500 <= ms < fire + 8000
+        lines.append(f"FAIL {iso(ms)} refused" if (blip or outage)
+                     else f"OK {iso(ms)} {iso(ms+40)} f 10.0.0.1")
+    (raw / "probe.log").write_text("\n".join(lines) + "\n")
+    (raw / "patroni_samples.jsonl").write_text(json.dumps(
+        {"ts_epoch_ms": fire + 3000, "leader": "pod-a", "timeline": 5,
+         "ready": 3, "total": 3, "members": []}) + "\n")
+    s = stitch(run)
+    assert s.probe["detection_ms"] >= 0          # never negative
+    assert s.probe["first_fail_ms"] >= fire      # anchored at/after fire
+    assert 7000 <= s.probe["client_downtime_ms"] <= 9000   # the real outage only
+
+
+def test_no_outage_reports_zero_not_none(tmp_path):
+    """Fire happened, probe never dropped -> downtime 0 (not 'n/a')."""
+    fire = BASE_MS + 100000
+    run = tmp_path / "r"
+    write_fixture(run, scenario="switchover", leader_before="pod-a",
+                  leader_after="pod-a", tl_before=5, tl_after=5, fire_ms=fire,
+                  fail_from_ms=fire + 999999, ok_again_ms=fire + 1000000)  # no fails
+    s = stitch(run)
+    assert s.probe["client_downtime_ms"] == 0
+    assert s.probe["fail_count"] == 0

@@ -56,6 +56,15 @@ def _now_iso_ms() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _libpq_quote(value: str) -> str:
+    """Quote a libpq conninfo value so spaces/specials in a target's db name,
+    user, or host can't inject extra keywords (e.g. downgrade sslmode)."""
+    v = str(value)
+    if v == "" or any(c in v for c in " '\\"):
+        return "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return v
+
+
 class ProbeThread(threading.Thread):
     """~5 Hz write probe through pgBouncer, logging OK/FAIL lines."""
 
@@ -307,6 +316,8 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
     log = run.get_logger()
     kube = Kube(context=t.context, namespace=t.namespace)
     threads: list[Any] = []
+    events_proc: Optional[subprocess.Popen] = None
+    events_fh: Optional[IO[str]] = None
     try:
         instances, leader, view = resolve_leader(kube, t.cr_name)
         leader_pod_doc = kube.json(["get", "pod", leader])
@@ -335,8 +346,7 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         for p in buckets["pgbouncer"]:
             threads.append(LogStream(kube, run, p["name"], "pgbouncer",
                                      f"pgbouncer_{p['name']}.log"))
-        events_fh: IO[str] = open(run.raw_path("events_watch.log"), "a",
-                                  encoding="utf-8")
+        events_fh = open(run.raw_path("events_watch.log"), "a", encoding="utf-8")
         events_proc = kube.stream(["get", "events", "-w"], stdout=events_fh)
         watch = ClusterWatch(kube, run, t.cr_name, len(buckets["instances"]))
         threads.append(watch)
@@ -362,10 +372,11 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
                 host = str(probe_cfg.get("host") or f"{t.cr_name}-pgbouncer")
                 port = int(probe_cfg.get("port", 5432))
             if probe_mode != "off":
-                conninfo = (f"host={host} port={port} user={t.db_user} "
-                            f"dbname={t.db_name} "
-                            f"sslmode={probe_cfg.get('sslmode', 'require')} "
-                            f"connect_timeout=2")
+                conninfo = " ".join(f"{k}={_libpq_quote(v)}" for k, v in (
+                    ("host", host), ("port", str(port)), ("user", t.db_user),
+                    ("dbname", t.db_name),
+                    ("sslmode", str(probe_cfg.get("sslmode", "require"))),
+                    ("connect_timeout", "2")))
                 env = dict(os.environ)
                 env["PGPASSWORD"] = pw          # child env only, never argv/logs
                 probe = ProbeThread(run, conninfo, env,
@@ -415,13 +426,10 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         # ── stop captures ──
         for th in threads:
             th.stop()
-        try:
-            events_proc.terminate()
-        except OSError:
-            pass
+        _stop_events(events_proc, events_fh)
+        events_proc, events_fh = None, None
         for th in threads:
             th.join(timeout=8)
-        events_fh.close()
         run.event("capture", "capture streams stopped", "")
 
         # ── stitch + report ──
@@ -459,9 +467,33 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         log.error("scenario failed: %s", exc)
         run.finalize("failed", error=str(exc)[:500])
         return EXIT_FAILED
+    except Exception as exc:  # noqa: BLE001 — never leave the run stuck 'running'
+        log.exception("scenario crashed")
+        run.finalize("failed", error=f"internal error: {str(exc)[:300]}")
+        return EXIT_FAILED
     finally:
+        # Reap every capture child even on the error path: the events watcher
+        # (kubectl get events -w) is owned by no thread and would otherwise leak.
         for th in threads:
             try:
                 th.stop()
             except Exception:  # noqa: BLE001
                 pass
+        _stop_events(events_proc, events_fh)
+
+
+def _stop_events(proc: "Optional[subprocess.Popen]", fh: "Optional[IO[str]]") -> None:
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    if fh is not None:
+        try:
+            fh.close()
+        except OSError:
+            pass

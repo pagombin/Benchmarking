@@ -41,6 +41,12 @@ PGBACKREST_BUNDLE = {
     "spool-path": "/pgdata",
 }
 
+import re
+
+# A plain, unquoted PostgreSQL identifier we are willing to interpolate into
+# DROP/CREATE DATABASE (which cannot be parameterized).
+_SAFE_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
 PATRONI_PARAMS_PATH = ("spec", "patroni", "dynamicConfiguration", "postgresql",
                        "parameters")
 PGBACKREST_GLOBAL_PATH = ("spec", "backups", "pgbackrest", "global")
@@ -105,7 +111,14 @@ def verify_pg_settings(kube: Kube, leader: str, expected: dict[str, Any],
     """Poll pg_settings on the leader until every expected value is live.
 
     Returns (live values, pending_restart names, all_matched)."""
-    names = ",".join(f"'{k}'" for k in expected)
+    if not expected:
+        # Nothing with a target value to confirm (e.g. a removal-only change).
+        # Return not-matched so the caller never reports a vacuous "verified".
+        return {}, [], False
+    # pg_settings names are validated GUC identifiers, but guard the interpolation
+    # anyway — only word-characters can reach the IN () list.
+    safe = [k for k in expected if re.match(r"^[A-Za-z0-9_.]+$", str(k))]
+    names = ",".join(f"'{k}'" for k in safe)
     sql = (f"SELECT name, setting, unit, pending_restart FROM pg_settings "
            f"WHERE name IN ({names}) ORDER BY name")
     deadline = time.monotonic() + timeout_s
@@ -182,13 +195,23 @@ def _prep_actions(kube: Kube, run: OpsRun, leader: str, db_name: str,
             run.event("prep", "recreate_db refused",
                       "confirmation mismatch — type the database name")
             return
+        if not _SAFE_DB_NAME.match(recreate):
+            # Never interpolate an unvalidated name into DROP/CREATE DATABASE
+            # (identifiers can't be parameterized) — reject anything that isn't
+            # a plain PostgreSQL identifier rather than risk SQL injection.
+            run.event("prep", "recreate_db refused",
+                      f"'{recreate[:40]}' is not a valid database name "
+                      "(letters, digits, underscore; must not start with a digit)")
+            return
+        ident = f'"{recreate}"'
+        lit = recreate.replace("'", "''")
         kube.psql(leader,
                   "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                  f"WHERE datname = '{recreate}' AND pid <> pg_backend_pid()",
+                  f"WHERE datname = '{lit}' AND pid <> pg_backend_pid()",
                   database="postgres")
-        r1 = kube.psql(leader, f'DROP DATABASE IF EXISTS "{recreate}"',
+        r1 = kube.psql(leader, f'DROP DATABASE IF EXISTS {ident}',
                        database="postgres", timeout_s=60)
-        r2 = kube.psql(leader, f'CREATE DATABASE "{recreate}"',
+        r2 = kube.psql(leader, f'CREATE DATABASE {ident}',
                        database="postgres", timeout_s=60)
         run.event("prep", f"database '{recreate}' recreated",
                   "ok" if (r1.ok and r2.ok) else
@@ -322,9 +345,20 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
                                     "removed": removed, "applied": True}
         if action == "patroni_params":
             expected = {k: v[1] for k, v in changes.items()}
+            _capture_patroni_config(kube, run, leader, t.patroni_scope)
+            if not expected:
+                # Removal-only change (e.g. a rollback that only deletes keys):
+                # there is no target value to confirm in pg_settings, so don't
+                # run a vacuous verify — record the patch as applied, unverified.
+                run.event("apply", "removal-only change applied",
+                          f"removed {', '.join(removed)}; no live value to verify")
+                headline.update({"verified": None, "pending_restart": []})
+                _prep_actions(kube, run, leader, t.db_name,
+                              dict(params.get("prep") or {}))
+                run.finalize("complete", headline=headline)
+                return EXIT_OK
             live, pending, matched = verify_pg_settings(
                 kube, leader, expected, verify_timeout, logger=log)
-            _capture_patroni_config(kube, run, leader, t.patroni_scope)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(
                 {"live": live, "pending_restart": pending, "matched": matched},
                 indent=2))
@@ -369,4 +403,8 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
     except KubeError as exc:
         log.error("cr-apply failed: %s", exc)
         run.finalize("failed", error=str(exc)[:500])
+        return EXIT_FAILED
+    except Exception as exc:  # noqa: BLE001 — never leave the run stuck 'running'
+        log.exception("cr-apply crashed")
+        run.finalize("failed", error=f"internal error: {str(exc)[:300]}")
         return EXIT_FAILED

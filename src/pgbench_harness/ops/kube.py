@@ -142,7 +142,10 @@ class Kube:
         b64 = (data.get("data") or {}).get(key)
         if not b64:
             raise KubeError(f"secret '{name}' has no key '{key}'")
-        return base64.b64decode(b64).decode("utf-8")
+        try:
+            return base64.b64decode(b64).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise KubeError(f"secret '{name}' key '{key}' is not valid UTF-8: {exc}")
 
     def cluster_cr(self, cr_kind: str, cr_name: str) -> dict[str, Any]:
         cr = self.json(["get", cr_kind, cr_name])

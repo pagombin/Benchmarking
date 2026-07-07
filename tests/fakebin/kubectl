@@ -360,7 +360,11 @@ def handle_exec(st, pod, argv):
     if "archive_status" in joined:                # queue-depth sampler
         out(str(archive_queue_depth(st)))
         return 0
-    if argv[0] == "df" or "pgdata" in joined and argv[0] == "du":
+    if argv[0] == "df":
+        out("Filesystem 1024-blocks Used Available Capacity Mounted on")
+        out("/dev/sda1 104857600 39845888 65011712 38% /pgdata")
+        return 0
+    if argv[0] == "du" and "pgdata" in joined:
         out("38G /pgdata")
         return 0
     sys.stderr.write(f"fake kubectl exec: unhandled command: {joined}\n")

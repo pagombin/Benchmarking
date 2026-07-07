@@ -51,7 +51,8 @@ def classify_pods(items: list[dict[str, Any]], cr_name: str) -> dict[str, list[d
             out["instances"].append(pod)
         elif "pgbouncer" in name or "pgbouncer" in pod["containers"]:
             out["pgbouncer"].append(pod)
-        elif "backup" in name or "pgbackrest" in name and "database" not in pod["containers"]:
+        elif ("backup" in name or "pgbackrest" in name) \
+                and "database" not in pod["containers"]:
             out["backup_jobs"].append(pod)
         else:
             out["other"].append(pod)
@@ -159,16 +160,23 @@ def run_discover(spec: OpsSpec) -> int:
         _check("workloads", "warn", str(exc)[:300])
 
     # pgBackRest repo info (raw text kept small; parse happens in backup ops).
+    # Guarded: a hung `pgbackrest info` must not crash discover after all the
+    # topology above has been collected — this is the last step and its output
+    # (OPS_TOPOLOGY_JSON) must always be printed for the worker to cache.
     if exec_pod:
-        res = kube.exec(exec_pod, "database",
-                        ["pgbackrest", "--stanza=db", "info"], timeout_s=30)
-        if res.ok:
-            topo["pgbackrest_info"] = res.stdout[-4000:]
-            _check("pgbackrest", "ok", "repo info collected")
-        else:
+        try:
+            res = kube.exec(exec_pod, "database",
+                            ["pgbackrest", "--stanza=db", "info"], timeout_s=30)
+            if res.ok:
+                topo["pgbackrest_info"] = res.stdout[-4000:]
+                _check("pgbackrest", "ok", "repo info collected")
+            else:
+                topo["pgbackrest_info"] = ""
+                _check("pgbackrest", "warn",
+                       (res.stderr or res.stdout).strip()[:300] or "info unavailable")
+        except KubeError as exc:
             topo["pgbackrest_info"] = ""
-            _check("pgbackrest", "warn",
-                   (res.stderr or res.stdout).strip()[:300] or "info unavailable")
+            _check("pgbackrest", "warn", str(exc)[:300])
 
     print(f"{TOPOLOGY_MARKER} {json.dumps(topo)}", flush=True)
     return 0

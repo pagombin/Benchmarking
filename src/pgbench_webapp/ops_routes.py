@@ -21,16 +21,14 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                PlainTextResponse, StreamingResponse)
 
+from pgbench_harness.errors import SpecError
 from pgbench_harness.ops.oprun import TERMINAL as OPS_TERMINAL
 from pgbench_harness.ops.oprun import read_meta
+from pgbench_harness.ops.opspec import parse_ops_spec
 from pgbench_webapp import ops_support, queries
 from pgbench_webapp.config import Config
 from pgbench_webapp.secrets_store import SecretStore
 from pgbench_webapp.security import CSRF_FIELD
-
-# Ops that mutate the cluster: admin + typed CR-name confirmation, always.
-DESTRUCTIVE_OPS = ("cr-apply", "backup", "scenario", "pause-schedules",
-                   "restore-schedules")
 
 
 def _kt_json(row: sqlite3.Row) -> dict[str, Any]:
@@ -100,6 +98,16 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             raise HTTPException(404, "kube target not found")
         return kt
 
+    def _params(payload: dict) -> dict[str, Any]:
+        """Extract params as a dict, rejecting a non-object with a clean 400
+        instead of letting dict("string") raise an uncaught 500."""
+        p = payload.get("params")
+        if p is None:
+            return {}
+        if not isinstance(p, dict):
+            raise HTTPException(400, "'params' must be a JSON object")
+        return dict(p)
+
     def _require_confirm(kt: sqlite3.Row, payload: dict) -> None:
         """Typed confirmation: the operator must retype the cluster (CR) name."""
         expected = kt["cr_name"] or kt["name"]
@@ -108,11 +116,25 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                                      f"'{expected}' to proceed")
 
     def _enqueue_ops(conn: sqlite3.Connection, kt: sqlite3.Row, op: str,
-                     params: dict[str, Any], label: str, username: str) -> int:
+                     params: dict[str, Any], label: str, username: str,
+                     mutex_kinds: tuple[str, ...] = ()) -> int:
         kind = "ops_" + op.replace("-", "_")
         spec_yaml = build_ops_spec_yaml(kt, op, params, label)
-        job_id = queries.enqueue_job(conn, kind, spec_yaml, None, username,
-                                     kube_target_id=kt["id"])
+        # Validate the spec HERE (parse errors become a clean 400) instead of
+        # letting a bad param enqueue a job that dies with "exit 2" and no run.
+        try:
+            parse_ops_spec(yaml.safe_load(spec_yaml))
+        except SpecError as exc:
+            raise HTTPException(400, str(exc))
+        if mutex_kinds:
+            # Self-heal any orphaned ops job (worker-crash leftover) so a stale
+            # 'running' row can't wedge the mutex, then enqueue atomically.
+            ops_support.reconcile_stale_ops_jobs(cfg, conn)
+        job_id = queries.enqueue_ops_job_atomic(conn, kind, spec_yaml, username,
+                                                kt["id"], mutex_kinds)
+        if job_id is None:
+            raise HTTPException(409, "another destructive operation is active on "
+                                     "this target — wait for it to finish")
         queries.audit(conn, username, f"ops_{op}_enqueue", target=kt["name"],
                       detail=f"job={job_id} " + json.dumps(params)[:300])
         return job_id
@@ -252,17 +274,16 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         kt = _kt_or_404(conn, target_id)
         if not kt["cr_name"]:
             raise HTTPException(400, "target has no CR name — run discover first")
-        params = dict(payload.get("params") or {})
+        params = _params(payload)
         dry_run = bool(params.get("dry_run"))
+        # A dry-run makes no cluster change, so it needs neither confirmation nor
+        # the mutex; a real apply needs both (enforced atomically at enqueue).
+        mutex: tuple[str, ...] = ()
         if not dry_run:
             _require_confirm(kt, payload)
-            busy = queries.active_ops_jobs(conn, target_id,
-                                           ("ops_cr_apply", "ops_scenario"))
-            if busy:
-                raise HTTPException(409, "another CR change or scenario is active "
-                                         "on this target")
+            mutex = ("ops_cr_apply", "ops_scenario", "ops_backup")
         job_id = _enqueue_ops(conn, kt, "cr-apply", params,
-                              payload.get("label") or "", user["username"])
+                              payload.get("label") or "", user["username"], mutex)
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/backup")
@@ -274,11 +295,10 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         if not kt["cr_name"]:
             raise HTTPException(400, "target has no CR name — run discover first")
         _require_confirm(kt, payload)
-        if queries.active_ops_jobs(conn, target_id, ("ops_backup", "ops_scenario")):
-            raise HTTPException(409, "a backup or scenario is already active on this target")
-        params = dict(payload.get("params") or {})
+        params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "backup", params,
-                              payload.get("label") or "", user["username"])
+                              payload.get("label") or "", user["username"],
+                              ("ops_backup", "ops_scenario", "ops_cr_apply"))
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/scenario")
@@ -290,15 +310,13 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         if not kt["cr_name"]:
             raise HTTPException(400, "target has no CR name — run discover first")
         _require_confirm(kt, payload)
-        # Safety rail: one destructive op per target at a time. The runner
-        # additionally refuses to FIRE if a pgBackRest lock is held.
-        if queries.active_ops_jobs(conn, target_id,
-                                   ("ops_scenario", "ops_backup", "ops_cr_apply")):
-            raise HTTPException(409, "a scenario, backup, or CR change is already "
-                                     "active on this target")
-        params = dict(payload.get("params") or {})
+        # Safety rail: one destructive op per target at a time (enforced
+        # atomically at enqueue). The runner additionally refuses to FIRE if a
+        # pgBackRest lock is held.
+        params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "scenario", params,
-                              payload.get("label") or "", user["username"])
+                              payload.get("label") or "", user["username"],
+                              ("ops_scenario", "ops_backup", "ops_cr_apply"))
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/monitor")
@@ -307,11 +325,10 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                           user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _csrf(request, payload)
         kt = _kt_or_404(conn, target_id)
-        if queries.active_ops_jobs(conn, target_id, ("ops_monitor",)):
-            raise HTTPException(409, "a monitor is already running for this target")
-        params = dict(payload.get("params") or {})
+        params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "monitor", params,
-                              payload.get("label") or "", user["username"])
+                              payload.get("label") or "", user["username"],
+                              ("ops_monitor",))
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/schedules/{action}")
@@ -404,8 +421,8 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             from pgbench_harness.ops.report_ops import generate_ops_report
             try:
                 generate_ops_report(run_dir)
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(500, f"report generation failed: {exc}")
+            except Exception:  # noqa: BLE001 — don't echo internal paths/traces
+                raise HTTPException(500, "report generation failed")
         if not report.exists():
             raise HTTPException(404, "report not available for this run")
         return HTMLResponse(report.read_text(encoding="utf-8"))
@@ -465,8 +482,13 @@ def _ops_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:
             if chunk:
                 yield _event("log", chunk)
         if events.exists():
-            lines = events.read_text(encoding="utf-8", errors="replace").splitlines()
-            if len(lines) > sent_events:
+            text = events.read_text(encoding="utf-8", errors="replace")
+            # Only consider COMPLETE lines (those terminated by \n). A line read
+            # mid-append would otherwise fail json.loads, get skipped, and be
+            # counted — permanently dropping that event once it completes.
+            complete = text.count("\n")
+            if complete > sent_events:
+                lines = text.split("\n")[:complete]
                 out = []
                 for ln in lines[sent_events:]:
                     try:
@@ -474,7 +496,7 @@ def _ops_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:
                     except ValueError:
                         continue
                 yield _event("events", {"offset": sent_events, "items": out})
-                sent_events = len(lines)
+                sent_events = complete
         if status.exists():
             try:
                 mt = status.stat().st_mtime
@@ -485,15 +507,21 @@ def _ops_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:
                 pass
         parsed = run_dir / "parsed"
         if parsed.is_dir():
+            terminal = (read_meta(run_dir) or {}).get("status") in OPS_TERMINAL
             for p in sorted(parsed.glob("*.csv")):
-                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-                if len(lines) > 1:
+                text = p.read_text(encoding="utf-8", errors="replace")
+                # Only emit complete rows (\n-terminated). Once the run is
+                # terminal the file is fully flushed, so include the last row too.
+                complete = text.count("\n") if not terminal \
+                    else len(text.splitlines())
+                lines = text.splitlines()
+                if complete > 1:
                     sent = csv_sent.get(p.name, 1)   # row 0 is the header
-                    if len(lines) > sent:
+                    if complete > sent:
                         yield _event("csv", {"file": p.name, "header": lines[0],
                                              "offset": sent - 1,
-                                             "rows": lines[sent:]})
-                        csv_sent[p.name] = len(lines)
+                                             "rows": lines[sent:complete]})
+                        csv_sent[p.name] = complete
         meta = read_meta(run_dir) or meta
         if meta.get("status") in OPS_TERMINAL:
             # final drain of the log, then done

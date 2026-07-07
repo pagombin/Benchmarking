@@ -302,6 +302,12 @@ def list_kube_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def update_kube_target(conn: sqlite3.Connection, target_id: int, **fields: Any) -> None:
+    # Drop None values: the columns are NOT NULL, so a caller passing {"cr_name":
+    # None} would otherwise raise IntegrityError. Use the dedicated pause/clear
+    # paths (which pass explicit "" / real values) to blank a field.
+    fields = {k: v for k, v in fields.items()
+              if v is not None or k in ("topology_json", "schedules_snapshot",
+                                        "schedules_paused_utc")}
     if not fields:
         return
     sets = ",".join(f"{k}=?" for k in fields)
@@ -325,6 +331,35 @@ def active_ops_jobs(conn: sqlite3.Connection, kube_target_id: int,
         sql += f" AND kind IN ({','.join('?' for _ in kinds)})"
         params += list(kinds)
     return list(conn.execute(sql, params))
+
+
+def enqueue_ops_job_atomic(conn: sqlite3.Connection, kind: str, spec_yaml: str,
+                           requested_by: str, kube_target_id: int,
+                           mutex_kinds: tuple[str, ...] = ()) -> Optional[int]:
+    """Enqueue an ops job, atomically enforcing the per-target mutex.
+
+    Wraps the active-jobs check and the insert in one immediate transaction so
+    two concurrent requests can't both pass the check and enqueue competing
+    destructive ops on the same cluster (the TOCTOU the plain check-then-insert
+    allowed). Returns the new job id, or None if the mutex is held.
+    ``mutex_kinds`` empty => no mutex (validate/discover/dry-run always enqueue).
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if mutex_kinds and active_ops_jobs(conn, kube_target_id, mutex_kinds):
+            conn.execute("COMMIT")
+            return None
+        cur = conn.execute(
+            "INSERT INTO jobs(kind, state, spec_yaml, target_id, scheduled_utc, "
+            "created_utc, requested_by, resume_run_id, options, kube_target_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (kind, "queued", spec_yaml, None, None, utc_now_iso(), requested_by,
+             None, None, kube_target_id))
+        conn.execute("COMMIT")
+        return int(cur.lastrowid or 0)
+    except sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # ── cluster ops: run index (results/ops/ stays source of truth) ─────

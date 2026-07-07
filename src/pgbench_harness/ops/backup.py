@@ -110,19 +110,21 @@ class Sampler(threading.Thread):
         self.misses = 0
 
     def run_once(self) -> None:
+        # The whole cycle (collect AND write) is guarded: an IO error on the
+        # write must not escape and silently kill the sampler thread mid-run.
         try:
             rows = self.fn()
+            if not rows:
+                self.misses += 1
+                return
+            new_file = not self.path.exists()
+            with open(self.path, "a", encoding="utf-8") as fh:
+                if new_file:
+                    fh.write(self.header + "\n")
+                for row in rows:
+                    fh.write(",".join(str(c) for c in row) + "\n")
         except Exception:  # noqa: BLE001 — a sampler must never kill the run
-            rows = None
-        if not rows:
             self.misses += 1
-            return
-        new_file = not self.path.exists()
-        with open(self.path, "a", encoding="utf-8") as fh:
-            if new_file:
-                fh.write(self.header + "\n")
-            for row in rows:
-                fh.write(",".join(str(c) for c in row) + "\n")
 
     def run(self) -> None:  # noqa: A003
         while not self.stop_event.is_set():
@@ -169,10 +171,13 @@ def preflight(kube: Kube, run: OpsRun, spec: OpsSpec,
                   json.dumps(bcfg["manual"])[:200])
     try:
         jobs = kube.json(["get", "jobs"]).get("items") or []
-        active = [j["metadata"]["name"] for j in jobs
-                  if (j.get("status") or {}).get("active")]
+        # Only a running pgBackRest BACKUP Job conflicts — an unrelated Job
+        # (or a scheduled restore/expire) in the namespace must not abort us.
+        active = [j.get("metadata", {}).get("name", "?") for j in jobs
+                  if (j.get("status") or {}).get("active")
+                  and "pgbackrest-backup" in json.dumps(j.get("metadata", {}))]
         if active:
-            run.event("preflight", "ABORT: active backup Job(s) in namespace",
+            run.event("preflight", "ABORT: active pgBackRest backup Job(s)",
                       ", ".join(active))
             return False, info_text, bcfg
     except KubeError:
@@ -374,6 +379,12 @@ def run_backup(spec: OpsSpec, results_dir: Path) -> int:
         log.error("backup failed: %s", exc)
         run.finalize("failed", error=str(exc)[:500])
         return EXIT_FAILED
+    except Exception as exc:  # noqa: BLE001 — the run dir must ALWAYS reach a
+        # terminal state; a bare exception (bad param, parse error, disk) must
+        # not leave meta.json stuck at "running" forever.
+        log.exception("backup crashed")
+        run.finalize("failed", error=f"internal error: {str(exc)[:300]}")
+        return EXIT_FAILED
     finally:
         for s in samplers:
             s.stop()
@@ -387,6 +398,17 @@ def _operator_path(kube: Kube, run: OpsRun, spec: OpsSpec, btype: str,
     is recorded in meta/report (they are not interchangeable evidence).
     """
     t = spec.target
+
+    def _backup_jobs() -> list[dict[str, Any]]:
+        jobs = kube.json(["get", "jobs"]).get("items") or []
+        return [j for j in jobs
+                if "pgbackrest-backup" in json.dumps(j.get("metadata", {}))]
+
+    # Snapshot the backup Jobs that ALREADY exist, so a leftover completed/failed
+    # Job from a prior run can't be mistaken for this one (the field false-success
+    # class: reporting done/failed in 0.1s from a stale Job before ours exists).
+    pre_existing = {j.get("metadata", {}).get("name", "") for j in _backup_jobs()}
+
     patch = {"spec": {"backups": {"pgbackrest": {"manual": {
         "repoName": "repo1", "options": [f"--type={btype}"]}}}}}
     kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
@@ -399,19 +421,16 @@ def _operator_path(kube: Kube, run: OpsRun, spec: OpsSpec, btype: str,
               "--overwrite"], check=True)
     run.event("fire", "manual backup annotated", f"{anno}={stamp}")
     deadline = time.monotonic() + timeout_s
-    seen_active = False
     while time.monotonic() < deadline:
-        jobs = kube.json(["get", "jobs"]).get("items") or []
-        backup_jobs = [j for j in jobs
-                       if "pgbackrest-backup" in json.dumps(j.get("metadata", {}))]
-        active = [j for j in backup_jobs if (j.get("status") or {}).get("active")]
-        done = [j for j in backup_jobs if (j.get("status") or {}).get("succeeded")]
-        failed = [j for j in backup_jobs if (j.get("status") or {}).get("failed")]
-        if active:
-            seen_active = True
+        # Only Jobs created for THIS run (not present before we annotated) —
+        # this is what prevents a stale prior-run Job from being read as ours.
+        new_jobs = [j for j in _backup_jobs()
+                    if j.get("metadata", {}).get("name", "") not in pre_existing]
+        failed = [j for j in new_jobs if (j.get("status") or {}).get("failed")]
+        done = [j for j in new_jobs if (j.get("status") or {}).get("succeeded")]
         if failed:
             return 1, f"backup Job failed: {failed[0]['metadata']['name']}"
-        if done and (seen_active or not active):
+        if done:
             return 0, f"backup Job succeeded: {done[0]['metadata']['name']}"
         time.sleep(2)
     return 1, "timeout waiting for the operator's backup Job"

@@ -180,6 +180,74 @@ def _marker_payload(log_path: Path, marker: str) -> Optional[dict[str, Any]]:
     return payload
 
 
+def reconcile_stale_ops_jobs(cfg: Config, conn: sqlite3.Connection,
+                             startup: bool = False) -> int:
+    """Converge ops jobs whose worker process is gone (crash recovery).
+
+    A scenario/backup CLI is its own session leader, so it can outlive a worker
+    crash; when it finishes it writes a terminal meta.json but nothing updates
+    the owning job row (the tracking thread died with the worker). Left alone,
+    the job stays 'running' forever and the per-target mutex is wedged.
+
+    A job is converged when its worker process is provably gone: the recorded
+    pid is dead, OR its op-run meta.json on disk is already terminal. A
+    ``running`` job with NO pid is ambiguous — it may have just been claimed a
+    moment before ``run_job`` recorded the pid — so it is only reaped on the
+    worker-startup pass (``startup=True``), where no concurrent claims exist;
+    the opportunistic web-tier call leaves it alone. Returns how many converged.
+    """
+    n = 0
+    for job in queries.list_jobs(conn, states=("running", "canceling")):
+        if not is_ops_kind(job["kind"]):
+            continue
+        pid = job["pid"]
+        run_id = job["run_id"]
+        meta = read_meta(cfg.results_dir / "ops" / run_id) if run_id else None
+        meta_terminal = meta is not None and meta.get("status") in OPS_TERMINAL
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if alive and not meta_terminal:
+            continue                           # genuinely running
+        if not pid and not meta_terminal and not startup:
+            continue                           # claim window (pid not yet recorded)
+        if job["state"] == "canceling":
+            state = "canceled"
+        elif meta_terminal:
+            state = "done" if meta["status"] in ("complete", "warning") else "failed"
+        else:
+            state = "failed"
+        queries.update_job(conn, job["id"], state=state, pid=None,
+                           finished_utc=utc_now_iso(),
+                           error="" if state == "done"
+                           else "interrupted (worker restart)")
+        if run_id:
+            converge_ops_run(cfg, run_id, "canceled" if state == "canceled" else
+                             ("done" if state == "done" else "failed"))
+            index_ops_run(cfg, conn, run_id, job)
+        n += 1
+    # Straggler pass: converge any ops run still indexed non-terminal whose
+    # owning job has ALREADY ended (e.g. marked terminal by another code path
+    # before this ran). Self-heals regardless of reconcile ordering.
+    for row in queries.list_ops_runs(conn):
+        if row["status"] in OPS_TERMINAL:
+            continue
+        job = queries.job_for_run(conn, row["op_run_id"])
+        if job is None or job["state"] in ("done", "failed", "canceled"):
+            jstate = job["state"] if job else "failed"
+            converge_ops_run(cfg, row["op_run_id"],
+                             "canceled" if jstate == "canceled" else
+                             ("done" if jstate == "done" else "failed"))
+            if job is not None:
+                index_ops_run(cfg, conn, row["op_run_id"], job)
+            n += 1
+    return n
+
+
 def postprocess(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                 state: str, op_run_id: Optional[str], log_path: Path) -> None:
     """After an ops job ends: cache validate/discover results onto the kube

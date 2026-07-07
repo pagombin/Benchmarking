@@ -225,18 +225,34 @@ def stitch(run_dir: Path) -> Stitched:
         return any(lo <= ms <= hi for lo, hi in artifact_windows)
 
     if fire_ms is not None and ticks:
-        last_ok_before = max((t.local_ms for t in ticks if t.ok and t.local_ms <= fire_ms),
-                             default=None)
-        fails = [t for t in ticks if not t.ok and t.local_ms >= (last_ok_before or fire_ms)
-                 and not in_artifact(t.local_ms)]
+        # The outage of interest is the one the FIRE caused: anchor the first
+        # FAIL at/after the fire instant. A transient FAIL during BASELINE (before
+        # the fire) is not this outage — counting it would over-report downtime
+        # and produce a NEGATIVE detection (first_fail - fire_ms < 0). Field bug.
+        raw_fails = [t for t in ticks if not t.ok and t.local_ms >= fire_ms]
+        fails = [t for t in raw_fails if not in_artifact(t.local_ms)]
         first_fail = min((t.local_ms for t in fails), default=None)
-        first_ok_after = None
+        last_ok_before = first_ok_after = None
         if first_fail is not None:
+            # last OK before the outage began (may be between fire and first_fail)
+            last_ok_before = max((t.local_ms for t in ticks
+                                  if t.ok and t.local_ms <= first_fail), default=None)
             first_ok_after = min((t.local_ms for t in ticks
                                   if t.ok and t.local_ms > first_fail), default=None)
-        downtime_ms = (first_ok_after - last_ok_before
-                       if first_ok_after is not None and last_ok_before is not None
-                       else None)
+            downtime_ms: Optional[int] = (
+                first_ok_after - last_ok_before
+                if first_ok_after is not None and last_ok_before is not None else None)
+        elif raw_fails:
+            # FAILs occurred but were all probe artifacts (port-forward restarts)
+            # -> the real outage window is obscured; report unmeasurable, not 0.
+            downtime_ms = None
+        else:
+            # fire happened, probe ran, NO FAIL after it -> genuinely zero outage
+            # (distinct from "unmeasurable" / no ticks, which stays None).
+            ok_after = [t for t in ticks if t.ok and t.local_ms >= fire_ms]
+            downtime_ms = 0 if ok_after else None
+            last_ok_before = max((t.local_ms for t in ticks
+                                  if t.ok and t.local_ms <= fire_ms), default=None)
         s.probe = {
             "last_ok_before_ms": last_ok_before, "first_fail_ms": first_fail,
             "first_ok_after_ms": first_ok_after,

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -32,8 +34,11 @@ def utc_ms() -> int:
 
 
 def make_op_run_id(op: str, label: str) -> str:
+    # A short random suffix prevents two runs of the same op+label within one
+    # second from colliding on the same directory (id is second-granularity).
     slug = re.sub(r"[^a-z0-9-]+", "-", (label or op).lower()).strip("-") or op
-    return f"{op}-{slug}-{utc_now().strftime('%Y%m%dT%H%M%SZ')}"
+    suffix = os.urandom(2).hex()
+    return f"{op}-{slug}-{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{suffix}"
 
 
 class OpsRun:
@@ -44,6 +49,7 @@ class OpsRun:
         self.op_run_id = make_op_run_id(op, label)
         self.run_dir = results_dir / "ops" / self.op_run_id
         (self.run_dir / "raw").mkdir(parents=True, exist_ok=True)
+        self._status_lock = threading.Lock()
         self.meta: dict[str, Any] = {
             "op_run_id": self.op_run_id, "op": op, "label": label,
             "target": target, "params": params,
@@ -76,18 +82,24 @@ class OpsRun:
         self.logger.info("ops run %s finished: %s", self.op_run_id, status)
 
     def status_update(self, **fields: Any) -> None:
-        """Live status snapshot for the SSE cockpit (atomic, overwrite-only)."""
-        path = self.run_dir / "status.json"
-        cur: dict[str, Any] = {}
-        if path.exists():
-            try:
-                cur = json.loads(path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                cur = {}
-        cur.update(fields)
-        cur["ts_utc"] = utc_now_iso()
-        cur["ts_epoch_ms"] = utc_ms()
-        atomic_write_json(path, cur)
+        """Live status snapshot for the SSE cockpit (atomic, overwrite-only).
+
+        Serialized with a lock: a scenario's background ClusterWatch thread and
+        the main thread both call this, and an unlocked read-modify-write would
+        lose fields (e.g. the watch thread, holding a pre-'fired' snapshot,
+        writing back over the phase the main thread just set)."""
+        with self._status_lock:
+            path = self.run_dir / "status.json"
+            cur: dict[str, Any] = {}
+            if path.exists():
+                try:
+                    cur = json.loads(path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    cur = {}
+            cur.update(fields)
+            cur["ts_utc"] = utc_now_iso()
+            cur["ts_epoch_ms"] = utc_ms()
+            atomic_write_json(path, cur)
 
     # ── event feed ──
 

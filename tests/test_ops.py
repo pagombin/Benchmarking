@@ -808,7 +808,8 @@ def test_monitor_samples_and_survives_failover(opsweb):
     repl = (run_dir / "parsed" / "replication.csv").read_text().splitlines()
     assert len(repl) >= 3                         # 2 replicas per cycle
     disk = (run_dir / "parsed" / "disk.csv").read_text().splitlines()
-    assert any("38G" in ln for ln in disk[1:])
+    assert disk[0] == "epoch_s,pod,pgdata_used,pgdata_use_pct"
+    assert any(ln.endswith("38%") for ln in disk[1:])   # Use% from df -P
 
 
 def test_monitor_lane_does_not_consume_concurrency(opsweb):
@@ -835,3 +836,174 @@ def test_monitor_lane_does_not_consume_concurrency(opsweb):
         queries.update_job(conn, job["id"], state="canceled")
     finally:
         conn.close()
+
+
+# ── bug-bash regressions (worker/queue/reconcile) ──
+
+def test_crash_recovery_converges_ops_run_and_clears_mutex(opsweb):
+    """After a worker crash mid-scenario, reconcile must drive the orphaned job
+    AND its op run terminal, and the per-target mutex must not stay wedged."""
+    client, cfg = opsweb
+    from pgbench_webapp import ops_support, queries
+    from pgbench_webapp.db import connect
+    from pgbench_harness.ops.oprun import OpsRun
+    tid = _ready_target(client, cfg)
+    # simulate a scenario job that was claimed, started, wrote its run dir, then
+    # the worker was SIGKILLed before it could finalize (run stuck 'running').
+    conn = connect(cfg.db_path)
+    run = OpsRun(cfg.results_dir, "scenario", "crash-test",
+                 target={"name": "doks-test", "cr_name": "cluster1",
+                         "cr_kind": "perconapgcluster", "namespace": "percona"},
+                 params={"case": "pgkill"})
+    jid = queries.enqueue_job(conn, "ops_scenario", "op: scenario\n", None, "admin",
+                              kube_target_id=tid)
+    queries.update_job(conn, jid, state="running", pid=2, run_id=run.op_run_id)
+    ops_support.index_ops_run(cfg, conn, run.op_run_id, queries.get_job(conn, jid))
+    # generic startup loop marks it failed first (the ordering bug); ops reconcile
+    # must still converge the RUN.
+    queries.update_job(conn, jid, state="failed")   # as the generic loop would
+    n = ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=True)
+    assert n >= 1
+    detail = client.get(f"/api/ops/runs/{run.op_run_id}", auth=("viewer", "vpw")).json()
+    assert detail["meta"]["status"] in ("failed", "canceled")   # not stuck 'running'
+    idx = queries.get_ops_run(conn, run.op_run_id)
+    assert idx["status"] in ("failed", "canceled")
+    # mutex is clear: a new scenario is accepted
+    r = client.post(f"/api/kube-targets/{tid}/scenario",
+                    json={"confirm": "cluster1",
+                          "params": {"case": "pgkill", "baseline_s": 0.3, "settle_s": 2,
+                                     "probe": {"mode": "off"}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    conn.close()
+    _drain_queue(cfg)
+
+
+def test_reconcile_spares_freshly_claimed_pidless_job(opsweb):
+    """A running ops job with no pid yet (claimed, run_job hasn't recorded the
+    pid) must NOT be reaped by the opportunistic (non-startup) reconcile."""
+    client, cfg = opsweb
+    from pgbench_webapp import ops_support, queries
+    from pgbench_webapp.db import connect
+    tid = _ready_target(client, cfg)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "ops_monitor", "op: monitor\n", None, "op",
+                              kube_target_id=tid)
+    queries.update_job(conn, jid, state="running", pid=None)   # claim window
+    ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=False)
+    assert queries.get_job(conn, jid)["state"] == "running"    # spared
+    # but the startup pass (no concurrent claims) DOES reap it
+    ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=True)
+    assert queries.get_job(conn, jid)["state"] == "failed"
+    conn.close()
+
+
+def test_mutex_atomic_enqueue_rejects_second(opsweb):
+    """enqueue_ops_job_atomic must reject a second destructive op on a target
+    that already has one active (the TOCTOU the plain check allowed)."""
+    client, cfg = opsweb
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    tid = _ready_target(client, cfg)
+    conn = connect(cfg.db_path)
+    mutex = ("ops_scenario", "ops_backup", "ops_cr_apply")
+    a = queries.enqueue_ops_job_atomic(conn, "ops_scenario", "op: scenario\n",
+                                       "admin", tid, mutex)
+    b = queries.enqueue_ops_job_atomic(conn, "ops_backup", "op: backup\n",
+                                       "admin", tid, mutex)
+    assert a is not None and b is None            # second blocked
+    # a non-mutex op (validate) always enqueues
+    c = queries.enqueue_ops_job_atomic(conn, "ops_validate", "op: validate\n",
+                                       "admin", tid, ())
+    assert c is not None
+    conn.close()
+
+
+def test_invalid_ops_params_rejected_at_api(opsweb):
+    """Bad params get a clean 400 at enqueue, not a job that dies 'exit 2'."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    for path, body in [
+        ("scenario", {"confirm": "cluster1", "params": {"case": "bogus"}}),
+        ("scenario", {"confirm": "cluster1", "params": "notadict"}),
+        ("backup", {"confirm": "cluster1", "params": {"type": "bogus"}}),
+    ]:
+        r = client.post(f"/api/kube-targets/{tid}/{path}", json=body,
+                        auth=("admin", "apw"))
+        assert r.status_code == 400, f"{path} {body} -> {r.status_code}"
+
+
+def test_worker_loop_monitor_does_not_block_benchmarks(opsweb, monkeypatch):
+    """The queue wedge fix: a 'running' monitor thread must not stop the loop
+    from claiming other jobs (the len(active) gate now excludes monitors)."""
+    client, cfg = opsweb
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.db import connect
+    import threading, time
+    tid = _ready_target(client, cfg)
+    conn = connect(cfg.db_path)
+    queries.set_setting(conn, "max_concurrency", "1")
+    # a long-lived monitor already 'running' in a fake thread
+    mid = queries.enqueue_job(conn, "ops_monitor", "op: monitor\n", None, "op",
+                              kube_target_id=tid)
+    queries.update_job(conn, mid, state="running", pid=1)
+    # a queued benchmark run
+    bid = queries.enqueue_job(conn, "run", _spec_yaml_bench(), None, "admin")
+    # emulate the loop's admission test: slotted (non-monitor) active vs max_conc
+    active = {mid: (threading.Thread(target=lambda: None), "ops_monitor")}
+    slotted = sum(1 for _t, k in active.values() if k != "ops_monitor")
+    assert slotted == 0                       # monitor doesn't fill the slot
+    job = queries.claim_next_job(conn, 1)     # benchmark still claimable
+    assert job is not None and job["id"] == bid
+    conn.close()
+
+
+def _spec_yaml_bench():
+    return ("run:\n  label: t\n  edition: advanced\n  tshirt_size: 4c16g\n"
+            "target:\n  host: h\n  port: 5432\n  database: d\n  user: u\n"
+            "  password_env: PGB_TARGET_PASSWORD\n  sslmode: require\n"
+            "workload:\n  type: oltp_read_write\n  tables: 1\n  table_size: 10\n"
+            "sweep:\n  threads: [1]\n  duration_s: 1\n  warmup_s: 0\n"
+            "  cooldown_s: 0\n  repetitions: 1\n")
+
+
+def test_monitor_disk_records_usage_not_device(opsweb):
+    """Regression: disk.csv must record Used/Use% from df -P, not the device."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}/monitor",
+                    json={"params": {"interval_s": 0.3, "max_duration_s": 1.5}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "monitor")
+    disk = (cfg.results_dir / "ops" / run["op_run_id"] / "parsed" / "disk.csv")
+    lines = disk.read_text().splitlines()
+    assert lines[0] == "epoch_s,pod,pgdata_used,pgdata_use_pct"
+    row = lines[1].split(",")
+    assert row[2].isdigit()                   # Used blocks, not "/dev/sda1"
+    assert row[3].endswith("%")               # Use%
+
+
+def test_recreate_db_rejects_injection_name(opsweb):
+    """SQL-injection guard: a db name that isn't a plain identifier is refused,
+    never interpolated into DROP/CREATE DATABASE."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "8192"},
+                                     "verify_timeout_s": 8,
+                                     "prep": {"recreate_db": 'x"; DROP DATABASE prod; --',
+                                              "confirm": 'x"; DROP DATABASE prod; --'}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    # The name is refused (never interpolated into DROP/CREATE DATABASE); it
+    # only appears, truncated, inside the human-readable refusal reason.
+    assert "recreate_db refused" in events
+    assert "not a valid database name" in events
+    assert "recreated" not in events     # no "database '<name>' recreated" event

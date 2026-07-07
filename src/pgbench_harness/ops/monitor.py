@@ -38,7 +38,7 @@ QUEUE_CMD = ["bash", "-c", "ls /pgdata/pg*/pg_wal/archive_status/ 2>/dev/null "
 MONITOR_HEADER = ("epoch_s,leader,timeline,wal_bytes,ckpt_timed,ckpt_req,"
                   "archived_count,archive_failed,archive_queue,ready,total")
 REPL_HEADER = "epoch_s,replica,state,lag_bytes,lag_s"
-DISK_HEADER = "epoch_s,pod,pgdata_used"
+DISK_HEADER = "epoch_s,pod,pgdata_used,pgdata_use_pct"
 
 
 def _append(path: Path, header: str, row: str) -> None:
@@ -129,12 +129,19 @@ def run_monitor(spec: OpsSpec, results_dir: Path) -> int:
                 for pod in instances:
                     try:
                         res = kube.exec(pod, "database",
-                                        ["df", "-h", "/pgdata"], timeout_s=15)
-                        used = res.stdout.strip().splitlines()[-1].split()[0] \
-                            if res.ok and res.stdout.strip() else ""
+                                        ["df", "-P", "/pgdata"], timeout_s=15)
+                        # df -P guarantees one data line with fixed columns:
+                        # Filesystem 1K-blocks Used Available Capacity Mounted.
+                        # Record Used + Use% (cols 2 and 4) — NOT col 0, which is
+                        # the device name (the header says pgdata_used).
+                        used, pct = "", ""
+                        if res.ok and res.stdout.strip():
+                            cols = res.stdout.strip().splitlines()[-1].split()
+                            if len(cols) >= 5:
+                                used, pct = cols[2], cols[4]
                         if used:
                             _append(parsed / "disk.csv", DISK_HEADER,
-                                    f"{ts},{pod},{used}")
+                                    f"{ts},{pod},{used},{pct}")
                     except KubeError:
                         continue
             _append(parsed / "monitor.csv", MONITOR_HEADER,
