@@ -247,8 +247,10 @@ def test_validate_reports_missing_kubeconfig(opsweb):
     job_id, state, job = _run_worker_once(cfg)
     assert state == "failed"
     out = (cfg.data_dir / "jobs" / f"job_{job_id}.out").read_text()
-    assert "not visible to the worker" in out
+    assert "Traceback" not in out                # never crash — report cleanly
+    assert "kubeconfig not found" in out
     assert "kubeconfigs/" in out                 # points at the sanctioned dir
+    assert "OPS_SUMMARY_JSON" in out             # summary still emitted for the worker
 
 
 # ── the extended leak gate ──
@@ -1007,3 +1009,43 @@ def test_recreate_db_rejects_injection_name(opsweb):
     assert "recreate_db refused" in events
     assert "not a valid database name" in events
     assert "recreated" not in events     # no "database '<name>' recreated" event
+
+
+# ── regression: validate must never crash on an unreadable/hidden kubeconfig ──
+
+def test_probe_kubeconfig_handles_all_failures(tmp_path, monkeypatch):
+    from pgbench_harness.ops.validate import _probe_kubeconfig
+    import os as _os
+    # missing
+    ok, msg = _probe_kubeconfig(str(tmp_path / "nope.yaml"))
+    assert ok is False and "not found" in msg
+    # a directory, not a file
+    ok, msg = _probe_kubeconfig(str(tmp_path))
+    assert ok is False and "not a regular file" in msg
+    # a real readable file
+    kc = tmp_path / "kc.yaml"; kc.write_text("apiVersion: v1\n")
+    ok, msg = _probe_kubeconfig(str(kc))
+    assert ok is True
+    # permission denied (the /root ProtectHome case) — simulated so it works as root
+    def boom(*a, **k):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(_os, "stat", boom)
+    ok, msg = _probe_kubeconfig("/root/kubeconfig-x")
+    assert ok is False
+    assert "not accessible" in msg and "kubeconfigs/" in msg   # the actionable hint
+
+
+def test_validate_reports_cleanly_when_kubeconfig_not_a_file(opsweb, tmp_path):
+    """A kubeconfig path that isn't a regular file (e.g. a directory) must make
+    validate FAIL with a clear checklist line, never crash. The permission-denied
+    (/root ProtectHome) branch is covered by test_probe_kubeconfig_handles_all_failures
+    — it can't be exercised through the subprocess as root."""
+    client, cfg = opsweb
+    d = tmp_path / "notafile"; d.mkdir()
+    _create_target(client, upload=False, name="dirkc", kubeconfig_path=str(d))
+    _id, state, job = _run_worker_once(cfg)
+    assert state == "failed"
+    out = (cfg.data_dir / "jobs" / f"job_{job['id']}.out").read_text()
+    assert "Traceback" not in out
+    assert "not a regular file" in out
+    assert "OPS_SUMMARY_JSON" in out

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+import stat
 from typing import Any
 
 from pgbench_harness.ops.kube import Kube, KubeError
@@ -19,11 +19,46 @@ from pgbench_harness.ops.opspec import CR_KINDS, OpsSpec
 
 SUMMARY_MARKER = "OPS_SUMMARY_JSON"
 
+_SANDBOX_HINT = (
+    "The service runs sandboxed (systemd ProtectHome=true / ProtectSystem=strict), "
+    "which makes /root and /home unreadable even when running as root. Copy the "
+    "kubeconfig under the data dir's kubeconfigs/ directory (e.g. "
+    "/var/lib/pgbench-harness/kubeconfigs/<name>.yaml) and point the target there, "
+    "or register it via the UI's 'paste contents' option (stored encrypted).")
+
 
 def _check(name: str, status: str, detail: str = "") -> dict[str, Any]:
     obj = {"name": name, "status": status, "detail": detail}
     print(json.dumps(obj), flush=True)
     return obj
+
+
+def _probe_kubeconfig(kc: str) -> tuple[bool, str]:
+    """Return (ok, message) for the kubeconfig path WITHOUT ever raising.
+
+    ``Path.is_file()`` re-raises PermissionError (EACCES) on Python 3.11+ rather
+    than returning False, so a sandbox-hidden path (/root, /home under
+    ProtectHome) would crash validate. Probe with os.stat + a real read and
+    turn every failure into a clear, actionable check line.
+    """
+    try:
+        st = os.stat(kc)
+    except FileNotFoundError:
+        # ProtectHome can present /root and /home as empty (files read as
+        # not-found), so the sandbox hint applies here too.
+        return False, f"kubeconfig not found at {kc}. " + _SANDBOX_HINT
+    except PermissionError:
+        return False, f"kubeconfig at {kc} is not accessible to the worker. " + _SANDBOX_HINT
+    except OSError as exc:
+        return False, f"kubeconfig at {kc} is not accessible: {exc}. " + _SANDBOX_HINT
+    if not stat.S_ISREG(st.st_mode):
+        return False, f"{kc} is not a regular file"
+    try:
+        with open(kc, "rb") as fh:
+            fh.read(1)
+    except OSError as exc:
+        return False, f"kubeconfig at {kc} exists but the worker cannot read it: {exc}. " + _SANDBOX_HINT
+    return True, "file readable"
 
 
 def run_validate(spec: OpsSpec) -> int:
@@ -42,15 +77,10 @@ def run_validate(spec: OpsSpec) -> int:
     if not kc:
         _check("kubeconfig", "fail", "KUBECONFIG not set in the worker environment")
         failed = True
-    elif not Path(kc).is_file():
-        _check("kubeconfig", "fail",
-               "kubeconfig not visible to the worker. If the file exists on the host, "
-               "note the worker runs sandboxed (ProtectHome/ProtectSystem) and can only "
-               "see paths under /var/lib/pgbench-harness — copy it to the data dir's "
-               "kubeconfigs/ directory.")
-        failed = True
     else:
-        _check("kubeconfig", "ok", "file readable")
+        kc_ok, kc_msg = _probe_kubeconfig(kc)
+        _check("kubeconfig", "ok" if kc_ok else "fail", kc_msg)
+        failed = failed or not kc_ok
 
     kube = Kube(context=t.context, namespace=t.namespace)
 
