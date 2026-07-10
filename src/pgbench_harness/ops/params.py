@@ -37,20 +37,43 @@ from pgbench_harness.util import utc_now_iso
 
 PARAMS_MARKER = "OPS_PARAMS_JSON"
 
-# Patroni force-sets these on every member; a CR-supplied value is ignored or
-# actively overwritten. (Patroni docs: "PostgreSQL parameters controlled by
-# Patroni".)
+# Patroni force-sets these on every member (CMDLINE_OPTIONS with a
+# false-validator, passed as postmaster args — precedence above ALTER SYSTEM);
+# a CR-supplied value is silently dropped. Verified against Patroni
+# patroni/postgresql/config.py.
 PATRONI_LOCKED = frozenset({
     "listen_addresses", "port", "cluster_name", "hot_standby", "wal_log_hints",
 })
 
 # Patroni accepts these only through DCS dynamic configuration and coordinates
-# them cluster-wide (they must match on primary and replicas; several are
-# restart-only and a decrease triggers a coordinated restart order).
+# them cluster-wide (must match on primary and replicas; shared-memory ones
+# have a restart-ordering rule — increase: replicas first; decrease: primary
+# first, replicas may stay pending_restart until replay catches up).
 PATRONI_DCS = frozenset({
     "max_connections", "max_locks_per_transaction", "max_worker_processes",
     "max_prepared_transactions", "max_replication_slots", "max_wal_senders",
     "wal_level", "wal_keep_segments", "wal_keep_size", "track_commit_timestamp",
+})
+
+# The operator itself owns these (mandatory values reverted on every
+# reconcile, or written by Patroni on replicas): TLS/socket/log plumbing,
+# pgBackRest archiving, and recovery/replication identity parameters.
+# Union of the Crunchy v5.8 spec.config CEL-forbidden list, both operators'
+# Mandatory sets, and Patroni's recovery-parameter set.
+OPERATOR_LOCKED = frozenset({
+    "config_file", "data_directory", "external_pid_file", "hba_file",
+    "ident_file", "logging_collector", "log_file_mode",
+    "ssl", "ssl_ca_file", "ssl_cert_file", "ssl_key_file", "ssl_crl_file",
+    "ssl_crl_dir", "ssl_ciphers", "ssl_dh_params_file", "ssl_library",
+    "ssl_max_protocol_version", "ssl_min_protocol_version",
+    "ssl_passphrase_command", "ssl_passphrase_command_supports_reload",
+    "ssl_prefer_server_ciphers",
+    "unix_socket_directories", "unix_socket_group", "unix_socket_permissions",
+    "archive_mode", "archive_command", "restore_command",
+    "synchronous_standby_names", "primary_conninfo", "primary_slot_name",
+    "recovery_min_apply_delay", "recovery_target", "recovery_target_action",
+    "recovery_target_inclusive", "recovery_target_lsn", "recovery_target_name",
+    "recovery_target_time", "recovery_target_timeline", "recovery_target_xid",
 })
 
 # One JSON document out of psql: no separator/quoting pitfalls, enumvals stays
@@ -72,6 +95,8 @@ def classify(name: str, context: str) -> str:
         return "readonly"
     if name in PATRONI_LOCKED:
         return "patroni-locked"
+    if name in OPERATOR_LOCKED:
+        return "operator-managed"
     if name in PATRONI_DCS:
         return "dcs-coordinated"
     return "cr"

@@ -108,7 +108,7 @@ export interface PgParam {
   reset_val: string | null;
   source: string | null;
   pending_restart: boolean;
-  channel: "cr" | "dcs-coordinated" | "patroni-locked" | "readonly";
+  channel: "cr" | "dcs-coordinated" | "patroni-locked" | "operator-managed" | "readonly";
   restart_required: boolean;
   cr_value: string | null;
 }

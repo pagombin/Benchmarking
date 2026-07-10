@@ -9,8 +9,40 @@ const CHANNEL_HELP: Record<string, string> = {
   cr: "applied via the CR (spec.patroni.dynamicConfiguration) — Patroni reloads it",
   "dcs-coordinated": "Patroni coordinates this cluster-wide through DCS — expect a rolling restart",
   "patroni-locked": "Patroni owns this parameter and overrides any value you set",
+  "operator-managed": "the operator owns this (TLS, archiving, recovery plumbing) — reverted on reconcile",
   readonly: "compiled into the server — display only",
 };
+
+// postgresql.org doc pages by the first segment of pg_settings.category;
+// per-GUC anchors are #GUC-<NAME-WITH-DASHES>.
+const DOC_PAGE: Record<string, string> = {
+  "File Locations": "runtime-config-file-locations",
+  "Connections and Authentication": "runtime-config-connection",
+  "Resource Usage": "runtime-config-resource",
+  "Write-Ahead Log": "runtime-config-wal",
+  "Replication": "runtime-config-replication",
+  "Query Tuning": "runtime-config-query",
+  "Reporting and Logging": "runtime-config-logging",
+  "Statistics": "runtime-config-statistics",
+  "Autovacuum": "runtime-config-autovacuum",
+  "Client Connection Defaults": "runtime-config-client",
+  "Lock Management": "runtime-config-locks",
+  "Version and Platform Compatibility": "runtime-config-compatible",
+  "Error Handling": "runtime-config-error-handling",
+  "Preset Options": "runtime-config-preset",
+  "Customized Options": "runtime-config-custom",
+  "Developer Options": "runtime-config-developer",
+};
+
+function docUrl(p: PgParam, pgVersion: string): string {
+  const major = (pgVersion || "17").split(".")[0];
+  const seg = (p.category || "").split(" / ")[0];
+  const page = DOC_PAGE[seg];
+  if (!page) {
+    return `https://www.postgresql.org/search/?u=%2Fdocs%2F${major}%2F&q=${p.name}`;
+  }
+  return `https://www.postgresql.org/docs/${major}/${page}.html#GUC-${p.name.toUpperCase().replace(/_/g, "-")}`;
+}
 
 const QUICK_FILTERS = [
   ["all", "All"],
@@ -311,13 +343,10 @@ export function KubeParams({ me }: { me: Me }) {
                               {" · default "}{p.boot_val}
                               {p.unit ? ` · unit ${p.unit}` : ""}
                               {" · "}
-                              <a href={`https://www.postgresql.org/search/?u=%2Fdocs%2F${(cat.pg_version || "17").split(".")[0]}%2F&q=${p.name}`}
+                              <a href={docUrl(p, cat.pg_version)}
                                  target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>docs ↗</a>
                             </p>
-                            {p.channel === "patroni-locked" && (
-                              <p className="subtle">🔒 {CHANNEL_HELP[p.channel]}.</p>
-                            )}
-                            {p.channel === "readonly" && (
+                            {["patroni-locked", "operator-managed", "readonly"].includes(p.channel) && (
                               <p className="subtle">🔒 {CHANNEL_HELP[p.channel]}.</p>
                             )}
                             {editable && (

@@ -347,6 +347,7 @@ def test_pg_params_snapshot_caches_catalog(opsweb):
     # the apply-channel overlay
     assert byname["listen_addresses"]["channel"] == "patroni-locked"
     assert byname["max_connections"]["channel"] == "dcs-coordinated"
+    assert byname["archive_command"]["channel"] == "operator-managed"
     assert byname["work_mem"]["channel"] == "cr"
     assert byname["block_size"]["channel"] == "readonly"
     # CR-managed values are marked so the UI can show provenance
