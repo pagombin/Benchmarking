@@ -595,6 +595,9 @@ from `raw/` at any time.
     `pending_restart` and a rolling restart;
   - `patroni-locked` — Patroni overrides these (listen_addresses, port, ...):
     the console refuses to stage them;
+  - `operator-managed` — the operator owns these and reverts them on every
+    reconcile (TLS/socket/log plumbing, pgBackRest archive/restore commands,
+    Patroni recovery parameters): display only, with the reason shown;
   - `readonly` — compiled in (`internal` context): display only.
   The editors are typed (bool/enum selects, numeric inputs with the server's
   own ranges), so an invalid value cannot be staged, let alone applied.
