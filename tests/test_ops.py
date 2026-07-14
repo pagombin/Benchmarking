@@ -655,6 +655,47 @@ def test_pgbouncer_global_apply_and_verify(opsweb):
     assert cat["pgbouncer_global"]["pool_mode"] == "transaction"
 
 
+def test_patroni_dcs_apply_and_verify(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    params = {"action": "patroni_dcs",
+              "settings": {"ttl": "45", "loop_wait": "15",
+                           "synchronous_mode": "true",
+                           "postgresql.use_slots": "true"}}
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"params": {**params, "dry_run": True}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["headline"]["dry_run"] is True
+    assert run["headline"]["changed"]["ttl"][1] == "45"
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1", "params": params},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True
+    # Percona routing: ttl/loop_wait went to the dedicated CR fields
+    import json as _json
+    st = _json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    pat = st["cr"]["spec"]["patroni"]
+    assert pat["leaderLeaseDurationSeconds"] == 45
+    assert pat["syncPeriodSeconds"] == 15
+    assert pat["dynamicConfiguration"]["synchronous_mode"] is True
+    assert pat["dynamicConfiguration"]["postgresql"]["use_slots"] is True
+    # and the snapshot shows the live DCS values
+    client.post(f"/api/kube-targets/{tid}/pg-params", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    cat = client.get(f"/api/kube-targets/{tid}/pg-params",
+                     auth=("viewer", "vpw")).json()["catalog"]
+    assert cat["patroni_dcs"]["ttl"] == "45"
+    assert cat["patroni_dcs"]["synchronous_mode"] == "True"
+    assert cat["patroni_dcs"]["postgresql.use_slots"] == "True"
+
+
 # ── continuous intelligence ──
 
 def test_auto_health_scheduling_and_history(opsweb):
