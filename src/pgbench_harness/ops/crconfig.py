@@ -476,6 +476,20 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             action = src_action
             run.event("rollback", f"rolling back {len(proposed)} parameter(s)",
                       f"from run {params.get('rollback_of')}")
+            if action == "patroni_dcs":
+                # DCS settings have no removal semantics in a rollback — keys
+                # that didn't exist before are skipped with a note.
+                skipped = [k for k, v in proposed.items() if v is None]
+                if skipped:
+                    run.event("rollback", "skipping keys with no previous value",
+                              ", ".join(skipped))
+                settings = {k: v for k, v in proposed.items() if v is not None}
+                if not settings:
+                    run.finalize("failed", error="rollback: every rolled-back DCS "
+                                 "key was newly added — nothing to restore")
+                    return EXIT_FAILED
+                return _patroni_dcs_action(kube, run, spec, cr,
+                                           {**params, "settings": settings})
         elif action == "patroni_params":
             proposed = dict(params.get("parameters") or PATRONI_BUNDLE)
         elif action == "pgbackrest_global":
@@ -568,6 +582,12 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             run.event("verify", "all values live in pg_settings on the leader", leader)
         elif action == "pgbouncer_global":
             expected = {k: v[1] for k, v in changes.items()}
+            if not expected:
+                run.event("apply", "removal-only change applied",
+                          f"removed {', '.join(removed)}; no live value to verify")
+                headline["verified"] = None
+                run.finalize("complete", headline=headline)
+                return EXIT_OK
             rendered, ok, note = verify_pgbouncer_config(kube, t.cr_name, expected,
                                                          verify_timeout)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(
@@ -585,6 +605,12 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             run.event("verify", note + " (SIGHUP reload; no pod restart)")
         else:   # pgbackrest_global
             expected = {k: v[1] for k, v in changes.items()}
+            if not expected:
+                run.event("apply", "removal-only change applied",
+                          f"removed {', '.join(removed)}; no live value to verify")
+                headline["verified"] = None
+                run.finalize("complete", headline=headline)
+                return EXIT_OK
             rendered, ok = verify_pgbackrest_config(kube, leader, expected,
                                                     verify_timeout)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(

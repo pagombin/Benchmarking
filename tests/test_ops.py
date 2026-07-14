@@ -696,6 +696,82 @@ def test_patroni_dcs_apply_and_verify(opsweb):
     assert cat["patroni_dcs"]["postgresql.use_slots"] == "True"
 
 
+def test_operate_bugbash_guardrails(opsweb):
+    """Bug-bash regressions: scale-to-0 crashed mid-verify; an empty resize
+    resources dict would have REPLACED the pods' resources with {}."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _operate(client, tid, {"operation": "scale", "replicas": 0})
+    assert r.status_code == 400 and "pause" in r.text
+    r = _operate(client, tid, {"operation": "resize", "resources": {}})
+    assert r.status_code == 400
+    r = _operate(client, tid, {"operation": "resize",
+                               "resources": {"limits": {}, "requests": {}}})
+    assert r.status_code == 400
+    # failover without a candidate dies inside patronictl — refuse in preflight
+    r = _operate(client, tid, {"operation": "failover"})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "aborted"
+    assert run["headline"]["reason"] == "failover-needs-target"
+
+
+def test_patroni_dcs_rollback_restores_previous(opsweb):
+    """Bug-bash regression: rollback of a patroni_dcs run hit 'unknown action'."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    for ttl in ("45", "60"):
+        r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                        json={"confirm": "cluster1",
+                              "params": {"action": "patroni_dcs",
+                                         "settings": {"ttl": ttl}}},
+                        auth=("admin", "apw"))
+        assert r.status_code == 200, r.text
+        _drain_queue(cfg)
+    src = _last_ops_run(client, "cr-apply")
+    assert src["headline"]["verified"] is True
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "rollback",
+                                     "rollback_of": src["op_run_id"]}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    import json as _json
+    st = _json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    assert st["cr"]["spec"]["patroni"]["leaderLeaseDurationSeconds"] == 45
+
+
+def test_auto_health_skips_during_destructive_op(opsweb):
+    """Bug-bash regression: a health check exec'd into pods mid-backup/failover
+    would produce garbage findings and false transition alerts."""
+    from pgbench_webapp import ops_support
+    from pgbench_webapp.db import connect
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}", json={"auto_health_s": 900},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200
+    r = _fire_backup(client, tid, {"type": "incr", "sample_interval_s": 0.2,
+                                   "settle_s": 0.2})
+    assert r.status_code == 200
+    conn = connect(cfg.db_path)
+    try:
+        assert ops_support.maybe_enqueue_auto_health(cfg, conn) == 0  # backup queued
+    finally:
+        conn.close()
+    _drain_queue(cfg)
+    conn = connect(cfg.db_path)
+    try:
+        assert ops_support.maybe_enqueue_auto_health(cfg, conn) == 1  # clear now
+    finally:
+        conn.close()
+    _drain_queue(cfg)
+
+
 # ── continuous intelligence ──
 
 def test_auto_health_scheduling_and_history(opsweb):
