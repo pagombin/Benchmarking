@@ -61,7 +61,8 @@ def _cfg(params: dict[str, Any]) -> dict[str, Any]:
                             or "docker.io/percona/pmm-client:3.8.1"),
         "query_source": str(params.get("query_source") or "pgstatmonitor"),
         "extension": str(params.get("extension") or "pg_stat_monitor"),
-        "base_libs": str(params.get("base_libs") or "pgaudit"),
+        # empty = auto-detect the cluster's existing libraries and preserve them
+        "base_libs": str(params.get("base_libs") or ""),
         "database": str(params.get("database") or "postgres"),
         "secret_name": str(params.get("secret_name") or ""),
         "rollout_timeout_s": float(params.get("rollout_timeout_s") or 600),
@@ -84,6 +85,54 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
         run.event("preflight", "token does not start with 'glsa_'",
                   "PMM3 service-account tokens normally do — continuing anyway")
     return token
+
+
+def _merge_spl(existing: str, extension: str) -> str:
+    """Merge the PMM extension into the cluster's existing preload libraries:
+    keep every existing library in order, dedupe, append the extension if
+    missing. Never drops a library the cluster already loads."""
+    libs: list[str] = []
+    for part in (existing or "").split(","):
+        p = part.strip()
+        if p and p not in libs:
+            libs.append(p)
+    if not libs:
+        libs = ["pgaudit"]                # the operator's own baseline
+    if extension not in libs:
+        libs.append(extension)
+    return ",".join(libs)
+
+
+def _current_spl(kube: Kube, cr: dict[str, Any], leader: str,
+                 database: str) -> tuple[str, str]:
+    """(value, source) of the cluster's current shared_preload_libraries.
+    The CR spec is the declared intent and wins; live runtime on the leader is
+    the fallback for clusters that never declared it (operator default)."""
+    cr_spl = str((((((cr.get("spec") or {}).get("patroni") or {})
+                    .get("dynamicConfiguration") or {}).get("postgresql") or {})
+                  .get("parameters") or {}).get("shared_preload_libraries", ""))
+    if cr_spl.strip():
+        return cr_spl.strip(), "CR spec"
+    if leader:
+        rt = _psql(kube, leader, database, "SHOW shared_preload_libraries;")
+        if rt:
+            return rt, "runtime (leader)"
+    return "", "operator default"
+
+
+def _resolve_spl(kube: Kube, run: OpsRun, cfg: dict[str, Any],
+                 cr: dict[str, Any], leader: str) -> str:
+    """The shared_preload_libraries value the patch will set — existing
+    libraries auto-detected and preserved unless params.base_libs overrides."""
+    if cfg["base_libs"]:
+        cur, src = cfg["base_libs"], "params.base_libs (explicit override)"
+    else:
+        cur, src = _current_spl(kube, cr, leader, cfg["database"])
+    spl = _merge_spl(cur, cfg["extension"])
+    run.event("preflight", f"shared_preload_libraries -> {spl}",
+              f"existing libraries ({src}: '{cur or 'none declared'}') are "
+              f"preserved; {cfg['extension']} appended if missing")
+    return spl
 
 
 def _instance_pods(kube: Kube, cr_name: str) -> list[dict[str, Any]]:
@@ -338,8 +387,10 @@ def _validation(kube: Kube, run: OpsRun, t: Any, cfg: dict[str, Any],
                   .get("parameters") or {}).get("shared_preload_libraries", ""))
     rt_spl = _psql(kube, leader, cfg["database"],
                    "SHOW shared_preload_libraries;") or ""
-    want = [x.strip() for x in f"{cfg['base_libs']},{cfg['extension']}".split(",")
-            if x.strip()]
+    # every library the CR declares must be loaded at runtime (after an
+    # enable, the CR carries the merged preserved+extension list)
+    want_src = cr_spl if cr_spl.strip() else cfg["extension"]
+    want = [x.strip() for x in want_src.split(",") if x.strip()]
     libs = {lib: lib in rt_spl for lib in want}
     if cr_spl and rt_spl and cr_spl != rt_spl:
         run.event("verify", "runtime shared_preload_libraries differs from the "
@@ -462,19 +513,23 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
                       f"query-source '{cfg['query_source']}' may not match",
                       "expected pairing: pgstatmonitor<->pg_stat_monitor, "
                       "pgstatements<->pg_stat_statements")
-        kube.cluster_cr(t.cr_kind, t.cr_name)        # raises if missing
+        cr = kube.cluster_cr(t.cr_kind, t.cr_name)   # raises if missing
         run.event("preflight", f"found {t.cr_kind}/{t.cr_name}")
 
-        spl = f"{cfg['base_libs']},{cfg['extension']}"
-        patch = {"spec": {
-            "pmm": {"enabled": True, "image": cfg["client_image"],
-                    "imagePullPolicy": "IfNotPresent",
-                    "querySource": cfg["query_source"],
-                    "secret": secret_name, "serverHost": cfg["server_host"]},
-            "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
-                "shared_preload_libraries": spl}}}}}}
+        def build_patch(spl: str) -> dict[str, Any]:
+            return {"spec": {
+                "pmm": {"enabled": True, "image": cfg["client_image"],
+                        "imagePullPolicy": "IfNotPresent",
+                        "querySource": cfg["query_source"],
+                        "secret": secret_name, "serverHost": cfg["server_host"]},
+                "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
+                    "shared_preload_libraries": spl}}}}}}
 
         if dry_run:
+            # no exec in a dry-run: detect from the CR (re-checked live,
+            # including the leader's runtime value, at apply time)
+            spl = _resolve_spl(kube, run, cfg, cr, leader="")
+            patch = build_patch(spl)
             run.event("dry-run", "secret", f"kubectl apply -f - <<< "
                       f"'{{\"kind\":\"Secret\",\"metadata\":{{\"name\":\"{secret_name}\"}},"
                       f"\"stringData\":{{\"PMM_SERVER_TOKEN\":\"<token>\"}}}}'")
@@ -493,6 +548,11 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         # 2. pre-change topology (resilient)
         instances, leader, _view = _discover(kube, run, t.cr_name, cfg,
                                              "pre-change")
+
+        # existing preload libraries: auto-detected (CR, then live runtime on
+        # the leader) and PRESERVED — the patch appends, never replaces
+        spl = _resolve_spl(kube, run, cfg, cr, leader)
+        patch = build_patch(spl)
 
         # 3. state backup before any mutation
         _backup_state(kube, run, t, cfg, secret_name, leader, instances)

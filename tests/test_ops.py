@@ -1973,3 +1973,122 @@ def test_build_pmm_links_scoped_to_run_window():
     assert "pmm-qan" in links["qan"] and f"from={frm}&to={to}" in links["qan"]
     assert "var-service_name=cluster1-instance1" in links["qan"]
     assert build_pmm_links(SimpleNamespace(pmm=None), "x", "y") is None
+
+
+def test_merge_spl_preserves_and_dedupes():
+    from pgbench_harness.ops.pmm import _merge_spl
+    assert _merge_spl("pgaudit,pgvector", "pg_stat_monitor") == \
+        "pgaudit,pgvector,pg_stat_monitor"
+    assert _merge_spl(" pgaudit , pg_stat_monitor ", "pg_stat_monitor") == \
+        "pgaudit,pg_stat_monitor"                     # already there: no dupe
+    assert _merge_spl("", "pg_stat_monitor") == "pgaudit,pg_stat_monitor"
+    assert _merge_spl("pgvector,pgaudit,pgvector", "pg_stat_statements") == \
+        "pgvector,pgaudit,pg_stat_statements"         # order kept, dupes dropped
+
+
+def test_pmm_enable_preserves_existing_preload_libraries(pmmops):
+    """The cluster already loads custom libraries (pgvector, pg_cron): the PMM
+    patch must append the extension, never clobber the existing list."""
+    import subprocess as sp
+
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    sp.run([str(FAKEBIN / "kubectl"), "patch", "perconapgcluster", "cluster1",
+            "--type", "merge", "-p", json.dumps({"spec": {"patroni": {
+                "dynamicConfiguration": {"postgresql": {"parameters": {
+                    "shared_preload_libraries": "pgaudit,pgvector,pg_cron"}}}}}})],
+           env=dict(os.environ), capture_output=True, check=True)
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops)
+    assert rc == 0
+    st = _fake_state()
+    spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
+           ["parameters"]["shared_preload_libraries"])
+    assert spl == "pgaudit,pgvector,pg_cron,pg_stat_monitor"
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    events = (run_dir / "events.jsonl").read_text()
+    assert "pgaudit,pgvector,pg_cron,pg_stat_monitor" in events
+    assert "preserved" in events
+    # validation verified every preserved library, not just the extension
+    val = json.loads((run_dir / "validation.json").read_text())
+    assert val["libs"] == {"pgaudit": True, "pgvector": True, "pg_cron": True,
+                           "pg_stat_monitor": True}
+
+
+# ── PMM via the console API (web routes) ──
+
+def test_pmm_web_enable_status_disable_flow(opsweb, monkeypatch):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("PGB_PMM_TOKEN", PMM_TOKEN)
+    monkeypatch.setenv("FAKE_KUBE_RESTART_S", "0")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "0")
+    monkeypatch.setenv("FAKE_KUBE_ROLL_S", "0.2")
+    params = {"server_host": "http://127.0.0.1:9", "poll_s": 0.2,
+              "rollout_timeout_s": 30, "discover_timeout_s": 10,
+              "qan_timeout_s": 10}
+    # enable: admin + typed confirmation
+    r = client.post(f"/api/kube-targets/{tid}/pmm/enable",
+                    json={"confirm": "cluster1", "params": params},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "pmm-enable")
+    assert run["status"] == "complete", run
+    assert run["headline"]["healthy"] is True
+    enable_id = run["op_run_id"]
+    # status: operator role, no confirmation, zero mutations
+    r = client.post(f"/api/kube-targets/{tid}/pmm/status",
+                    json={"params": {"server_host": "http://127.0.0.1:9"}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "pmm-status")
+    assert run["status"] == "complete", run
+    # disable: rollback_of auto-resolves to the newest enable run's backup
+    r = client.post(f"/api/kube-targets/{tid}/pmm/disable",
+                    json={"confirm": "cluster1", "params": {}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "pmm-disable")
+    assert run["status"] == "complete", run
+    assert run["headline"]["restored_from"] == enable_id
+    state = json.loads((cfg.data_dir.parent / "fakekube" / "state.json").read_text())
+    assert "pmm" not in state["cr"]["spec"]
+    # the token sentinel never landed anywhere the webapp writes
+    for path in cfg.data_dir.rglob("*"):
+        if path.is_file() and "fakekube" not in str(path) \
+                and path.name != "secrets.enc":
+            assert PMM_TOKEN not in path.read_text(encoding="utf-8",
+                                                   errors="replace"), path
+
+
+def test_pmm_web_rbac_confirm_and_validation(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    host = {"server_host": "pmm.example.com"}
+    # viewer: nothing; operator: status only, not enable/disable
+    r = client.post(f"/api/kube-targets/{tid}/pmm/status",
+                    json={"params": host}, auth=("viewer", "vpw"))
+    assert r.status_code == 403
+    r = client.post(f"/api/kube-targets/{tid}/pmm/enable",
+                    json={"confirm": "cluster1", "params": host},
+                    auth=("op", "oppw"))
+    assert r.status_code == 403
+    # admin without typed confirmation -> 400 (unless dry-run)
+    r = client.post(f"/api/kube-targets/{tid}/pmm/enable",
+                    json={"params": host}, auth=("admin", "apw"))
+    assert r.status_code == 400 and "confirmation" in r.text
+    r = client.post(f"/api/kube-targets/{tid}/pmm/enable",
+                    json={"params": {**host, "dry_run": True}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text          # dry-run: no confirm needed
+    # missing server_host -> clean 400, nothing enqueued
+    r = client.post(f"/api/kube-targets/{tid}/pmm/enable",
+                    json={"confirm": "cluster1", "params": {}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400 and "server_host" in r.text
+    # disable with no enable run to roll back to -> clean 400
+    r = client.post(f"/api/kube-targets/{tid}/pmm/disable",
+                    json={"confirm": "cluster1", "params": {}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400 and "nothing to restore" in r.text
