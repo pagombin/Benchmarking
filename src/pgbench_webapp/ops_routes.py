@@ -553,7 +553,10 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         if not kt["cr_name"]:
             raise HTTPException(400, "target has no CR name — run discover first")
         params = _params(payload)
-        if not str(params.get("rollback_of") or "").strip():
+        rollback_of = str(params.get("rollback_of") or "").strip()
+        if rollback_of:
+            _safe_segment(rollback_of)          # raises 400 on traversal shapes
+        else:
             src = _latest_pmm_enable_run(kt)
             if not src:
                 raise HTTPException(400, "no pmm-enable run with a CR backup "

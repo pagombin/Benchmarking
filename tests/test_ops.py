@@ -1796,6 +1796,12 @@ def test_pmm_enable_end_to_end_with_inventory_confirmation(pmmops):
     spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
            ["parameters"]["shared_preload_libraries"])
     assert spl == "pgaudit,pg_stat_monitor"
+    # HA-preserving bounce: the leader is deleted LAST, after every replica
+    deletes = [json.loads(ln) for ln in
+               (run_dir / "events.jsonl").read_text().splitlines()
+               if '"bounce"' in ln and "deleting pod" in ln]
+    assert len(deletes) == 3
+    assert "cluster1-instance1-abcd-0" in deletes[-1]["label"]   # the leader
     # DoD: the token never lands in anything the harness writes
     for p in pmmops.rglob("*"):
         if p.is_file():
@@ -2092,3 +2098,102 @@ def test_pmm_web_rbac_confirm_and_validation(opsweb):
                     json={"confirm": "cluster1", "params": {}},
                     auth=("admin", "apw"))
     assert r.status_code == 400 and "nothing to restore" in r.text
+
+
+# ── bug-bash round 3 regressions (PMM surface) ──
+
+def test_pmm_enable_twice_is_idempotent(pmmops):
+    """Re-enabling an already-monitored cluster must converge, not break:
+    no duplicate libs, secret refreshed, run completes healthy."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    st = _fake_state()
+    spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
+           ["parameters"]["shared_preload_libraries"])
+    assert spl == "pgaudit,pg_stat_monitor"          # merged, not doubled
+    assert st["pmm_secret"] == "cluster1-pmm-secret"
+
+
+def test_pmm_disable_rejects_traversal_rollback_id(pmmops):
+    from pgbench_harness.ops.pmm import run_pmm_disable
+    rc = run_pmm_disable(
+        _pmm_ops_spec("pmm-disable", rollback_of="../../../../etc"), pmmops)
+    assert rc == 3
+    meta = json.loads((_only_pmm_run_dir(pmmops, "pmm-disable") / "meta.json")
+                      .read_text())
+    assert meta["status"] == "aborted"
+    assert meta["headline"]["reason"] == "bad-rollback-id"
+
+
+def test_pmm_disable_strips_server_owned_fields_on_restore(pmmops):
+    """The backed-up CR dump carries resourceVersion/uid/creationTimestamp and
+    status; re-applying those can be rejected as a conflict. The restore must
+    strip them (and report the reconcile actually completed)."""
+    from pgbench_harness.ops.pmm import run_pmm_disable, run_pmm_enable
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    enable_id = _only_pmm_run_dir(pmmops, "pmm-enable").name
+    # the backup itself DOES contain the server-owned fields (raw truth)
+    backup = (_only_pmm_run_dir(pmmops, "pmm-enable") / "backup"
+              / "cr-cluster1.yaml").read_text()
+    assert "resourceVersion" in backup and '"status"' in backup
+    rc = run_pmm_disable(_pmm_ops_spec("pmm-disable", rollback_of=enable_id),
+                         pmmops)
+    assert rc == 0
+    st = _fake_state()
+    assert "resourceVersion" not in st["cr"]["metadata"]
+    assert "status" not in st["cr"]
+    assert "pmm" not in st["cr"]["spec"]
+    meta = json.loads((_only_pmm_run_dir(pmmops, "pmm-disable") / "meta.json")
+                      .read_text())
+    assert meta["headline"]["reconciled"] is True
+
+
+def test_pmm_token_whitespace_is_stripped(pmmops, monkeypatch):
+    """A pasted token with a trailing newline must not corrupt the Bearer
+    header/secret or trigger a bogus 'not glsa_' warning."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("PGB_PMM_TOKEN", "  glsa_padded_token_SENTINEL_42\n")
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable", dry_run=True), pmmops)
+    assert rc == 0
+    events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "does not start with 'glsa_'" not in events
+    assert "glsa_padded_token_SENTINEL_42" not in events
+
+
+def test_pmm_web_enable_mutex_blocks_second_destructive(opsweb, monkeypatch):
+    """Two enables can't be queued at once — the shared one-destructive-op
+    mutex rejects the second with a 409 while the first is still queued."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("PGB_PMM_TOKEN", PMM_TOKEN)
+    body = {"confirm": "cluster1",
+            "params": {"server_host": "http://127.0.0.1:9", "poll_s": 0.2,
+                       "rollout_timeout_s": 20, "discover_timeout_s": 10,
+                       "qan_timeout_s": 5}}
+    r1 = client.post(f"/api/kube-targets/{tid}/pmm/enable", json=body,
+                     auth=("admin", "apw"))
+    assert r1.status_code == 200, r1.text
+    r2 = client.post(f"/api/kube-targets/{tid}/pmm/enable", json=body,
+                     auth=("admin", "apw"))
+    assert r2.status_code == 409                      # queued job holds the mutex
+    # and a backup is blocked by the queued PMM enable too (shared tuple)
+    r3 = client.post(f"/api/kube-targets/{tid}/backup",
+                     json={"confirm": "cluster1", "params": {"type": "incr"}},
+                     auth=("admin", "apw"))
+    assert r3.status_code == 409
+    monkeypatch.setenv("FAKE_KUBE_RESTART_S", "0")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "0")
+    _drain_queue(cfg)                                 # first enable completes
+    run = _last_ops_run(client, "pmm-enable")
+    assert run["status"] in ("complete", "warning")
+
+
+def test_pmm_web_disable_rejects_traversal_rollback_id(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}/pmm/disable",
+                    json={"confirm": "cluster1",
+                          "params": {"rollback_of": "../../secrets"}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400 and "invalid id" in r.text

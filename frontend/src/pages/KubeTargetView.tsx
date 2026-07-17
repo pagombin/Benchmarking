@@ -594,12 +594,12 @@ export function KubeTargetView({ me }: { me: Me }) {
                 </select></div>
             </div>
             <button disabled={!pmmHost.trim()} onClick={() =>
-              launch("pmm/enable", { params: { ...pmmParams, dry_run: true } })}>
-              Dry-run (show plan)</button>{" "}
-            <button disabled={!pmmHost.trim()} onClick={() =>
               launch("pmm/status", { params: pmmParams })}>
               Check status (read-only)</button>{" "}
             {isAdmin && <>
+              <button disabled={!pmmHost.trim()} onClick={() =>
+                launch("pmm/enable", { params: { ...pmmParams, dry_run: true } })}>
+                Dry-run (show plan)</button>{" "}
               <button className="primary" disabled={!pmmHost.trim()} onClick={() =>
                 launch("pmm/enable", { confirm, params: pmmParams })}>
                 Enable PMM (rolls all pods)</button>{" "}
