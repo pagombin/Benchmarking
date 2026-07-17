@@ -27,7 +27,7 @@ def validate_yaml(spec_yaml: str) -> dict[str, Any]:
         spec = parse_spec(doc)
     except SpecError as exc:
         return {"ok": False, "error": str(exc), "hint": getattr(exc, "hint", "")}
-    return {"ok": True, "mode": "soak" if spec.is_soak else "sweep",
+    return {"ok": True, "mode": "soak" if spec.is_soak else "suite" if spec.is_suite else "sweep",
             "label": spec.run.label, "workload": spec.workload.type}
 
 

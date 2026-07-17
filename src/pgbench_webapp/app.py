@@ -323,7 +323,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
-        kind = "soak" if v["mode"] == "soak" else "run"
+        kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
         job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
                                      scheduled_utc=payload.get("scheduled_utc") or None)
         password = payload.get("password")
@@ -615,7 +615,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     _CSV_FILES = {"samples": "parsed/samples.csv",
                   "timeseries": "parsed/soak_timeseries.csv",
-                  "pg": "parsed/pg_timeseries.csv"}
+                  "pg": "parsed/pg_timeseries.csv",
+                  "device": "parsed/device_io.csv"}
 
     @app.get("/runs/{run_id}/csv")
     def run_csv(run_id: str, which: str = "samples",

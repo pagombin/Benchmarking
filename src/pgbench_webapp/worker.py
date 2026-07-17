@@ -170,7 +170,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                         early_run_id = rid
                         queries.update_job(conn, job["id"], run_id=rid)
                         ops_support.index_ops_run(cfg, conn, rid, job)
-                if early_run_id is None and kind in ("run", "soak"):
+                if early_run_id is None and kind in ("run", "soak", "suite"):
                     rid = _parse_run_id(red, cfg.results_dir)
                     if rid:
                         early_run_id = rid
@@ -193,7 +193,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         # to the new manifest-bearing dir, then to the resume dir.
         # preflight/prepare/doctor/ops_validate/ops_discover never set a run_id.
         run_id: Optional[str] = None
-        if kind in ("run", "soak"):
+        if kind in ("run", "soak", "suite"):
             run_id = _parse_run_id("".join(head), cfg.results_dir)
             if run_id is None:
                 new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
@@ -248,7 +248,7 @@ def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
                       detail="worker finished job")
     except Exception:  # noqa: BLE001
         pass
-    if job["kind"] not in ("run", "soak"):
+    if job["kind"] not in ("run", "soak", "suite"):
         return   # don't email/Slack for preflight/prepare/doctor health checks
     try:
         from pgbench_webapp import notify as _n
