@@ -2,6 +2,21 @@
 
 ## Unreleased — IOPS ceiling verification framework
 
+- **Single pane of glass**: the whole framework runs from the console. New
+  Run gains a **suite mode** form (ladder/duration/pgbench toggle), an
+  **io_stress** workload form (dataset_gb / mix / key distribution), and
+  **rate steps** on soak; an "Attach cluster" selector lists the registered
+  Kube Targets — attaching one makes the worker inject that target's
+  kubeconfig AND auto-synthesizes the spec's `cluster:` section from the
+  registry, so storage identity + the device-IOPS series are captured with
+  zero YAML editing. The cluster page gains an **IOPS evidence** quick-launch
+  card (suite / rate-stepped, pre-attached). The run page shows the
+  **verdict banner** (capped / exceeds / inconclusive) served by the new
+  `/api/runs/{id}/evidence` endpoint, next to the existing bundle download.
+  Device-probe specs submit through New Run too (admin-only, requires an
+  attached cluster, plus the in-spec `allow_device_probe` arming the runner
+  enforces); web dry-run renders suite and probe plans.
+
 - **New run modes**: `suite` (the storage team's full evidentiary matrix —
   oltp_point_select / read_only / read_write / write_only + pgbench TPC-B and
   SELECT-only across a thread ladder, sequential segments, one consolidated
