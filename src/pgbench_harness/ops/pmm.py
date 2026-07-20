@@ -83,6 +83,16 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
                       "environment — it never goes in the spec")
         return None
     get_redactor().register(token)
+    # a non-reversible fingerprint so operators can compare what the worker
+    # actually loaded against their shell without ever printing the token:
+    #   printf %s "$PGB_PMM_TOKEN" | sha256sum
+    import hashlib
+    fp = hashlib.sha256(token.encode()).hexdigest()[:12]
+    run.event("preflight", f"PMM token loaded (sha256 {fp}…, {len(token)} chars)",
+              'compare with: printf %s "$PGB_PMM_TOKEN" | sha256sum — a '
+              "mismatch means the worker's secrets file differs from your "
+              "shell (edit /etc/pgbench-harness.secrets.env, then restart "
+              "pgbench-worker)")
     if not token.startswith("glsa_"):
         run.event("preflight", "token does not start with 'glsa_'",
                   "PMM3 service-account tokens normally do — continuing anyway")

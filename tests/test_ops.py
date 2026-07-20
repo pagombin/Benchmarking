@@ -2159,6 +2159,10 @@ def test_pmm_token_whitespace_is_stripped(pmmops, monkeypatch):
     events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
     assert "does not start with 'glsa_'" not in events
     assert "glsa_padded_token_SENTINEL_42" not in events
+    # fingerprint of the STRIPPED token, for shell comparison — never the token
+    import hashlib
+    fp = hashlib.sha256(b"glsa_padded_token_SENTINEL_42").hexdigest()[:12]
+    assert f"sha256 {fp}" in events and "29 chars" in events
 
 
 def test_pmm_web_enable_mutex_blocks_second_destructive(opsweb, monkeypatch):
