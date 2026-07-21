@@ -188,6 +188,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(429, "too many login attempts; wait a few minutes")
         row = queries.get_user(conn, username)
         if not row or row["disabled"] or not verify_password(password, row["pw_hash"]):
+            # bound the tracker: prune expired entries across ALL ips (a
+            # scanner rotating source addresses grew this dict without limit)
+            if len(_LOGIN_ATTEMPTS) > 1000:
+                for k in [k for k, v in _LOGIN_ATTEMPTS.items()
+                          if not any(now - t < LOGIN_WINDOW_S for t in v)]:
+                    _LOGIN_ATTEMPTS.pop(k, None)
             _LOGIN_ATTEMPTS[ip] = attempts + [now]
             queries.audit(conn, username, "login_failed", detail=f"ip={ip}")
             return page(request, "login.html", None, error="Invalid credentials")
