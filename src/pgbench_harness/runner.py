@@ -713,6 +713,7 @@ def _soak_supervisor(
     seg = relaunches = total_intervals = 0
     consecutive_short = consecutive_zero_sample = 0
     prev_rate_idx = -1
+    forced_step_idx = 0
     disk_warned: dict = {}
     last_excerpt = ""
 
@@ -750,9 +751,11 @@ def _soak_supervisor(
             if soak.rate_steps:
                 elapsed = soak.duration_s - remaining
                 idx = min(elapsed // soak.step_duration_s, len(soak.rate_steps) - 1)
+                idx = max(idx, forced_step_idx)      # steps proven unachievable are skipped
                 rate = soak.rate_steps[idx]
                 seg_time = max(1, min(remaining,
-                                      (idx + 1) * soak.step_duration_s - elapsed))
+                                      (idx + 1) * soak.step_duration_s - elapsed,
+                                      soak.step_duration_s))
             seg += 1
             _disk_guard(run_dir, logger, disk_warned)
             if soak.rate_steps and idx != prev_rate_idx:
@@ -791,6 +794,29 @@ def _soak_supervisor(
                              "finished_utc": _iso_micros(), "exit_code": rc,
                              "intervals": n_intervals, "timed_out": timed_out,
                              "error_excerpt": excerpt})
+            # Rate-stepped mode: sysbench's "event queue is full" is not an
+            # outage — it is the deterministic answer "offered >> achievable"
+            # (each --rate event is a whole transaction; workers at this
+            # concurrency cannot keep up). That IS the knee-finder's datum:
+            # record it and ADVANCE the ladder instead of relaunching into
+            # the same doomed step for its whole window (the failure mode
+            # that burned max_relaunches in the field).
+            if soak.rate_steps and rc != 0 and excerpt \
+                    and "event queue is full" in excerpt.lower():
+                _append_event(run_dir, "note",
+                              f"rate step {idx + 1}/{len(soak.rate_steps)} "
+                              f"unachievable: offered {rate} tps exceeds worker "
+                              "capacity at this concurrency — the knee is "
+                              "below this rate",
+                              "sysbench: event queue full (deterministic, not "
+                              "an outage) — advancing to the next step", "auto")
+                logger.warning("soak: rate step %d (%s tps) unachievable — "
+                               "advancing the ladder", idx + 1, rate)
+                forced_step_idx = idx + 1
+                if forced_step_idx >= len(soak.rate_steps):
+                    logger.error("soak: every remaining rate step exceeds "
+                                 "worker capacity; ending the ladder early.")
+                    break
             manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
             manifest.save(run_dir)
             total_intervals += n_intervals
