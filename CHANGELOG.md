@@ -37,6 +37,30 @@
 - **soak.report_interval_s must be 1**: the downtime/TTR model is strictly
   per-second dense; any coarser interval scored ~(1-1/N) of a flawless run
   as outage. Explicitly rejected now.
+- **Worker: recycled PIDs can no longer be adopted** — orphan reattach and
+  Cancel now verify process identity via /proc start time, not just
+  os.kill(pid,0): after a droplet reboot a recycled pid used to become a
+  phantom "running" job that starved the queue, and Cancel could SIGKILL an
+  unrelated process group. A non-UTF-8 byte in child output no longer
+  abandons a live benchmark (errors=replace), and any worker-side failure
+  now terminates the benchmark process group instead of orphaning it with
+  the job marked failed.
+- **Worker: decrypted kubeconfig copies are swept** — a worker restart
+  mid-job skipped the normal cleanup, leaving the plaintext kubeconfig on
+  disk indefinitely; startup now sweeps copies whose job is no longer
+  running, and reattach convergence unlinks its own.
+- **Cockpit stream correctness**: the live-CSV tail detects the harness's
+  atomic finalize/resume rewrite by inode and tells the client to rebuild
+  (was: torn rows or thousands of duplicate points in the "final" chart);
+  CRLF row terminators are stripped; the task-output stream tails by byte
+  offset (was O(file) per second) and drains the final lines that land
+  with the terminal state flip (they used to vanish).
+- **Web tier**: run artifact downloads spool to disk instead of building
+  a potentially multi-GB tar.gz in RAM; /runs/{id}/provider-metrics gets
+  the same traversal guard as every other run route; SSE streams no longer
+  pin an unused SQLite connection for their lifetime; malformed
+  kube_target_id / scheduled_utc are clean 400s (a bad scheduled_utc used
+  to make the job silently permanently ineligible).
 
 ## Unreleased — device-probe iteration (field fixes from the first live probe)
 
