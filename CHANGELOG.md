@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — bug bash round 5 (whole-harness adversarial review)
+
+- **Knee-finder ladder accounting rewritten**: after a queue-full skip the
+  ladder REBASES (the forced step gets its full window anchored at the next
+  segment's start) instead of being re-derived from wall-clock — the old
+  math re-ran the forced step and booked a spurious relaunch per healthy
+  re-run, which burned max_relaunches, forced "partial" status and polluted
+  the report with fake restart events. Relaunch accounting now keys on the
+  previous segment's actual outcome: a crash landing past a step boundary
+  counts (it used to evade the budget), a healthy completion never does,
+  and queue-full skips are a datum, not an outage. Queue-full detection
+  scans the whole segment log (the 5-line excerpt could bury it).
+- **Soaks are stoppable**: a PID-directed SIGTERM only set a flag that was
+  checked between segments — a single-segment week-long soak would ignore
+  it for days. The handler now terminates the current load generator so
+  the partial-report finalize runs immediately.
+- **Disk guard now guards**: the free-space check ran once per segment —
+  once at t=0 for a healthy non-stepped soak. It now re-checks every ~60s
+  during the stream and cleanly aborts (results-so-far intact) instead of
+  hitting ENOSPC days in; and a harness-side tee failure (ENOSPC on the
+  log write) kills the child instead of orphaning a load generator that
+  keeps hammering the target for up to --time.
+- **Suite aborts keep the completed cells**: SIGTERM/Ctrl-C mid-matrix (and
+  a pgbench-init failure) finalize the real per-level status (partial, not
+  failed-wholesale), emit the bundle best-effort, and no longer leave the
+  manifest stuck 'running' with an orphaned child. run/suite post-
+  processing (parse + report) is best-effort after a completed run — a
+  report bug can no longer flip a multi-day result into a failed job.
+- **Parsers**: numeric regexes no longer accept malformed tokens ("12..3"
+  from a torn log splice crashed finalize); pgbench "lat NaN" progress
+  lines (a stalled interval — exactly the sample not to lose) parse as 0.
+- **Watchdog grace capped** at 15 min (was duration/2 — 12h tolerance for a
+  hung child in a 24h cell); a typo'd PGB_LEVEL_WATCHDOG_GRACE_S is ignored
+  instead of crashing at level start.
+- **soak.report_interval_s must be 1**: the downtime/TTR model is strictly
+  per-second dense; any coarser interval scored ~(1-1/N) of a flawless run
+  as outage. Explicitly rejected now.
+
 ## Unreleased — device-probe iteration (field fixes from the first live probe)
 
 - **Device probe is now a first-class New Run mode** (admin-only): threads,
