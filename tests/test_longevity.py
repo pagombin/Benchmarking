@@ -284,3 +284,18 @@ def test_sse_stream_serves_running_run_incrementally(tmp_path):
     assert payload["reset"] is True
     assert len(payload["rows"]) == SSE_BACKFILL_ROWS   # capped, not 22k+
     assert payload["offset"] == 500                    # where the window starts
+
+
+def test_cluster_target_mismatch_cross_check():
+    """Attaching kube cluster A while SQL-targeting cluster B must be called
+    out — the device series would measure an idle cluster."""
+    from pgbench_harness.runner import cluster_target_mismatch
+    from pgbench_harness.spec import parse_spec
+    doc = make_spec_doc()
+    doc["target"]["host"] = "adv-pg-bm-ehuff-1-bawya.db1.ondigitalocean.com"
+    doc["cluster"] = {"cr_name": "adv-pg-bm-ehuff-1"}
+    assert cluster_target_mismatch(parse_spec(doc)) == ""      # same cluster
+    doc["cluster"] = {"cr_name": "adv-pgsql-30gsmal-nyc3-50415"}
+    msg = cluster_target_mismatch(parse_spec(doc))
+    assert "IDLE cluster" in msg and "SAME cluster" in msg     # cross-wired
+    assert cluster_target_mismatch(parse_spec(make_spec_doc())) == ""

@@ -1071,12 +1071,40 @@ def cmd_report(run_dir: Path) -> int:
 
 # ── IOPS ceiling verification: observation, suite mode, device probe ──
 
+def cluster_target_mismatch(spec: Spec) -> str:
+    """Warn when the attached cluster doesn't look like the SQL target: the
+    device series would measure an IDLE cluster while the load runs elsewhere
+    — silently poisoned evidence. DO hostnames normally embed the cluster
+    name, so a non-match is suspicious (still a warning: private hostnames
+    can legitimately differ)."""
+    if spec.cluster is None:
+        return ""
+    cr = spec.cluster.cr_name.lower()
+    host = spec.target.host.lower()
+    if cr and cr not in host:
+        return (f"attached cluster '{spec.cluster.cr_name}' does not appear in "
+                f"the SQL target host '{spec.target.host}' — if these are "
+                "different clusters, the device-IOPS series and storage "
+                "identity will describe an IDLE cluster while the load runs "
+                "elsewhere, and the verdict will be meaningless. Double-check "
+                "the connection profile and the attached cluster refer to the "
+                "SAME cluster.")
+    return ""
+
+
 def _start_observation(spec: Spec, run_dir: Path, logger: logging.Logger):
     """Cluster-aware evidence capture: storage identity + 1s device sampler.
     Pure-SQL runs (no cluster: section) skip this entirely; any failure is a
     recorded warning, never a run failure."""
     if spec.cluster is None:
         return None
+    mism = cluster_target_mismatch(spec)
+    if mism:
+        logger.warning("cluster/target cross-check: %s", mism)
+        wpath = run_dir / "env" / "device_io_warning.txt"
+        wpath.parent.mkdir(parents=True, exist_ok=True)
+        with open(wpath, "a", encoding="utf-8") as fh:
+            fh.write(f"{utc_now_iso()} {mism}\n")
     from pgbench_harness import deviceio
     try:
         ident = deviceio.capture_storage_identity(spec, run_dir, logger)
