@@ -1148,7 +1148,9 @@ def _finish_evidence(run_dir: Path, spec: Spec, logger: logging.Logger) -> Optio
     from pgbench_harness import deviceio, evidence
     try:
         rows = deviceio.derive_device_series(run_dir)
-        verdict = deviceio.compute_verdict(rows, spec.limits) if spec.cluster else None
+        verdict = deviceio.compute_verdict(
+            rows, spec.limits,
+            deviceio.load_event_markers(run_dir)) if spec.cluster else None
         doc = evidence.build_evidence(run_dir, spec, verdict)
         if verdict:
             line = f"IOPS verdict: {verdict['finding'].upper()} — {verdict['detail']}"

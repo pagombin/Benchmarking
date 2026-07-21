@@ -31,6 +31,18 @@ from pgbench_harness.util import (atomic_write_json, atomic_write_text,
 
 PROBE_DIR = "pgb-fileio-probe"          # all test files live under /pgdata/<this>
 
+
+def _mark(run_dir: Path, label: str, note: str = "") -> None:
+    """Stamp a probe phase into events.jsonl — the verdict attributes its
+    sustained-peak window to these markers (a peak during 'fileio run' is
+    ceiling evidence; during prepare or the end-of-run flush it is not)."""
+    ev = {"ts_utc": utc_now_iso(), "type": "phase", "label": label,
+          "note": note, "source": "device-probe"}
+    path = run_dir / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(ev) + "\n")
+
 FILEIO_RESULT_RES = {
     "reads_s": re.compile(r"reads/s:\s+([\d.]+)"),
     "writes_s": re.compile(r"writes/s:\s+([\d.]+)"),
@@ -253,17 +265,26 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
         else:
             logger.info("fileio prepare (%.0fG in %d files) ...",
                         dp.file_total_size_gb, dp.file_num)
+            _mark(run_dir, "fileio prepare",
+                  f"{dp.file_total_size_gb:g}G in {dp.file_num} files "
+                  "(sequential writes — a different IO regime than the run)")
             res = kube.exec(pod_name, "fileio", sh(["prepare"]),
                             timeout_s=3600, check=True)
             atomic_write_text(run_dir / "raw" / "fileio_prepare.log", res.stdout)
         t0 = utc_now_iso()
         logger.info("fileio run: %s for %ds x%d threads ...",
                     dp.test_mode, dp.duration_s, dp.threads)
+        _mark(run_dir, "fileio run",
+              f"{dp.test_mode} x{dp.threads} threads, backlog "
+              f"{dp.async_backlog}, {dp.block_size_kb}K blocks; sysbench "
+              "fsyncs all files at exit, so the tail of this window is a "
+              "writeback flush, not steady-state random IO")
         res = kube.exec(pod_name, "fileio",
                         sh([f"--time={dp.duration_s}", "--report-interval=1",
                             "run"]),
                         timeout_s=float(dp.duration_s + 300), check=True)
         atomic_write_text(run_dir / "raw" / "fileio_run.log", res.stdout)
+        _mark(run_dir, "fileio done", "load stopped; anything after is idle")
         result = parse_fileio_result(res.stdout)
         if "iops" not in result:
             # sysbench build printed an unrecognized summary format (field
@@ -304,7 +325,8 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
     manifest.finished_utc = utc_now_iso()
     manifest.save(run_dir)
     rows = deviceio.derive_device_series(run_dir)
-    verdict = deviceio.compute_verdict(rows, spec.limits)
+    verdict = deviceio.compute_verdict(rows, spec.limits,
+                                       deviceio.load_event_markers(run_dir))
     evidence.build_evidence(run_dir, spec, verdict)
     report_evidence.generate_evidence_report(run_dir)
     line = f"IOPS verdict: {verdict['finding'].upper()} — {verdict['detail']}"

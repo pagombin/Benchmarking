@@ -182,6 +182,62 @@ def test_verdict_three_ways():
     assert v["finding"] == "inconclusive" and "no device series" in v["detail"]
 
 
+def test_verdict_peak_window_is_stamped_and_attributed():
+    """The verdict must say WHEN the sustained peak happened and which phase
+    produced it — a 12K burst during the end-of-run flush must not be read as
+    the random-IO ceiling (first live EXCEEDS was exactly this ambiguity)."""
+    from pgbench_harness.deviceio import compute_verdict
+    from pgbench_harness.spec import Limits
+    base = 1_770_000_000_000                        # some real epoch ms
+    rows = []
+    for i in range(60):                             # 0-29s quiet, 30-59s hot
+        iops = 3000.0 if i < 30 else 22000.0
+        rows.append({"t_epoch_ms": base + i * 1000, "reads_s": iops * 0.6,
+                     "writes_s": iops * 0.4, "iops": iops, "read_mb_s": 90.0,
+                     "write_mb_s": 60.0, "await_ms": 2.0, "util_pct": 99.0,
+                     "queue_depth": 80.0})
+    events = [(float(base), "fileio prepare"),
+              (float(base + 30_000), "fileio run")]
+    v = compute_verdict(rows, Limits(), events)
+    assert v["finding"] == "exceeds"
+    assert v["peak_during"] == "fileio run"
+    assert "during 'fileio run'" in v["detail"]
+    assert "peak window" in v["detail"]
+    # the stamped window must sit inside the hot phase
+    assert v["peak_window_start_utc"] >= "2026"     # ISO, sortable
+    from datetime import datetime, timezone
+    start = datetime.strptime(v["peak_window_start_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    hot0 = datetime.fromtimestamp((base + 30_000) / 1000, tz=timezone.utc)
+    assert start.replace(tzinfo=timezone.utc) >= hot0
+    # without events the window is still stamped, just unattributed
+    v2 = compute_verdict(rows, Limits())
+    assert "peak window" in v2["detail"] and "peak_during" not in v2
+    # a peak butting against the next phase marker is flagged as a possible
+    # flush/transition burst (the live 12.5K end-of-run fsync case); a peak
+    # mid-phase is not
+    ev3 = events + [(float(base + 60_000), "fileio done")]
+    v3 = compute_verdict(rows, Limits(), ev3)
+    assert "peak_at_phase_tail" not in v3        # peak starts at 30s, mid-phase
+    tail_rows = []
+    for i in range(60):                          # hot only in the last 12s
+        iops = 3000.0 if i < 48 else 22000.0
+        tail_rows.append(dict(rows[i], iops=iops))
+    v4 = compute_verdict(tail_rows, Limits(), ev3)
+    assert v4.get("peak_at_phase_tail") is True
+    assert "at its tail" in v4["detail"]
+
+
+def test_probe_run_stamps_phase_events(tmp_path):
+    """load_event_markers round-trips what deviceprobe._mark writes."""
+    from pgbench_harness.deviceio import load_event_markers
+    from pgbench_harness.deviceprobe import _mark
+    _mark(tmp_path, "fileio prepare", "100G")
+    _mark(tmp_path, "fileio run", "rndrw x64")
+    marks = load_event_markers(tmp_path)
+    assert [m[1] for m in marks] == ["fileio prepare", "fileio run"]
+    assert marks[0][0] <= marks[1][0]
+
+
 def test_device_series_derivation_from_diskstats_stream(tmp_path):
     from pgbench_harness.deviceio import derive_device_series
     raw = tmp_path / "raw"

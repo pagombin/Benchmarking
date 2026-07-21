@@ -2,6 +2,17 @@
 
 ## Unreleased — device-probe iteration (field fixes from the first live probe)
 
+- **Verdicts say WHEN and DURING WHAT**: the first live EXCEEDS verdict
+  (12,540 IOPS sustained) turned out to sit in sysbench's end-of-run fsync
+  flush — a large-write regime — while the steady random phase served
+  ~7.4K; only PMM could show that. The verdict now stamps the sustained-
+  peak window's UTC timestamps and attributes it to the phase event that
+  contains it ("[peak window 04:36:41–04:36:51 UTC, during 'fileio run']"),
+  and the device probe stamps its phases (prepare / run / done) into
+  events.jsonl like every other run mode already did. A peak that butts
+  against the next phase marker is additionally flagged as a possible
+  flush/transition burst.
+
 - **`device_probe.keep_files`**: preparing the fileio test set took ~5 min
   for 100 GB on the live cluster and was repeated on every probe run. With
   `keep_files: true` the probe skips prepare when the files already exist
