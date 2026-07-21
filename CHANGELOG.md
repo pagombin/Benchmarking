@@ -2,6 +2,15 @@
 
 ## Unreleased — device-probe iteration (field fixes from the first live probe)
 
+- **Device probe is now a first-class New Run mode** (admin-only): threads,
+  async backlog, IO pattern (rndrw/rndrd/rndwr), duration, file geometry and
+  keep-files are form fields — no more pasting YAML. Cluster pages
+  quick-launch all three patterns with the cluster pre-attached, and the
+  form refuses to submit without an attached cluster. The knee-finder's
+  seeded rate ladder now starts low (100…2000, 0) — unachievable steps skip
+  forward, but a ladder that opens far beyond capacity wastes its first
+  segments.
+
 - **Verdicts say WHEN and DURING WHAT**: the first live EXCEEDS verdict
   (12,540 IOPS sustained) turned out to sit in sysbench's end-of-run fsync
   flush — a large-write regime — while the steady random phase served
