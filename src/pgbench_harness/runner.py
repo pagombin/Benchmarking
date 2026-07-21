@@ -1469,3 +1469,17 @@ def cmd_device_probe(spec_path: Path, results_dir: Path, dry_run: bool = False) 
                        hint="add device_probe: {allow_device_probe: true, ...} "
                             "plus a cluster: section — TEST CLUSTERS ONLY.")
     return deviceprobe.run_device_probe(spec, results_dir, dry_run=dry_run)
+
+
+def cmd_evidence_pack(spec_path: Path, results_dir: Path,
+                      dry_run: bool = False) -> int:
+    """`evidence-pack` subcommand: the core four device probes as one job
+    plus a consolidated storage-team narrative (see evidencepack.py)."""
+    from pgbench_harness import evidencepack
+    spec = load_spec(spec_path)
+    if spec.device_probe is None:
+        raise RunError("this spec has no 'device_probe' section",
+                       hint="add device_probe: {allow_device_probe: true, "
+                            "pack: true, ...} plus a cluster: section — "
+                            "TEST CLUSTERS ONLY.")
+    return evidencepack.run_evidence_pack(spec, results_dir, dry_run=dry_run)

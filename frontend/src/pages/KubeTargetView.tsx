@@ -646,7 +646,9 @@ export function KubeTargetView({ me }: { me: Me }) {
               <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndrd`}>
                 Probe: read ceiling (rndrd)</Link>{" "}
               <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndwr`}>
-                Probe: write ceiling (rndwr)</Link>
+                Probe: write ceiling (rndwr)</Link>{" "}
+              <Link className="btn primary" to={`/new?cluster=${targetId}&mode=evidence-pack`}>
+                Evidence pack (core 4 + narrative, ~45 min)</Link>
             </>
           ) : (
             <span className="subtle" style={{ fontSize: 12 }}>

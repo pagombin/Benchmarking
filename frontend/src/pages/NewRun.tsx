@@ -48,7 +48,7 @@ export function NewRun({ me }: { me: Me }) {
   const [wl, setWl] = useState({ type: "tpcc", tpcc_path: "/opt/sysbench-tpcc", tables: 10, scale: 30, table_size: 1000000, dataset_gb: 64, mix: "mixed", rand_type: "uniform" });
   const [mode, setMode] = useState<"sweep" | "soak" | "suite" | "probe">("sweep");
   const [suite, setSuite] = useState({ duration_s: 300, threads: "1, 2, 4, 8, 16, 32", warmup_s: 30, cooldown_s: 30, pgbench: true, pgbench_scale: 1000 });
-  const [probe, setProbe] = useState({ threads: 64, async_backlog: 256, test_mode: "rndrw", duration_s: 600, file_num: 128, file_total_size_gb: 100, keep_files: true });
+  const [probe, setProbe] = useState({ threads: 64, async_backlog: 256, test_mode: "rndrw", duration_s: 600, file_num: 128, file_total_size_gb: 100, keep_files: true, direct_io: true, pack: false });
   const [rateSteps, setRateSteps] = useState("");          // soak-only, optional
   const [stepDur, setStepDur] = useState(180);
   const [sweep, setSweep] = useState({ threads: "1, 4, 16, 64", duration_s: 300, warmup_s: 60, cooldown_s: 30, repetitions: 1 });
@@ -87,6 +87,10 @@ export function NewRun({ me }: { me: Me }) {
       const variant = params.get("variant") || "";
       if (["rndrw", "rndrd", "rndwr"].includes(variant))
         setProbe((p) => ({ ...p, test_mode: variant }));
+    }
+    if (wantMode === "evidence-pack") {
+      setMode("probe"); setWl((w) => ({ ...w, type: "io_stress" }));
+      setProbe((p) => ({ ...p, pack: true, threads: 128, keep_files: false }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -131,6 +135,8 @@ export function NewRun({ me }: { me: Me }) {
         async_backlog: probe.async_backlog, test_mode: probe.test_mode,
         fsync_freq: 0, threads: probe.threads, duration_s: probe.duration_s,
         ...(probe.keep_files ? { keep_files: true } : {}),
+        ...(probe.direct_io ? { direct_io: true } : {}),
+        ...(probe.pack ? { pack: true } : {}),
       };
     } else d.sweep = {
       threads: ladder(sweep.threads),
@@ -315,19 +321,26 @@ export function NewRun({ me }: { me: Me }) {
               <div className="row">
                 <div className="field"><label>Threads</label><input type="number" value={probe.threads} onChange={(e) => setProbe({ ...probe, threads: Number(e.target.value) })} /></div>
                 <div className="field"><label>Async backlog (per-thread queue)</label><input type="number" value={probe.async_backlog} onChange={(e) => setProbe({ ...probe, async_backlog: Number(e.target.value) })} /></div>
-                <div className="field"><label>IO pattern</label>
-                  <select value={probe.test_mode} onChange={(e) => setProbe({ ...probe, test_mode: e.target.value })}>
-                    <option value="rndrw">rndrw — mixed random</option>
-                    <option value="rndrd">rndrd — pure random read</option>
-                    <option value="rndwr">rndwr — pure random write</option>
-                  </select></div>
+                {!probe.pack ? (
+                  <div className="field"><label>IO pattern</label>
+                    <select value={probe.test_mode} onChange={(e) => setProbe({ ...probe, test_mode: e.target.value })}>
+                      <option value="rndrw">rndrw — mixed random</option>
+                      <option value="rndrd">rndrd — pure random read</option>
+                      <option value="rndwr">rndwr — pure random write</option>
+                    </select></div>
+                ) : (
+                  <div className="field"><label>IO patterns</label>
+                    <input value="rndrd 16K · rndrd 8K · rndwr 16K ×2" disabled /></div>
+                )}
               </div>
               <div className="row">
                 <div className="field"><label>Duration (s)</label><input type="number" value={probe.duration_s} onChange={(e) => setProbe({ ...probe, duration_s: Number(e.target.value) })} /></div>
                 <div className="field"><label>Test files total (GiB)</label><input type="number" value={probe.file_total_size_gb} onChange={(e) => setProbe({ ...probe, file_total_size_gb: Number(e.target.value) })} /></div>
                 <div className="field"><label>File count</label><input type="number" value={probe.file_num} onChange={(e) => setProbe({ ...probe, file_num: Number(e.target.value) })} /></div>
               </div>
-              <div className="field"><label><input type="checkbox" checked={probe.keep_files} onChange={(e) => setProbe({ ...probe, keep_files: e.target.checked })} />&nbsp;Keep test files between probes (skip the multi-minute prepare when iterating; run once unchecked — or delete <code>/pgdata/pgb-fileio-probe</code> — to reclaim the space)</label></div>
+              <div className="field"><label><input type="checkbox" checked={probe.pack} onChange={(e) => setProbe({ ...probe, pack: e.target.checked })} />&nbsp;<b>Evidence pack</b>: run the core four probes (rndrd 16K, rndrd 8K, rndwr 16K ×2 replication — all O_DIRECT) as one job and emit a consolidated storage-team narrative with fresh numbers (~4× duration + one prepare)</label></div>
+              {!probe.pack && <div className="field"><label><input type="checkbox" checked={probe.direct_io} onChange={(e) => setProbe({ ...probe, direct_io: e.target.checked })} />&nbsp;Direct IO (O_DIRECT — bypasses the node page cache so sysbench and device counters agree; recommended)</label></div>}
+              <div className="field"><label><input type="checkbox" checked={probe.keep_files} onChange={(e) => setProbe({ ...probe, keep_files: e.target.checked })} />&nbsp;Keep test files {probe.pack ? "after the pack" : "between probes"} (skip the multi-minute prepare when iterating; run once unchecked — or delete <code>/pgdata/pgb-fileio-probe</code> — to reclaim the space)</label></div>
               <p className="subtle" style={{ fontSize: 12 }}>
                 Runs sysbench fileio from a pod pinned to the primary&apos;s node,
                 mounting the pgdata PVC directly — Postgres&apos;s synchronous read

@@ -361,16 +361,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
-        if v["mode"] == "device-probe":
+        if v["mode"] in ("device-probe", "evidence-pack"):
             # destructive-adjacent: saturates the pgdata volume. Admin + the
             # in-spec arming flag (the runner refuses without it anyway).
             if user["role"] != "admin":
-                raise HTTPException(403, "device-probe runs are admin-only")
+                raise HTTPException(403, f"{v['mode']} runs are admin-only")
             if kube_target_id is None:
-                raise HTTPException(400, "device-probe needs kube_target_id "
+                raise HTTPException(400, f"{v['mode']} needs kube_target_id "
                                          "(the cluster whose kubeconfig the "
                                          "worker injects)")
-            kind = "device_probe"
+            kind = ("evidence_pack" if v["mode"] == "evidence-pack"
+                    else "device_probe")
         else:
             kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
         scheduled = payload.get("scheduled_utc") or None

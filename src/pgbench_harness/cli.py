@@ -70,6 +70,15 @@ def _build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--dry-run", action="store_true",
                     help="print the pod plan + fileio commands, then exit")
 
+    ep = sub.add_parser("evidence-pack",
+                        help="the core four device probes (rndrd 16K/8K, "
+                             "rndwr 16K x2, all O_DIRECT) as one job + a "
+                             "consolidated narrative (TEST CLUSTERS ONLY)")
+    ep.add_argument("--spec", required=True, type=Path)
+    ep.add_argument("--results-dir", type=Path, default=Path("results"))
+    ep.add_argument("--dry-run", action="store_true",
+                    help="print the four probe plans, then exit")
+
     sk = sub.add_parser("soak", help="fixed-concurrency resilience run (failover/scale) + report")
     sk.add_argument("--spec", required=True, type=Path)
     sk.add_argument("--results-dir", type=Path, default=Path("results"))
@@ -193,6 +202,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from pgbench_harness.runner import cmd_device_probe
             return cmd_device_probe(args.spec, args.results_dir,
                                     dry_run=args.dry_run)
+        if args.command == "evidence-pack":
+            from pgbench_harness.runner import cmd_evidence_pack
+            return cmd_evidence_pack(args.spec, args.results_dir,
+                                     dry_run=args.dry_run)
         if args.command == "soak":
             from pgbench_harness.runner import cmd_soak
             return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run,

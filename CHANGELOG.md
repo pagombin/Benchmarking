@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — one-click IOPS evidence pack
+
+- **`evidence-pack`**: the core four device probes (rndrd 16K, rndrd 8K,
+  rndwr 16K ×2 replication — all O_DIRECT, files prepared once) as a
+  single job, from the CLI, a spec (`device_probe.pack: true`), or one
+  click on a cluster page. Emits `pack_report.md` — a consolidated,
+  storage-team-ready narrative with fresh numbers: steady ceilings per
+  pattern (device-measured, Little's-law-consistent), block-size
+  dependence, the replication delta, a burst-tier check against the
+  spec'd limits, and the volume's provisioning identity (StorageClass
+  parameters + backend volume_id). Child probes remain normal,
+  individually browsable runs; a dead child is recorded as a hole and
+  the pack continues. Admin-only via the web, same guardrails as the
+  device probe.
+
 ## Unreleased — hotfix: error paths crashed on KubeResult.rc
 
 - Field crash: the device probe's new exec-death salvage path (and the

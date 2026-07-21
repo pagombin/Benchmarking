@@ -487,7 +487,17 @@ evidence" card quick-launches the suite, the knee finder, and (admin-only)
 the device probe in its three patterns — mixed `rndrw`, pure-read `rndrd`,
 pure-write `rndwr` — with the cluster pre-attached; New Run's
 `device probe` mode exposes threads / async backlog / pattern / duration /
-file geometry / keep-files as form fields.
+file geometry / keep-files / direct-IO as form fields.
+
+**One-click evidence pack** (`pgbench-harness evidence-pack --spec
+examples/evidence-pack.yaml`, or the "Evidence pack" button on a cluster
+page): runs the core four probes — rndrd 16K, rndrd 8K (database page
+size), rndwr 16K, and a rndwr replication — all O_DIRECT, files prepared
+once, as a single job, then emits `pack_report.md`: a consolidated,
+storage-team-ready narrative with fresh numbers (steady ceilings per
+pattern, block-size dependence, replication delta, burst check, and the
+volume's provisioning identity including the backend volume_id). Each
+probe is also a normal, individually browsable run with its own bundle.
 
 Every mode ends with a printed **verdict** judged against the spec's
 `limits:` (recorded, never hardcoded): **capped** (sustained plateau within

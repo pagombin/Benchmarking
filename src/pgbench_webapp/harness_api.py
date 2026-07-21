@@ -33,6 +33,8 @@ def validate_yaml(spec_yaml: str) -> dict[str, Any]:
         mode = "suite"
     elif spec.sweep is not None:
         mode = "sweep"
+    elif spec.device_probe is not None and spec.device_probe.pack:
+        mode = "evidence-pack"
     else:
         mode = "device-probe"
     return {"ok": True, "mode": mode, "label": spec.run.label,
@@ -63,9 +65,16 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
                             + max(0, n - 1) * spec.suite.cooldown_s,
                 "commands": lines}
     if spec.device_probe is not None and spec.sweep is None and spec.soak is None:
-        from pgbench_harness.deviceprobe import run_device_probe
         import contextlib, io as _io
         buf = _io.StringIO()
+        if spec.device_probe.pack:
+            from pgbench_harness.evidencepack import PACK_VARIANTS, run_evidence_pack
+            with contextlib.redirect_stdout(buf):
+                run_evidence_pack(spec, Path("."), dry_run=True)
+            return {"mode": "evidence-pack",
+                    "budget_s": len(PACK_VARIANTS) * spec.device_probe.duration_s,
+                    "commands": buf.getvalue().splitlines()}
+        from pgbench_harness.deviceprobe import run_device_probe
         with contextlib.redirect_stdout(buf):
             run_device_probe(spec, Path("."), dry_run=True)
         return {"mode": "device-probe",
@@ -95,6 +104,14 @@ def generate_report(run_dir: Path) -> Path:
         # spec.sweep and 500'd on suite/device-probe runs
         from pgbench_harness import report_evidence
         return report_evidence.generate_evidence_report(run_dir)
+    if mode == "pack":
+        # the pack narrative is written by the orchestrator; nothing to regen
+        p = run_dir / "report.html"
+        if p.exists():
+            return p
+        from pgbench_harness.errors import ReportError
+        raise ReportError("evidence pack has no report.html — the pack run "
+                          "may have died before finalize")
     return _report.generate_report(run_dir)
 
 

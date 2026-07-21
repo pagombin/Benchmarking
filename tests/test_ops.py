@@ -2295,6 +2295,32 @@ def test_web_device_probe_gating(opsweb):
     assert ev["fileio"]["iops"] > 0
 
 
+def test_web_evidence_pack_gating_and_kind(opsweb):
+    """Evidence pack submits like a probe: admin-only, cluster required,
+    enqueued as its own kind so the worker runs `evidence-pack`."""
+    import yaml as _yaml
+    from conftest import make_spec_doc
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["device_probe"] = {"allow_device_probe": True, "pack": True,
+                           "duration_s": 2, "file_total_size_gb": 1,
+                           "file_num": 8, "threads": 4}
+    pack_yaml = _yaml.safe_dump(doc)
+    r = client.post("/api/runs", json={"spec_yaml": pack_yaml,
+                                       "kube_target_id": tid},
+                    auth=("op", "oppw"))
+    assert r.status_code == 403                        # operators: no
+    r = client.post("/api/runs", json={"spec_yaml": pack_yaml},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400                        # no cluster: no
+    r = client.post("/api/runs", json={"spec_yaml": pack_yaml,
+                                       "kube_target_id": tid},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200 and r.json()["kind"] == "evidence_pack"
+
+
 def test_web_probe_spec_without_cluster_gets_synthesized_section(opsweb):
     """The New Run probe form emits a spec with NO cluster: section — the
     server must synthesize it from the attached kube target's registry entry
