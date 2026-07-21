@@ -466,6 +466,76 @@ def test_device_probe_keep_files_reuses_across_runs(iops_env, monkeypatch):
     assert st.get("probe_files") is False
 
 
+def test_device_probe_keep_files_geometry_mismatch_refused(iops_env, monkeypatch):
+    """Reusing kept files under a DIFFERENT geometry silently falsifies the
+    evidence (sysbench accepts larger-than-expected files): the probe must
+    refuse with a clear message instead."""
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "9950")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 1, "file_num": 8,
+                           "threads": 4, "keep_files": True}
+    spec_path = iops_env / "probe.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("device-probe", "--spec", str(spec_path),
+                   "--results-dir", str(results)) == 0
+    doc["device_probe"]["file_total_size_gb"] = 2        # changed geometry
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    rc = run_cli("device-probe", "--spec", str(spec_path),
+                 "--results-dir", str(results))
+    assert rc == 2
+    runs = sorted(results.iterdir())
+    log = (runs[-1] / "harness.log").read_text()
+    assert "do not match this spec's geometry" in log
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    assert st.get("probe_files") is True                 # files left untouched
+
+
+def test_device_probe_first_keep_files_run_requires_full_space(iops_env, monkeypatch):
+    """The relaxed 0.2x space budget applies only when the files actually
+    exist — a FIRST run with keep_files: true still writes the full set and
+    must clear the 2x guardrail (else prepare ENOSPCs the live volume)."""
+    monkeypatch.setenv("FAKE_KUBE_DF_AVAIL_KB", str(10 * 1048576))  # 10 GiB
+    doc = make_spec_doc()
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 8,      # needs 16 GiB
+                           "keep_files": True}
+    spec_path = iops_env / "probe.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    rc = run_cli("device-probe", "--spec", str(spec_path),
+                 "--results-dir", str(iops_env / "results"))
+    assert rc == 2
+
+
+def test_fill_from_device_falls_back_to_whole_series_on_clock_skew(tmp_path):
+    """Pod-stamped samples vs host-stamped window: NTP skew must not empty
+    the summary when the series is complete."""
+    from pgbench_harness.deviceprobe import _fill_from_device
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    (raw / "diskstats_device.json").write_text(
+        json.dumps({"majmin": "259:4", "device": "nvme1n1"}))
+    lines = []
+    base_s = 1_760_000_000
+    for i in range(8):
+        reads, writes = 6000 * i, 4000 * i
+        lines += [str((base_s + i) * 1000),
+                  f" 259       4 nvme1n1 {reads} 0 {reads * 32} {reads // 3} "
+                  f"{writes} 0 {writes * 32} {writes // 2} 2 {i * 980} "
+                  f"{i * 3900} 0 0", "==="]
+    (raw / "diskstats.log").write_text("\n".join(lines))
+    from datetime import datetime, timezone
+    iso = lambda s: datetime.fromtimestamp(s, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    out = _fill_from_device(tmp_path, iso(base_s + 900), iso(base_s + 1200))
+    assert out["iops"] == 10000.0
+    assert "clock skew" in out["source"]
+
+
 def test_probe_summary_falls_back_to_device_series(tmp_path):
     """Field bug: an unrecognized sysbench summary printed 'fileio result: ?'
     — the device counters are the ground truth, so the figures derive from

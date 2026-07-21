@@ -320,17 +320,6 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
         clean_yaml, target_id = _spec_with_target(conn, payload)
-        v = harness_api.validate_yaml(clean_yaml)
-        if not v.get("ok"):
-            raise HTTPException(400, v.get("error", "invalid spec"))
-        if v["mode"] == "device-probe":
-            # destructive-adjacent: saturates the pgdata volume. Admin + the
-            # in-spec arming flag (the runner refuses without it anyway).
-            if user["role"] != "admin":
-                raise HTTPException(403, "device-probe runs are admin-only")
-            kind = "device_probe"
-        else:
-            kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
         kube_target_id = payload.get("kube_target_id") or None
         if kube_target_id is not None:
             kt = queries.get_kube_target(conn, int(kube_target_id))
@@ -339,9 +328,15 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             kube_target_id = int(kube_target_id)
             # single pane of glass: attaching a registered cluster IS the
             # cluster-awareness switch — synthesize the spec's cluster: section
-            # from the registry when the YAML doesn't carry one.
-            doc = yaml.safe_load(clean_yaml)
-            if "cluster" not in doc:
+            # from the registry when the YAML doesn't carry one. This must
+            # happen BEFORE validation: a probe-only spec is invalid without
+            # a cluster section, so validate-first rejected exactly the spec
+            # the New Run probe form produces.
+            try:
+                doc = yaml.safe_load(clean_yaml)
+            except yaml.YAMLError:
+                doc = None                    # let validate_yaml report it
+            if isinstance(doc, dict) and "cluster" not in doc:
                 doc["cluster"] = {k: v for k, v in (
                     ("cr_name", kt["cr_name"]), ("namespace", kt["namespace"]),
                     ("cr_kind", kt["cr_kind"]), ("context", kt["context"]),
@@ -350,13 +345,21 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                     raise HTTPException(400, "attached kube target has no CR "
                                              "name — run discover on it first")
                 clean_yaml = yaml.safe_dump(doc, sort_keys=False)
-                v = harness_api.validate_yaml(clean_yaml)
-                if not v.get("ok"):
-                    raise HTTPException(400, v.get("error", "invalid spec"))
-        elif kind == "device_probe":
-            raise HTTPException(400, "device-probe needs kube_target_id (the "
-                                     "cluster whose kubeconfig the worker "
-                                     "injects)")
+        v = harness_api.validate_yaml(clean_yaml)
+        if not v.get("ok"):
+            raise HTTPException(400, v.get("error", "invalid spec"))
+        if v["mode"] == "device-probe":
+            # destructive-adjacent: saturates the pgdata volume. Admin + the
+            # in-spec arming flag (the runner refuses without it anyway).
+            if user["role"] != "admin":
+                raise HTTPException(403, "device-probe runs are admin-only")
+            if kube_target_id is None:
+                raise HTTPException(400, "device-probe needs kube_target_id "
+                                         "(the cluster whose kubeconfig the "
+                                         "worker injects)")
+            kind = "device_probe"
+        else:
+            kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
         job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
                                      scheduled_utc=payload.get("scheduled_utc") or None,
                                      kube_target_id=kube_target_id)
