@@ -55,6 +55,31 @@
   CRLF row terminators are stripped; the task-output stream tails by byte
   offset (was O(file) per second) and drains the final lines that land
   with the terminal state flip (they used to vanish).
+- **Backup/failover safety rails fail CLOSED**: an exec failure during the
+  pgBackRest lock check used to read as "lock clear" — the harness could
+  fire a backup or failover into a running backup, the exact field bug the
+  check exists to prevent. "Cannot verify" now aborts with the reason.
+- **Report regeneration survives cross-version/partial data**: manifests
+  with unknown keys (newer harness, hand annotations) no longer TypeError
+  every report entry point; older soak summaries missing newer keys no
+  longer KeyError the recovery path; the webapp now routes suite/probe
+  runs to the evidence renderer (the sweep renderer 500'd on them) and
+  the sweep renderer raises a real error instead of an assert.
+- **Failover stitch is derived data**: a stitcher exception downgrades to
+  a warning event instead of flipping a successful scenario run to failed
+  (captures are intact on disk).
+- **Kubeconfig redaction parses the document**: JSON kubeconfigs (every
+  line quoted) and YAML block scalars evaded the line-regex — ZERO values
+  were registered with the redactor for those formats. The sensitive keys
+  are now found by structured walk, with the line scan as fallback; an
+  empty kubeconfig path is rejected instead of silently falling back to
+  ~/.kube/config (wrong-cluster risk).
+- **Small but real**: a "tps": null in a soak summary no longer makes the
+  whole run vanish from the index; string-valued tags no longer explode
+  into per-character tags; ops liveness treats EPERM as alive; an unknown
+  health severity no longer aborts postprocess; kubectl timeouts keep the
+  child's last output as the diagnosis; the connection-ceiling probe reaps
+  killed psql children (was: zombies for the process lifetime).
 - **Web tier**: run artifact downloads spool to disk instead of building
   a potentially multi-GB tar.gz in RAM; /runs/{id}/provider-metrics gets
   the same traversal guard as every other run route; SSE streams no longer
