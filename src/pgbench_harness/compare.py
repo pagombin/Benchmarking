@@ -251,6 +251,117 @@ def settings_diff(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return diff
 
 
+def key_settings_table(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The key settings side-by-side for EVERY run — always shown, identical
+    or not. A cross-provider write-up needs the memory/WAL/IO posture of both
+    sides on the page even when they happen to match."""
+    out = []
+    for name in KEY_SETTINGS:
+        vals = [r["_settings"].get(name, "n/a") for r in runs]
+        out.append({"name": name, "vals": vals,
+                    "differs": len({v for v in vals}) > 1})
+    return out
+
+
+def all_settings_union(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """EVERY captured pg_setting side-by-side (union over runs), differing
+    rows flagged — the full-capture appendix, rendered collapsed."""
+    names = sorted({n for r in runs for n in r["_settings"]})
+    return [{"name": n,
+             "vals": [r["_settings"].get(n, "—") for r in runs],
+             "differs": len({r["_settings"].get(n, "—") for r in runs}) > 1}
+            for n in names]
+
+
+def _first_line(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return ""
+
+
+def load_env_card(run_dir: Path) -> dict[str, Any]:
+    """Per-run identity card: who was tested, with what, when.
+
+    Cross-provider comparisons live or die on this context — 'DO Advanced
+    vs Aiven Standard' means nothing without server version, host, workload
+    geometry and run window next to the numbers."""
+    import yaml as _yaml
+    card: dict[str, Any] = {"dir": str(run_dir)}
+    try:
+        doc = _yaml.safe_load((run_dir / "spec.yaml").read_text(
+            encoding="utf-8")) or {}
+    except (OSError, _yaml.YAMLError):
+        doc = {}
+    run = doc.get("run") or {}
+    tgt = doc.get("target") or {}
+    wl = doc.get("workload") or {}
+    card.update({
+        "label": run.get("label", ""), "edition": run.get("edition", ""),
+        "tshirt_size": run.get("tshirt_size", ""),
+        "notes": run.get("notes", ""), "tags": run.get("tags") or [],
+        "host": tgt.get("host", ""), "database": tgt.get("database", ""),
+        "workload": wl,
+        "cluster_aware": "cluster" in doc,
+    })
+    for section in ("sweep", "soak", "suite"):
+        if section in doc:
+            card["mode"] = section
+            card["mode_cfg"] = doc[section]
+            break
+    else:
+        card["mode"], card["mode_cfg"] = "?", {}
+    man = {}
+    try:
+        man = read_json(run_dir / "manifest.json")
+    except (OSError, ValueError):
+        pass
+    card["run_id"] = man.get("run_id", run_dir.name)
+    card["started_utc"] = man.get("created_utc", "")
+    card["finished_utc"] = man.get("finished_utc", "")
+    card["wall_time_s"] = man.get("wall_time_s")
+    card["server_version"] = _first_line(run_dir / "env" / "server_version.txt")
+    card["sysbench_version"] = _first_line(run_dir / "env" / "sysbench_version.txt")
+    return card
+
+
+# The fields that make two runs a FAIR comparison. Anything differing here
+# is flagged loudly — a DO-vs-Aiven number where the dataset or ladder
+# differs is not a comparison, it's an accident.
+_FAIRNESS_FIELDS = (
+    ("workload type", lambda c: (c["workload"] or {}).get("type")),
+    ("tables", lambda c: (c["workload"] or {}).get("tables")),
+    ("table_size", lambda c: (c["workload"] or {}).get("table_size")),
+    ("scale", lambda c: (c["workload"] or {}).get("scale")),
+    ("dataset_gb", lambda c: (c["workload"] or {}).get("dataset_gb")),
+    ("mode", lambda c: c.get("mode")),
+    ("threads / ladder", lambda c: str((c.get("mode_cfg") or {}).get("threads", ""))),
+    ("duration_s", lambda c: (c.get("mode_cfg") or {}).get("duration_s")),
+    ("warmup_s", lambda c: (c.get("mode_cfg") or {}).get("warmup_s")),
+    ("repetitions", lambda c: (c.get("mode_cfg") or {}).get("repetitions")),
+    ("rate_steps", lambda c: str((c.get("mode_cfg") or {}).get("rate_steps", ""))),
+    ("sysbench version", lambda c: c.get("sysbench_version")),
+    ("PostgreSQL major", lambda c: (c.get("server_version") or "").split(".")[0]
+                                   .replace("PostgreSQL ", "").strip()),
+)
+
+
+def comparability(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fairness check across the runs: which comparison-critical knobs are
+    identical, which differ. `fair` is True only when every field matches."""
+    rows = []
+    for name, get in _FAIRNESS_FIELDS:
+        vals = [get(c) for c in cards]
+        shown = ["—" if v in (None, "", "None") else str(v) for v in vals]
+        if all(s == "—" for s in shown):
+            continue                     # field not used by any run
+        rows.append({"name": name, "vals": shown,
+                     "same": len(set(shown)) == 1})
+    mismatches = [r for r in rows if not r["same"]]
+    return {"rows": rows, "mismatches": mismatches,
+            "fair": not mismatches}
+
+
 def _run_mode(run_dir: Path) -> str:
     """sweep | soak, decided by the parsed artifact present (then the manifest)."""
     if (run_dir / "parsed" / "soak_summary.json").exists():
@@ -294,10 +405,15 @@ def generate_compare(run_dirs: list[Path], out_path: Path) -> Path:
     runs = [load_run(d) for d in run_dirs]
     _disambiguate(runs)
     kpis = build_run_kpis(runs)
+    cards = [load_env_card(d) for d in run_dirs]
+    for card, run in zip(cards, runs):
+        card["display"] = run["display"]
     html = _jinja_env().get_template("compare.html.j2").render(
         runs=runs,
         kpis=kpis,
         winner=build_winner(kpis),
+        cards=cards,
+        fairness=comparability(cards),
         charts={
             "qps": chart_overlay(runs, "qps_avg", "QPS vs client threads", "QPS"),
             "tps": chart_overlay(runs, "tps_avg", "TPS vs client threads", "TPS"),
@@ -309,6 +425,8 @@ def generate_compare(run_dirs: list[Path], out_path: Path) -> Path:
         },
         table=build_table(runs),
         diff=settings_diff(runs),
+        key_settings=key_settings_table(runs),
+        all_settings=all_settings_union(runs),
         any_settings=any(r["_settings"] for r in runs),
         generated_utc=utc_now_iso(),
         harness=harness_version(),
@@ -333,41 +451,47 @@ def load_soak_run(run_dir: Path) -> dict[str, Any]:
     return s
 
 
-def _soak_tps_series(run_dir: str) -> tuple[list[int], list[float]]:
+def _soak_series(run_dir: str, col: str) -> tuple[list[int], list[float]]:
     path = Path(run_dir) / "parsed" / "soak_timeseries.csv"
     if not path.exists():
         return [], []
     ts: list[int] = []
-    tps: list[float] = []
+    vals: list[float] = []
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             try:
                 ts.append(int(row["t"]))
-                tps.append(float(row["tps"]))
+                vals.append(float(row[col]))
             except (KeyError, ValueError):
                 continue
-    return ts, tps
+    return ts, vals
 
 
-def chart_soak_throughput(runs: list[dict[str, Any]]) -> Optional[str]:
-    """Overlaid per-second TPS-over-time, one line per soak (decimated)."""
+def chart_soak_overlay(runs: list[dict[str, Any]], col: str, title: str,
+                       ylabel: str) -> Optional[str]:
+    """Overlaid per-second series over time, one line per soak (decimated)."""
     fig, ax = plt.subplots(figsize=(FIGSIZE[0], 4.6))
     plotted = False
     for i, run in enumerate(runs):
-        ts, tps = _soak_tps_series(run["_dir"])
+        ts, vals = _soak_series(run["_dir"], col)
         if not ts:
             continue
         stride = max(1, len(ts) // 1500)
-        ax.plot(ts[::stride], tps[::stride], color=_color(i), linewidth=1.6,
+        ax.plot(ts[::stride], vals[::stride], color=_color(i), linewidth=1.6,
                 label=run["display"])
         plotted = True
     if not plotted:
         plt.close(fig)
         return None
-    _style_ax(ax, "Throughput over time (overlaid)", "elapsed time (s)", "TPS")
+    _style_ax(ax, title, "elapsed time (s)", ylabel)
     ax.legend(fontsize=11)
     ax.set_ylim(bottom=0)
     return fig_to_base64(fig)
+
+
+def chart_soak_throughput(runs: list[dict[str, Any]]) -> Optional[str]:
+    return chart_soak_overlay(runs, "tps", "Throughput over time (overlaid)",
+                              "TPS")
 
 
 def build_soak_kpis(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -410,12 +534,35 @@ def generate_soak_compare(run_dirs: list[Path], out_path: Path) -> Path:
     runs = [load_soak_run(d) for d in run_dirs]
     _disambiguate(runs)
     kpis = build_soak_kpis(runs)
+    cards = [load_env_card(d) for d in run_dirs]
+    for card, run in zip(cards, runs):
+        card["display"] = run["display"]
+    # two-run comparisons get a delta column (second vs first)
+    deltas = None
+    if len(kpis) == 2 and kpis[0].get("median_tps") and \
+            kpis[1].get("median_tps") is not None:
+        base, other = kpis[0], kpis[1]
+        def _pct(a, b):
+            return (b - a) / a * 100 if (a and b is not None) else None
+        deltas = {"median_tps": _pct(base["median_tps"], other["median_tps"]),
+                  "p99": _pct(base["p99"], other["p99"]) if base.get("p99") else None}
     html = _jinja_env().get_template("compare_soak.html.j2").render(
         runs=runs,
         kpis=kpis,
         winner=build_soak_winner(kpis),
+        deltas=deltas,
+        cards=cards,
+        fairness=comparability(cards),
         chart=chart_soak_throughput(runs),
+        chart_lat=chart_soak_overlay(runs, "lat_p99",
+                                     "p99 latency over time (overlaid)",
+                                     "p99 latency (ms)"),
+        chart_err=chart_soak_overlay(runs, "err_s",
+                                     "Errors/s over time (overlaid)",
+                                     "errors / second"),
         diff=settings_diff(runs),
+        key_settings=key_settings_table(runs),
+        all_settings=all_settings_union(runs),
         any_settings=any(r["_settings"] for r in runs),
         generated_utc=utc_now_iso(),
         harness=harness_version(),

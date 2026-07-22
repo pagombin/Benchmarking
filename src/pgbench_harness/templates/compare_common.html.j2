@@ -1,0 +1,114 @@
+{# Shared comparison sections: environment cards, fairness check, key
+   settings (always shown), and the full-settings appendix. Included by
+   compare.html.j2 and compare_soak.html.j2 — expects `cards`, `fairness`,
+   `runs`, `key_settings`, `all_settings`, `diff`, `any_settings`. #}
+
+{% if part == "context" %}
+<h2 id="env"><span class="secno">{{ secno_env }}</span>Environment &amp; identity</h2>
+<p class="subtle">Who was tested, with what, when — read the numbers only in this context.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="text-align:left">Field</th>
+    {% for c in cards %}<th>{{ c.display }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  <tr><td style="text-align:left">Target host</td>
+    {% for c in cards %}<td style="font-family:ui-monospace,Menlo,monospace;font-size:12px">{{ c.host or "—" }}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Server version</td>
+    {% for c in cards %}<td style="font-size:12px">{{ c.server_version or "—" }}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Edition / size</td>
+    {% for c in cards %}<td>{{ c.edition or "—" }} / {{ c.tshirt_size or "—" }}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Workload</td>
+    {% for c in cards %}<td>{{ c.workload.type | default("—") }}
+      {%- if c.workload.tables %} · {{ c.workload.tables }} tables{% endif %}
+      {%- if c.workload.table_size %} · {{ "{:,}".format(c.workload.table_size) }} rows{% endif %}
+      {%- if c.workload.dataset_gb %} · {{ c.workload.dataset_gb }} GiB{% endif %}
+      {%- if c.workload.scale %} · scale {{ c.workload.scale }}{% endif %}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Mode config</td>
+    {% for c in cards %}<td style="font-family:ui-monospace,Menlo,monospace;font-size:12px">{{ c.mode }}:
+      {%- for k, v in (c.mode_cfg or {}).items() %} {{ k }}={{ v }}{% endfor %}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Run window (UTC)</td>
+    {% for c in cards %}<td style="font-size:12px">{{ c.started_utc or "—" }}<br>→ {{ c.finished_utc or "—" }}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Load generator</td>
+    {% for c in cards %}<td style="font-size:12px">{{ c.sysbench_version or "—" }}</td>{% endfor %}</tr>
+  <tr><td style="text-align:left">Cluster-aware (device series)</td>
+    {% for c in cards %}<td>{{ "yes" if c.cluster_aware else "no" }}</td>{% endfor %}</tr>
+  {% if cards | selectattr("notes") | list %}
+  <tr><td style="text-align:left">Notes</td>
+    {% for c in cards %}<td style="font-size:12px">{{ c.notes or "—" }}</td>{% endfor %}</tr>
+  {% endif %}
+  </tbody>
+</table>
+</div>
+
+<h2 id="fairness"><span class="secno">{{ secno_fair }}</span>Comparability check</h2>
+{% if fairness.fair %}
+<div class="note" style="border-color:#2e8b57">
+  <b>Fair comparison ✓</b> — every comparison-critical parameter (workload
+  geometry, thread ladder, durations, load-generator and server major
+  version) is identical across the selected runs.
+</div>
+{% else %}
+<div class="warnbox">
+  <b>⚠ {{ fairness.mismatches | length }} comparison-critical difference{{ "s" if fairness.mismatches | length != 1 }}:</b>
+  the deltas below are only meaningful once these are accounted for —
+  {{ fairness.mismatches | map(attribute="name") | join(", ") }}.
+</div>
+{% endif %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="text-align:left">Parameter</th>
+    {% for c in cards %}<th>{{ c.display }}</th>{% endfor %}<th></th></tr></thead>
+  <tbody>
+  {% for row in fairness.rows %}
+  <tr>
+    <td style="text-align:left">{{ row.name }}</td>
+    {% for v in row.vals %}<td style="font-family:ui-monospace,Menlo,monospace;font-size:12px{% if not row.same %};font-weight:600{% endif %}">{{ v }}</td>{% endfor %}
+    <td>{% if row.same %}<span style="color:#2e8b57">✓</span>{% else %}<span style="color:#c0392b">≠</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}{# part == "context" #}
+
+{% if part == "settings" %}
+<h2 id="keysettings"><span class="secno">{{ secno_key }}</span>Key database settings</h2>
+{% if any_settings %}
+<p class="subtle">The memory/WAL/IO posture of every run — shown even when identical (a fair fight should say so). Differing rows are highlighted.</p>
+<div class="table-wrap">
+<table class="settings">
+  <thead><tr><th>Setting</th>{% for r in runs %}<th>{{ r.display }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for s in key_settings %}
+  <tr{% if s.differs %} style="background:#fff6e0"{% endif %}>
+    <td><b>{{ s.name }}</b></td>
+    {% for v in s.vals %}<td>{{ v }}</td>{% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h3>Full pg_settings capture (all {{ all_settings | length }} settings, all runs)</h3>
+<details>
+  <summary class="subtle">Expand the complete side-by-side settings dump
+    ({{ all_settings | selectattr("differs") | list | length }} differ) —
+    every setting from every run's <code>env/pg_settings.csv</code>.</summary>
+  <div class="table-wrap">
+  <table class="settings">
+    <thead><tr><th>Setting</th>{% for r in runs %}<th>{{ r.display }}</th>{% endfor %}</tr></thead>
+    <tbody>
+    {% for s in all_settings %}
+    <tr{% if s.differs %} style="background:#fff6e0"{% endif %}>
+      <td>{{ s.name }}</td>
+      {% for v in s.vals %}<td>{{ v }}</td>{% endfor %}
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</details>
+{% else %}
+<p class="subtle">No pg_settings captures available for these runs.</p>
+{% endif %}
+{% endif %}{# part == "settings" #}

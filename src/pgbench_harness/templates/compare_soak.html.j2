@@ -13,18 +13,31 @@
 </div>
 
 <main>
+<div class="toc">
+  <a href="#headline">Headline</a><a href="#env">Environment</a>
+  <a href="#fairness">Comparability</a><a href="#charts">Time series</a>
+  <a href="#keysettings">Key settings</a><a href="#diff">Settings diff</a>
+</div>
+
 {% if winner %}
 <div class="note" style="font-size:15px"><b>Highest median TPS:</b> {{ winner.display }}
   ({{ winner.median_tps | round(1) }} TPS{% if winner.margin_pct is not none %}, +{{ winner.margin_pct | round(1) }}% over the runner-up{% endif %}).</div>
 {% endif %}
+{% if deltas and deltas.median_tps is not none %}
+<div class="note"><b>{{ runs[1].display }}</b> vs <b>{{ runs[0].display }}</b>:
+  median TPS {{ "%+.1f" | format(deltas.median_tps) }}%{% if deltas.p99 is not none %},
+  p99 latency {{ "%+.1f" | format(deltas.p99) }}%{% endif %}.</div>
+{% endif %}
 
-{% if chart %}
-<div class="chart"><img alt="Throughput over time (overlaid)" src="{{ chart }}">
-  <div class="cap">Per-second TPS for each soak, overlaid on a shared elapsed-time axis (decimated for legibility).</div>
+{% if not fairness.fair %}
+<div class="warnbox" style="font-size:14px">
+  <b>⚠ Not an apples-to-apples comparison:</b>
+  {{ fairness.mismatches | map(attribute="name") | join(", ") }} differ —
+  see the <a href="#fairness">comparability check</a> before quoting deltas.
 </div>
 {% endif %}
 
-<h2>Headline metrics</h2>
+<h2 id="headline"><span class="secno">1</span>Headline metrics</h2>
 <div class="table-wrap">
 <table>
   <thead><tr>
@@ -56,8 +69,30 @@
 </div>
 <p class="subtle">Latency columns are whole-run figures (p50/p95/p99 from each soak's end-of-run histogram). "Detected" counts auto-detected, unconfirmed anomalies.</p>
 
+{% with part="context", secno_env="2", secno_fair="3" %}{% include "compare_common.html.j2" %}{% endwith %}
+
+<h2 id="charts"><span class="secno">4</span>Time series (overlaid)</h2>
+{% if chart %}
+<div class="chart"><img alt="Throughput over time (overlaid)" src="{{ chart }}">
+  <div class="cap">Per-second TPS for each soak, overlaid on a shared elapsed-time axis (decimated for legibility).</div>
+</div>
+{% endif %}
+{% if chart_lat %}
+<div class="chart"><img alt="p99 latency over time (overlaid)" src="{{ chart_lat }}">
+  <div class="cap">Per-second p99 latency — throughput parity with worse tail latency is not parity.</div>
+</div>
+{% endif %}
+{% if chart_err %}
+<div class="chart"><img alt="Errors/s over time (overlaid)" src="{{ chart_err }}">
+  <div class="cap">Errors per second — a flat zero line is part of the result.</div>
+</div>
+{% endif %}
+{% if not chart and not chart_lat %}<p class="subtle">No per-second series available to overlay.</p>{% endif %}
+
+{% with part="settings", secno_key="5" %}{% include "compare_common.html.j2" %}{% endwith %}
+
+<h2 id="diff"><span class="secno">6</span>Settings diff</h2>
 {% if diff %}
-<h2>Configuration differences</h2>
 <div class="table-wrap">
 <table>
   <thead><tr><th>Setting</th>{% for r in runs %}<th>{{ r.display }}</th>{% endfor %}</tr></thead>

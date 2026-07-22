@@ -275,6 +275,34 @@ def test_compare_two_runs(fake_env, spec_file, results_dir, monkeypatch, tmp_pat
     assert "highest peak throughput" in html  # winner callout
     assert "overflow: hidden" not in html     # scroll-bug regression guard
     assert "table-wrap" in html               # tables are horizontally scrollable
+    # cross-provider context: identity cards, fairness verdict, full capture
+    assert "Environment &amp; identity" in html
+    assert "Comparability check" in html
+    assert "Fair comparison" in html          # same spec both runs -> fair
+    assert "Key database settings" in html
+    assert "Full pg_settings capture" in html
+    assert "shared_buffers" in html           # key settings shown even if equal
+
+
+def test_compare_flags_unfair_comparison(fake_env, spec_file, results_dir,
+                                         monkeypatch, tmp_path) -> None:
+    """A DO-vs-Aiven number with different workload geometry is an accident,
+    not a comparison — the report must say so loudly."""
+    import yaml as _yaml
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    doc = _yaml.safe_load(spec_file.read_text())
+    doc["sweep"]["duration_s"] = doc["sweep"]["duration_s"] + 1
+    doc["sweep"]["threads"] = list(doc["sweep"]["threads"]) + [3]
+    spec2 = spec_file.parent / "spec2.yaml"
+    spec2.write_text(_yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("run", "--spec", str(spec2), "--results-dir", str(results_dir)) == 0
+    runs = sorted(d.name for d in results_dir.iterdir() if (d / "manifest.json").exists())
+    out = tmp_path / "compare.html"
+    assert run_cli("compare", "--runs", *runs, "--results-dir", str(results_dir),
+                   "--out", str(out)) == 0
+    html = out.read_text()
+    assert "Not an apples-to-apples comparison" in html
+    assert "duration_s" in html and "threads / ladder" in html
 
 
 def test_list_runs(fake_env, spec_file, results_dir, capsys) -> None:

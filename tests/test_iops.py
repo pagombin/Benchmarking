@@ -340,6 +340,36 @@ def test_suite_high_iops_marker_is_surfaced(iops_env, monkeypatch):
     assert "high-IOPS/QoS markers present" in ident["finding"]
 
 
+def test_soak_compare_report_has_context_and_settings(iops_env):
+    """Soak-vs-soak comparison (the DO-vs-Aiven workhorse): identity cards,
+    fairness verdict, latency/error overlays, key + full settings."""
+    from pgbench_harness.compare import generate_soak_compare
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["soak"] = {"threads": 4, "duration_s": 3}
+    spec_path = iops_env / "soak.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("soak", "--spec", str(spec_path),
+                   "--results-dir", str(results)) in (0, 1)
+    assert run_cli("soak", "--spec", str(spec_path),
+                   "--results-dir", str(results)) in (0, 1)
+    dirs = sorted(d for d in results.iterdir()
+                  if (d / "manifest.json").exists())
+    assert len(dirs) == 2
+    out = iops_env / "soak_compare.html"
+    generate_soak_compare(dirs, out)
+    html = out.read_text()
+    assert "Environment &amp; identity" in html
+    assert "Comparability check" in html
+    assert "Fair comparison" in html               # identical specs
+    assert "Key database settings" in html
+    assert "Full pg_settings capture" in html
+    assert "p99 latency over time" in html
+    assert "median TPS" in html                    # two-run delta note
+    assert "table-wrap" in html
+
+
 # ── e2e: rate-stepped soak against an obviously-not-pressured device ──
 
 def test_rate_stepped_soak_inconclusive_verdict(iops_env, monkeypatch):

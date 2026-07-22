@@ -18,9 +18,11 @@
 
 <main>
 <div class="toc">
-  <a href="#summary">Summary</a><a href="#throughput">Throughput</a>
+  <a href="#summary">Summary</a><a href="#env">Environment</a>
+  <a href="#fairness">Comparability</a><a href="#throughput">Throughput</a>
   <a href="#latency">Latency</a><a href="#efficiency">Efficiency</a>
-  <a href="#io">Storage I/O</a><a href="#table">Side-by-side</a><a href="#diff">Settings diff</a>
+  <a href="#io">Storage I/O</a><a href="#table">Side-by-side</a>
+  <a href="#keysettings">Key settings</a><a href="#diff">Settings diff</a>
 </div>
 
 {% if winner %}
@@ -28,6 +30,14 @@
   <b>{{ winner.display }}</b> has the highest peak throughput at
   <b>{{ "{:,.0f}".format(winner.peak_qps) }} QPS</b>{% if winner.margin_pct is not none %},
   {{ "%.1f" | format(winner.margin_pct) }}% ahead of the next run{% endif %}.
+</div>
+{% endif %}
+
+{% if not fairness.fair %}
+<div class="warnbox" style="font-size:14px">
+  <b>⚠ Not an apples-to-apples comparison:</b>
+  {{ fairness.mismatches | map(attribute="name") | join(", ") }} differ —
+  see the <a href="#fairness">comparability check</a> before quoting deltas.
 </div>
 {% endif %}
 
@@ -63,7 +73,9 @@
 </table>
 </div>
 
-<h2 id="throughput"><span class="secno">2</span>Throughput</h2>
+{% with part="context", secno_env="2", secno_fair="3" %}{% include "compare_common.html.j2" %}{% endwith %}
+
+<h2 id="throughput"><span class="secno">4</span>Throughput</h2>
 {% if charts.qps %}<div class="chart"><img alt="QPS comparison" src="{{ charts.qps }}"></div>
 {% else %}<p class="subtle">No successful levels to chart.</p>{% endif %}
 {% if charts.tps %}<div class="chart"><img alt="TPS comparison" src="{{ charts.tps }}"></div>{% endif %}
@@ -73,24 +85,24 @@
 </div>
 {% endif %}
 
-<h2 id="latency"><span class="secno">3</span>Latency (p99)</h2>
+<h2 id="latency"><span class="secno">5</span>Latency (p99)</h2>
 {% if charts.p99 %}<div class="chart"><img alt="p99 latency comparison" src="{{ charts.p99 }}"></div>
 {% else %}<p class="subtle">No p99 data to chart.</p>{% endif %}
 
-<h2 id="efficiency"><span class="secno">4</span>Efficiency (latency vs throughput)</h2>
+<h2 id="efficiency"><span class="secno">6</span>Efficiency (latency vs throughput)</h2>
 {% if charts.efficiency %}<div class="chart"><img alt="Latency vs throughput" src="{{ charts.efficiency }}">
   <div class="cap">Tail latency at each achieved throughput. Lower and further right is better.</div>
 </div>
 {% else %}<p class="subtle">Not enough data to chart.</p>{% endif %}
 
-<h2 id="io"><span class="secno">5</span>Storage I/O (engine-side)</h2>
+<h2 id="io"><span class="secno">7</span>Storage I/O (engine-side)</h2>
 {% if charts.io_write or charts.io_read %}
 <p class="subtle">Logical I/O as PostgreSQL issued it (8&nbsp;KB blocks) — an IOPS proxy, not device IOPS.</p>
 {% if charts.io_write %}<div class="chart"><img alt="Write ops/s comparison" src="{{ charts.io_write }}"></div>{% endif %}
 {% if charts.io_read %}<div class="chart"><img alt="Read ops/s comparison" src="{{ charts.io_read }}"></div>{% endif %}
 {% else %}<p class="subtle">No engine-side I/O captured for these runs.</p>{% endif %}
 
-<h2 id="table"><span class="secno">6</span>Headline side-by-side</h2>
+<h2 id="table"><span class="secno">8</span>Headline side-by-side</h2>
 <p class="subtle">Union of thread ladders; “—” marks levels a run did not execute or that failed.</p>
 <div class="table-wrap">
 <table>
@@ -123,7 +135,9 @@
 </div>
 {% if table.with_delta %}<p class="subtle">Δ QPS % = second run vs first run at the same thread level (green = faster, red = slower).</p>{% endif %}
 
-<h2 id="diff"><span class="secno">7</span>Settings diff</h2>
+{% with part="settings", secno_key="9" %}{% include "compare_common.html.j2" %}{% endwith %}
+
+<h2 id="diff"><span class="secno">10</span>Settings diff</h2>
 {% if diff %}
 <p class="subtle">Only pg_settings rows that differ between runs are shown; key settings first (bold).</p>
 <div class="table-wrap">

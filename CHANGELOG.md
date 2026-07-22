@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — cross-provider comparison report overhaul (DO vs Aiven ready)
+
+- **Environment & identity cards** in both sweep and soak comparisons:
+  target host, server version, edition/size, workload geometry, mode
+  config, run window, load-generator version — the numbers now sit next
+  to who was tested with what.
+- **Comparability check**: every comparison-critical parameter (workload
+  type/tables/rows/dataset, thread ladder, durations, warmup, reps, rate
+  steps, sysbench version, PostgreSQL major) is compared across runs;
+  identical → a "Fair comparison ✓" banner, otherwise a loud
+  "Not an apples-to-apples comparison" warning naming the mismatches at
+  the top of the report. Cross-provider deltas without this are
+  accidents, not comparisons.
+- **Full settings story**: key settings side-by-side are ALWAYS shown
+  (even when identical — a fair fight should say so), plus a collapsible
+  appendix with EVERY captured pg_setting from every run, differing rows
+  highlighted. The diff-only section remains.
+- **Soak comparison grew up**: p99-latency-over-time and errors/s
+  overlays alongside the TPS overlay, a two-run delta callout
+  (median TPS %, p99 %), a TOC, and all the sections above. Soak-vs-soak
+  is the workhorse for provider comparisons and no longer a one-chart
+  page.
+
 ## Unreleased — one-click IOPS evidence pack
 
 - **`evidence-pack`**: the core four device probes (rndrd 16K, rndrd 8K,
