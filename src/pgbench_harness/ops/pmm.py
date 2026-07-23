@@ -112,15 +112,36 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
     return token
 
 
+# pg_stat_monitor and pg_stat_statements are MUTUALLY EXCLUSIVE to the Percona
+# operator: its admission Validate (perconapgcluster_types.go) REJECTS any CR
+# whose shared_preload_libraries lists both — "pg_stat_monitor and
+# pg_stat_statements cannot both be enabled". A cluster already loading
+# pg_stat_monitor therefore cannot simply have pg_stat_statements appended; the
+# operator refuses the whole patch and NOTHING rolls (spec silently rejected in
+# a reconcile loop, pods stay on the old spec). So enabling one half of the pair
+# must DROP the other half from the preload list.
+_STAT_PAIR = {"pg_stat_statements": "pg_stat_monitor",
+              "pg_stat_monitor": "pg_stat_statements"}
+
+
 def _merge_spl(existing: str, extension: str) -> str:
     """Merge the PMM extension into the cluster's existing preload libraries:
     keep every existing library in order, dedupe, append the extension if
-    missing. Never drops a library the cluster already loads."""
+    missing. Preserves every library the cluster already loads EXCEPT the
+    mutually-exclusive pg_stat_* counterpart of *extension*, which is dropped —
+    leaving both in shared_preload_libraries makes the operator reject the CR."""
+    exclusive = _STAT_PAIR.get(extension)
     libs: list[str] = []
     for part in (existing or "").split(","):
-        p = part.strip()
-        if p and p not in libs:
-            libs.append(p)
+        # normalize quotes/spaces so the counterpart is matched (and dropped)
+        # even when the operator renders SPL as 'pg_stat_monitor', pgaudit —
+        # and so the value we write back to the CR is canonical.
+        p = _norm_lib(part)
+        if not p or p in libs:
+            continue
+        if p == exclusive:               # mutually exclusive with `extension`
+            continue
+        libs.append(p)
     if not libs:
         libs = ["pgaudit"]                # the operator's own baseline
     if extension not in libs:
@@ -154,9 +175,13 @@ def _resolve_spl(kube: Kube, run: OpsRun, cfg: dict[str, Any],
     else:
         cur, src = _current_spl(kube, cr, leader, cfg["database"])
     spl = _merge_spl(cur, cfg["extension"])
-    run.event("preflight", f"shared_preload_libraries -> {spl}",
-              f"existing libraries ({src}: '{cur or 'none declared'}') are "
-              f"preserved; {cfg['extension']} appended if missing")
+    dropped = _STAT_PAIR.get(cfg["extension"])
+    note = (f"existing libraries ({src}: '{cur or 'none declared'}') are "
+            f"preserved; {cfg['extension']} appended if missing")
+    if dropped and dropped in {_norm_lib(x) for x in cur.split(",")}:
+        note += (f"; {dropped} REMOVED — the operator rejects a CR with both "
+                 f"{dropped} and {cfg['extension']} in shared_preload_libraries")
+    run.event("preflight", f"shared_preload_libraries -> {spl}", note)
     return spl
 
 
@@ -640,9 +665,12 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
             run.event("dry-run", "CR patch",
                       f"kubectl patch {t.cr_kind} {t.cr_name} --type merge -p "
                       f"'{json.dumps(patch)}'")
+            drop = _STAT_PAIR.get(cfg["extension"])
             run.event("dry-run", "then", "rollout wait -> re-discover -> "
                       f"CREATE EXTENSION IF NOT EXISTS {cfg['extension']} on the "
-                      "leader -> HA bounce -> validation")
+                      "leader -> "
+                      + (f"DROP EXTENSION IF EXISTS {drop} -> " if drop else "")
+                      + "HA bounce -> validation")
             run.finalize("complete", headline={"op": "pmm-enable",
                                                "dry_run": True,
                                                "secret": secret_name,
@@ -707,6 +735,25 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
             return EXIT_FAILED
         run.event("extension", f"{cfg['extension']} live on primary "
                   f"({cnt} rows)")
+
+        # 9b. drop the stale mutually-exclusive extension. Switching query
+        # sources removed the counterpart library from shared_preload_libraries
+        # (the operator forbids both); leaving the extension OBJECT behind makes
+        # its views error ("must be loaded via shared_preload_libraries") and
+        # keeps pg_stat_monitor holding the shared memory it reserved at the old
+        # load. DROP ... IF EXISTS is a no-op when it was never installed.
+        counterpart = _STAT_PAIR.get(cfg["extension"])
+        if counterpart:
+            res = kube.psql(leader, f"DROP EXTENSION IF EXISTS {counterpart};",
+                            database=cfg["database"], timeout_s=30)
+            if res.ok:
+                run.event("extension", f"stale {counterpart} extension dropped",
+                          f"mutually exclusive with {cfg['extension']} — no "
+                          "longer in shared_preload_libraries")
+            else:
+                run.event("extension", f"could not drop stale {counterpart} "
+                          "extension", (res.stderr or res.stdout).strip()[:150]
+                          + " — its views will error until dropped manually")
 
         # 10. HA-preserving sidecar bounce so QAN re-registers: replicas
         # first, the leader LAST (only after every replica is back and Ready)

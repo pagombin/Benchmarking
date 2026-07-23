@@ -1240,6 +1240,26 @@ def main():
                     deep_merge(dst[k], v)
                 else:
                     dst[k] = v
+
+        # Operator Validate(): pg_stat_monitor and pg_stat_statements are
+        # mutually exclusive — a CR that lists BOTH in shared_preload_libraries
+        # is rejected (perconapgcluster_types.go). This is the real reason an
+        # additive merge on a pg_stat_monitor cluster never rolled: the patch
+        # was refused, not slow. Evaluate against the POST-merge value.
+        merged_cr = json.loads(json.dumps(st["cr"]))
+        deep_merge(merged_cr, patch)
+        spl_v = str(((((((merged_cr.get("spec") or {}).get("patroni") or {})
+                      .get("dynamicConfiguration") or {}).get("postgresql")
+                      or {}).get("parameters") or {})
+                     .get("shared_preload_libraries", "")))
+        spl_toks = {p.strip().strip("'\"").strip() for p in spl_v.split(",")}
+        if {"pg_stat_monitor", "pg_stat_statements"} <= spl_toks:
+            sys.stderr.write(
+                "admission webhook denied the request: "
+                "validate PerconaPGCluster: pg_stat_monitor and "
+                "pg_stat_statements cannot both be enabled\n")
+            return 1
+
         deep_merge(st["cr"], patch)
         if ((patch.get("spec") or {}).get("pmm") or {}).get("enabled"):
             # the operator rolls the instance pods one at a time

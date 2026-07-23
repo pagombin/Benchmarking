@@ -2627,6 +2627,25 @@ def test_merge_spl_preserves_and_dedupes():
         "pgvector,pgaudit,pg_stat_statements"         # order kept, dupes dropped
 
 
+def test_merge_spl_mutually_exclusive_stat_libs():
+    # The Percona operator REJECTS a CR with both pg_stat_monitor and
+    # pg_stat_statements in shared_preload_libraries. Enabling one must drop the
+    # other while preserving every unrelated library.
+    from pgbench_harness.ops.pmm import _merge_spl
+    # switching a monitor cluster to statements: monitor removed, pgaudit kept
+    assert _merge_spl("pg_stat_monitor,pgaudit", "pg_stat_statements") == \
+        "pgaudit,pg_stat_statements"
+    # and the reverse direction
+    assert _merge_spl("pgaudit,pg_stat_statements", "pg_stat_monitor") == \
+        "pgaudit,pg_stat_monitor"
+    # counterpart at the head with nothing else -> falls back to the baseline
+    assert _merge_spl("pg_stat_monitor", "pg_stat_statements") == \
+        "pgaudit,pg_stat_statements"
+    # quoted/spaced operator rendering is still matched, dropped, and canonicalized
+    assert _merge_spl(" 'pg_stat_monitor' , pgaudit ", "pg_stat_statements") == \
+        "pgaudit,pg_stat_statements"
+
+
 def test_pmm_enable_preserves_existing_preload_libraries(pmmops):
     """The cluster already loads custom libraries (pgvector, pg_cron): the PMM
     patch must append the extension, never clobber the existing list."""
