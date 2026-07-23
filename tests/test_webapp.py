@@ -119,6 +119,27 @@ def test_run_id_linked_live_before_completion(web, monkeypatch):
     assert early is not None and terminal is not None and early < terminal
 
 
+def test_dry_run_budget_breakdown_explains_per_level_duration(web):
+    """A sweep's duration_s is PER thread level: the dry-run budget must be
+    levels × duration + cooldowns, and budget_breakdown must spell that out so a
+    '5-minute' duration over several levels never reads as ignored."""
+    client, _cfg = web
+    sweep = _spec_yaml("sweep").replace(
+        "sweep:\n  threads: [1]\n  duration_s: 2\n  warmup_s: 1\n  cooldown_s: 0\n  repetitions: 1\n",
+        "sweep:\n  threads: [1, 4]\n  duration_s: 300\n  warmup_s: 60\n  cooldown_s: 30\n  repetitions: 1\n")
+    r = client.post("/api/dry-run", json={"spec_yaml": sweep}, auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    d = r.json()
+    assert d["mode"] == "sweep"
+    assert d["budget_s"] == 2 * 300 + 1 * 30            # two levels, one cooldown
+    assert d["budget_breakdown"] == "2 thread levels × 5:00 each + 1×0:30 cooldown"
+
+    r = client.post("/api/dry-run", json={"spec_yaml": _spec_yaml("soak")}, auth=("viewer", "vpw"))
+    d = r.json()
+    assert d["mode"] == "soak" and d["budget_s"] == 2   # soak duration is a single total window
+    assert d["budget_breakdown"].startswith("single 0:02 window")
+
+
 def test_live_run_loads_from_filesystem_before_indexed(web):
     """A started-but-not-yet-indexed run (no DB row) must still load the cockpit
     via its on-disk manifest — the fix for 'run not found' on a live run link."""

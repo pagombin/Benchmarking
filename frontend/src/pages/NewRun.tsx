@@ -162,8 +162,10 @@ export function NewRun({ me }: { me: Me }) {
   async function dryRun() {
     setErr(null);
     try {
-      const d = await api.post<{ mode: string; budget_s: number; commands: string[] }>("/api/dry-run", { spec_yaml: yaml });
-      setDryOut(`# ${d.mode} — planned wall-clock ~${Math.round(d.budget_s / 60)} min (${d.budget_s}s)\n` + d.commands.join("\n"));
+      const d = await api.post<{ mode: string; budget_s: number; budget_breakdown?: string; commands: string[] }>("/api/dry-run", { spec_yaml: yaml });
+      setDryOut(`# ${d.mode} — planned wall-clock ~${Math.round(d.budget_s / 60)} min (${d.budget_s}s)`
+        + (d.budget_breakdown ? `\n# budget = ${d.budget_breakdown}` : "")
+        + `\n` + d.commands.join("\n"));
     } catch (e) { setDryOut("error: " + (e as Error).message); }
   }
   function credBody(): Record<string, unknown> {

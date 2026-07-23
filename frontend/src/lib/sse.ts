@@ -7,6 +7,7 @@ export interface Hello {
   mode: string;
   status: string;
   budget_s: number;
+  budget_breakdown?: string;   // how the budget is built, e.g. "4 thread levels × 5:00 each + 3×0:30 cooldown"
   start_utc: string;   // run t=0 wall-clock anchor (soak load start, else created) for alignment
 }
 

@@ -1086,7 +1086,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
     pg_tail = _CsvTail()
     sent_any = {"samples": False, "pg": False}
     cur_file: Optional[str] = None
-    budget_s = _planned_budget_s(run_dir)
+    budget_s, budget_breakdown = _planned_budget(run_dir)
 
     def _samples_path() -> tuple[Optional[str], Optional[Path]]:
         for rel in ("parsed/soak_timeseries.csv", "parsed/samples.csv"):
@@ -1123,6 +1123,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
     yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
                            "status": _run_status(run_dir), "budget_s": budget_s,
+                           "budget_breakdown": budget_breakdown,
                            "start_utc": _run_start_utc(run_dir),
                            "backfill_cap": SSE_BACKFILL_ROWS})
     for _ in range(max_ticks):
@@ -1326,15 +1327,22 @@ def _run_start_utc(run_dir: Path) -> str:
     return str(soak_start or m.get("created_utc", "") or "")
 
 
-def _planned_budget_s(run_dir: Path) -> int:
-    """Planned wall-clock budget from the spec (for live ETA); 0 if unknown."""
+def _planned_budget(run_dir: Path) -> tuple[int, str]:
+    """Planned wall-clock budget + human breakdown from the spec (for live ETA).
+    Returns (0, "") if unknown — the ETA is best-effort and never breaks the stream."""
     spec = run_dir / "spec.yaml"
     if not spec.exists():
-        return 0
+        return 0, ""
     try:
-        return int(harness_api.dry_run(spec.read_text(encoding="utf-8")).get("budget_s", 0))
+        dr = harness_api.dry_run(spec.read_text(encoding="utf-8"))
+        return int(dr.get("budget_s", 0)), str(dr.get("budget_breakdown", ""))
     except Exception:  # noqa: BLE001  (ETA is best-effort, never breaks the stream)
-        return 0
+        return 0, ""
+
+
+def _planned_budget_s(run_dir: Path) -> int:
+    """Planned wall-clock budget only (kept for callers that don't need the breakdown)."""
+    return _planned_budget(run_dir)[0]
 
 
 def _progress(run_dir: Path, budget_s: int) -> dict:

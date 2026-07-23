@@ -38,6 +38,7 @@ export function RunDetail({ me }: { me: Me }) {
   const [streamState, setStreamState] = useState("connecting…");
   const [activeJob, setActiveJob] = useState<Job | null>(null);
   const [budget, setBudget] = useState(0);   // planned wall-clock budget (from hello)
+  const [budgetBreakdown, setBudgetBreakdown] = useState("");  // how the budget is built (from hello)
   const [mode, setMode] = useState("");      // sweep | soak (from hello)
   const [verdict, setVerdict] = useState<{ finding: string; detail: string;
     peak_sustained_iops: number } | null>(null);
@@ -72,6 +73,7 @@ export function RunDetail({ me }: { me: Me }) {
         setPg(pgRef.current);
         setLog("");
         setBudget(h.budget_s);
+        setBudgetBreakdown(h.budget_breakdown || "");
         setMode(h.mode);
         setStreamState("live");
       },
@@ -237,6 +239,11 @@ export function RunDetail({ me }: { me: Me }) {
             {progress.levels_total > 0 && <>level {progress.current || "—"} · {progress.levels_done}/{progress.levels_total} levels · </>}
             {pct}% of planned budget
           </div>
+          {budgetBreakdown && (
+            <div className="subtle" style={{ marginTop: 2, fontSize: 12 }}>
+              budget = {budgetBreakdown}
+            </div>
+          )}
         </div>
       )}
 
