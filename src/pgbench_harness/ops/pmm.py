@@ -123,6 +123,18 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
 _STAT_PAIR = {"pg_stat_statements": "pg_stat_monitor",
               "pg_stat_monitor": "pg_stat_statements"}
 
+# The operator's Validate() counts an extension as "enabled" through a SECOND,
+# independent path: the built-in extensions toggle spec.extensions.builtin.<key>
+# (pgv2 2.x manages shared_preload_libraries + CREATE EXTENSION from it). So
+# removing pg_stat_monitor from shared_preload_libraries is NOT enough — while
+# spec.extensions.builtin.pgStatMonitor stays true the operator still sees both
+# stat modules enabled and rejects EVERY reconcile (the rejection is at the top
+# of Reconcile, so the whole cluster — rollout included — stops progressing).
+# Enabling one half of the pair must therefore also switch off the OTHER half's
+# built-in toggle.
+_EXT_BUILTIN_KEY = {"pg_stat_monitor": "pgStatMonitor",
+                    "pg_stat_statements": "pgStatStatements"}
+
 
 def _merge_spl(existing: str, extension: str) -> str:
     """Merge the PMM extension into the cluster's existing preload libraries:
@@ -718,7 +730,7 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         run.event("preflight", f"found {t.cr_kind}/{t.cr_name}")
 
         def build_patch(spl: str) -> dict[str, Any]:
-            return {"spec": {
+            patch: dict[str, Any] = {"spec": {
                 "pmm": {"enabled": True, "image": cfg["client_image"],
                         "imagePullPolicy": "IfNotPresent",
                         "querySource": _CR_QUERY_SOURCE.get(
@@ -726,6 +738,14 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
                         "secret": secret_name, "serverHost": cfg["server_host"]},
                 "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
                     "shared_preload_libraries": spl}}}}}}
+            # Also switch OFF the counterpart's built-in extension toggle, or the
+            # operator keeps counting it as enabled (via spec.extensions.builtin)
+            # and rejects the CR at Validate() no matter what SPL says.
+            counterpart = _STAT_PAIR.get(cfg["extension"])
+            key = _EXT_BUILTIN_KEY.get(counterpart) if counterpart else None
+            if key:
+                patch["spec"]["extensions"] = {"builtin": {key: False}}
+            return patch
 
         if dry_run:
             # no exec in a dry-run: detect from the CR (re-checked live,
@@ -779,8 +799,12 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         # 5. single CR patch
         kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
                   "-p", json.dumps(patch)], check=True)
+        _dis = _EXT_BUILTIN_KEY.get(_STAT_PAIR.get(cfg["extension"]) or "")
         run.event("apply", "CR patched",
-                  f"pmm enabled + shared_preload_libraries={spl}")
+                  f"pmm enabled + shared_preload_libraries={spl}"
+                  + (f"; spec.extensions.builtin.{_dis}=false (operator counts "
+                     "the built-in toggle as an independent enable)"
+                     if _dis else ""))
 
         # 6. spec-aware rollout wait
         rolled = _wait_rollout(kube, run, t.cr_kind, t.cr_name, cfg, secret_name,

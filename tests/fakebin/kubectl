@@ -54,7 +54,7 @@ DEV_MAJMIN = "259:4"
 def default_state():
     insts = ["cluster1-instance1-abcd-0", "cluster1-instance1-efgh-0",
              "cluster1-instance1-ijkl-0"]
-    return {
+    state = {
         "cluster": "cluster1", "leader": insts[0], "tl": 5,
         "instances": [{"name": n, "node": f"node-{i}", "ip": f"10.244.0.{20+i}"}
                       for i, n in enumerate(insts)],
@@ -87,6 +87,12 @@ def default_state():
         "pending_restart": [], "roll_until": 0,
         "extensions": ["pgaudit"], "pmm_roll": {}, "pmm_secret": "",
     }
+    # FAKE_KUBE_BUILTIN_PGSM: mirror a real 2.9 cluster that enables
+    # pg_stat_monitor via the built-in extensions toggle (independent of
+    # shared_preload_libraries) — so Validate rejects until it's switched off.
+    if os.environ.get("FAKE_KUBE_BUILTIN_PGSM"):
+        state["cr"]["spec"]["extensions"] = {"builtin": {"pgStatMonitor": True}}
+    return state
 
 
 def load():
@@ -1269,10 +1275,11 @@ def main():
                     dst[k] = v
 
         # Operator Validate(): pg_stat_monitor and pg_stat_statements are
-        # mutually exclusive — a CR that lists BOTH in shared_preload_libraries
-        # is rejected (perconapgcluster_types.go). This is the real reason an
-        # additive merge on a pg_stat_monitor cluster never rolled: the patch
-        # was refused, not slow. Evaluate against the POST-merge value.
+        # mutually exclusive (perconapgcluster_types.go). A module counts as
+        # "enabled" through EITHER path — presence in shared_preload_libraries OR
+        # the built-in extensions toggle spec.extensions.builtin.<key> — so
+        # clearing only the SPL is not enough while the toggle stays true. This
+        # runs against the POST-merge CR and rejects if both end up enabled.
         merged_cr = json.loads(json.dumps(st["cr"]))
         deep_merge(merged_cr, patch)
         spl_v = str(((((((merged_cr.get("spec") or {}).get("patroni") or {})
@@ -1280,7 +1287,12 @@ def main():
                       or {}).get("parameters") or {})
                      .get("shared_preload_libraries", "")))
         spl_toks = {p.strip().strip("'\"").strip() for p in spl_v.split(",")}
-        if {"pg_stat_monitor", "pg_stat_statements"} <= spl_toks:
+        builtin = ((((merged_cr.get("spec") or {}).get("extensions") or {})
+                    .get("builtin")) or {})
+        pgsm_on = "pg_stat_monitor" in spl_toks or bool(builtin.get("pgStatMonitor"))
+        pgss_on = ("pg_stat_statements" in spl_toks
+                   or bool(builtin.get("pgStatStatements")))
+        if pgsm_on and pgss_on:
             sys.stderr.write(
                 "admission webhook denied the request: "
                 "validate PerconaPGCluster: pg_stat_monitor and "

@@ -2479,6 +2479,25 @@ def test_pmm_rollout_wait_is_spec_aware_not_fooled_by_ready_old_pods(pmmops, mon
     assert meta["headline"]["healthy"] is False
 
 
+def test_pmm_enable_disables_builtin_counterpart_extension(pmmops, monkeypatch):
+    """A 2.9 cluster enables pg_stat_monitor via the built-in extensions toggle
+    (spec.extensions.builtin.pgStatMonitor), independent of
+    shared_preload_libraries. Switching to pg_stat_statements must ALSO flip that
+    toggle off, or the operator's Validate() keeps rejecting the CR (both stat
+    modules 'enabled') and the whole reconcile — rollout included — never runs."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("FAKE_KUBE_BUILTIN_PGSM", "1")   # base CR: monitor builtin on
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops)
+    assert rc == 0                                       # accepted + rolled + healthy
+    # the CR patch turned the counterpart's built-in toggle OFF
+    patches = (Path(os.environ["FAKE_KUBE_STATE"]) / "patches.log").read_text()
+    assert '"pgStatMonitor": false' in patches
+    # and the operator's stored CR reflects it (Validate passed)
+    st = _fake_state()
+    assert (st["cr"]["spec"]["extensions"]["builtin"]["pgStatMonitor"]) is False
+    assert st["cr"]["spec"].get("pmm", {}).get("enabled") is True
+
+
 def test_pmm_rollout_timeout_surfaces_operator_blocker(pmmops, monkeypatch):
     """When the operator won't roll the pods because a pgBackRest backup is
     serializing the rollout, the wait must NAME that blocker (the real cause of
