@@ -190,6 +190,62 @@ def _instance_pods(kube: Kube, cr_name: str) -> list[dict[str, Any]]:
     return classify_pods(items, cr_name)["instances"]
 
 
+# The Percona operator serializes instance rollouts behind pgBackRest backups: a
+# backup marked "in progress" (or a stuck PerconaPGBackup that left the
+# backup-in-progress annotation behind) silently DEFERS every pod restart. That
+# turns a config change into an endless "waiting for rollout" with no error — the
+# real-world cause of a PMM/shared_preload_libraries change never rolling.
+_BACKUP_IN_PROGRESS_ANN = "pgv2.percona.com/backup-in-progress"
+_BACKUP_ACTIVE_STATES = {"Running", "Starting", "Waiting", "New"}
+
+
+def _rollout_blockers(kube: Kube, cr_kind: str, cr_name: str) -> list[str]:
+    """Operator-level reasons an instance rollout can't proceed — surfaced so a
+    blocked rollout never reads as a blind timeout. Best-effort: any probe that
+    errors is simply skipped (the caller still reports the plain timeout)."""
+    blockers: list[str] = []
+    # 1) the CR's backup-in-progress annotation pins the whole cluster
+    try:
+        cr = kube.cluster_cr(cr_kind, cr_name)
+        bip = ((cr.get("metadata") or {}).get("annotations") or {}).get(
+            _BACKUP_IN_PROGRESS_ANN)
+        if bip:
+            blockers.append(
+                f"a pgBackRest backup is marked in progress "
+                f"({_BACKUP_IN_PROGRESS_ANN}={bip}) — the operator serializes "
+                "instance rollouts behind backups; clear it with: kubectl "
+                f"annotate {cr_kind} {cr_name} {_BACKUP_IN_PROGRESS_ANN}-")
+    except KubeError:
+        pass
+    # 2) a PerconaPGBackup for this cluster still in a non-terminal state, plus a
+    #    failed-backup retry loop (usually broken WAL archiving) as context
+    try:
+        items = kube.json(["get", "perconapgbackup"]).get("items") or []
+    except KubeError:
+        items = []
+    active, failed = [], []
+    for it in items:
+        meta, spec, status = (it.get("metadata") or {}, it.get("spec") or {},
+                              it.get("status") or {})
+        name = meta.get("name", "")
+        if cr_name not in name and spec.get("clusterName") != cr_name:
+            continue
+        state = str(status.get("state") or "")
+        if state in _BACKUP_ACTIVE_STATES:
+            active.append(f"{name} [{state}]")
+        elif state == "Failed":
+            failed.append(name)
+    if active:
+        blockers.append("backup still in flight: " + ", ".join(active[:3])
+                        + " — instance rollout waits for it to finish or be deleted")
+    if failed:
+        blockers.append(
+            f"{len(failed)} failed backup(s) in a retry loop (e.g. {failed[0]}) "
+            "— check WAL archiving (pgBackRest error 082 = WAL not archived); a "
+            "stuck backup here is what pins the rollout")
+    return blockers
+
+
 def _pod_raw(kube: Kube, name: str) -> Optional[dict[str, Any]]:
     try:
         return kube.json(["get", "pod", name])
@@ -232,17 +288,23 @@ def _pod_ready(pod_raw: dict[str, Any]) -> bool:
     return bool(cs) and all(c.get("ready") for c in cs)
 
 
-def _wait_rollout(kube: Kube, run: OpsRun, cr_name: str, cfg: dict[str, Any],
-                  secret_name: str, pre_uids: dict[str, str],
+def _wait_rollout(kube: Kube, run: OpsRun, cr_kind: str, cr_name: str,
+                  cfg: dict[str, Any], secret_name: str, pre_uids: dict[str, str],
                   pre_matched: dict[str, bool], what: str) -> bool:
     """Spec-aware rollout wait (reference-script bug #1 fixed).
 
     Done only when every instance pod exists, is Running with all containers
     Ready, carries the patched spec, and — if its pre-patch spec did NOT
     already match — has a new UID (i.e. was actually recreated). A pod that
-    is merely Ready on the old spec counts as not-done."""
+    is merely Ready on the old spec counts as not-done.
+
+    If nothing has rolled for a while, probe for operator-level blockers (a
+    pgBackRest backup serializing the rollout) and surface them ONCE, so a
+    blocked rollout is diagnosed instead of silently burning the whole timeout."""
     deadline = time.monotonic() + cfg["rollout_timeout_s"]
     last = ""
+    blockers_reported = False
+    checks = 0
     while True:
         pods = _instance_pods(kube, cr_name)
         pending: list[str] = []
@@ -272,10 +334,21 @@ def _wait_rollout(kube: Kube, run: OpsRun, cr_name: str, cfg: dict[str, Any],
         if detail != last:
             run.status_update(phase=f"rollout ({what})", detail=detail)
             last = detail
+        # nothing has rolled AND we've waited a couple of polls -> diagnose why
+        checks += 1
+        stalled = all(": old spec" in p for p in pending) if pending else False
+        if not blockers_reported and checks >= 2 and stalled:
+            blockers = _rollout_blockers(kube, cr_kind, cr_name)
+            if blockers:
+                run.event("rollout", "rollout appears BLOCKED by the operator, "
+                          "not merely slow", "; ".join(blockers))
+                blockers_reported = True
         if time.monotonic() >= deadline:
+            blockers = _rollout_blockers(kube, cr_kind, cr_name)
+            extra = ("  BLOCKED: " + "; ".join(blockers)) if blockers else ""
             run.event("rollout", f"TIMEOUT waiting for rollout ({what})",
-                      detail + " — continuing to verification (never leaving "
-                      "the cluster half-configured silently)")
+                      detail + extra + " — continuing to verification (never "
+                      "leaving the cluster half-configured silently)")
             return False
         time.sleep(cfg["poll_s"])
 
@@ -710,7 +783,7 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
                   f"pmm enabled + shared_preload_libraries={spl}")
 
         # 6. spec-aware rollout wait
-        rolled = _wait_rollout(kube, run, t.cr_name, cfg, secret_name,
+        rolled = _wait_rollout(kube, run, t.cr_kind, t.cr_name, cfg, secret_name,
                                pre_uids, pre_matched, "post CR-patch")
 
         # 7. post-rollout re-discovery (resilient — leader may have moved)

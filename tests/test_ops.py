@@ -2479,6 +2479,43 @@ def test_pmm_rollout_wait_is_spec_aware_not_fooled_by_ready_old_pods(pmmops, mon
     assert meta["headline"]["healthy"] is False
 
 
+def test_pmm_rollout_timeout_surfaces_operator_blocker(pmmops, monkeypatch):
+    """When the operator won't roll the pods because a pgBackRest backup is
+    serializing the rollout, the wait must NAME that blocker (the real cause of
+    a PMM change never rolling) instead of a blind timeout — both an early
+    'BLOCKED' event and the blocker detail on the timeout line."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("FAKE_KUBE_ROLL_S", "600")          # pods never roll
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_IN_PROGRESS",
+                       "cluster1-repo1-incr-bdvd5")        # CR annotation set
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_BLOCK", "Running:3")  # 1 active + 3 failed
+    rc = run_pmm_enable(
+        _pmm_ops_spec("pmm-enable", rollout_timeout_s=1.5, poll_s=0.3,
+                      qan_timeout_s=0.5, discover_timeout_s=5), pmmops)
+    assert rc == 1
+    events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "BLOCKED by the operator" in events              # early diagnosis
+    assert "backup-in-progress" in events                   # the annotation cause
+    assert "backup still in flight" in events               # the active backup
+    assert "WAL archiving" in events                        # the failed-loop hint
+    assert "TIMEOUT waiting for rollout" in events
+
+
+def test_rollout_blockers_probe_reads_backup_state(pmmops, monkeypatch):
+    """The blocker probe itself: reads the CR annotation and the PerconaPGBackup
+    list, and stays silent (empty) when nothing is blocking."""
+    from pgbench_harness.ops.kube import Kube
+    from pgbench_harness.ops.pmm import run_pmm_enable, _rollout_blockers
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0  # seed a CR
+    kube = Kube(namespace="percona")
+    assert _rollout_blockers(kube, "perconapgcluster", "cluster1") == []
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_IN_PROGRESS", "cluster1-repo1-incr-bdvd5")
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_BLOCK", "Running:0")
+    blockers = _rollout_blockers(kube, "perconapgcluster", "cluster1")
+    assert any("backup-in-progress" in b for b in blockers)
+    assert any("in flight" in b for b in blockers)
+
+
 def test_pmm_status_reports_without_mutating(pmmops):
     from pgbench_harness.ops.pmm import run_pmm_enable, run_pmm_status
     assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0

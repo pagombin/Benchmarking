@@ -1039,17 +1039,44 @@ def main():
                 return 1
             named = [a for a in rest if not a.startswith("-")
                      and a not in ("json", "yaml")]
+            cr_doc = st["cr"]
+            # FAKE_KUBE_BACKUP_IN_PROGRESS: stamp the operator's
+            # backup-in-progress annotation so the rollout-blocker probe sees a
+            # pinned cluster (a stuck backup serializing the instance rollout).
+            bip = os.environ.get("FAKE_KUBE_BACKUP_IN_PROGRESS")
+            if bip:
+                cr_doc = json.loads(json.dumps(cr_doc))
+                cr_doc.setdefault("metadata", {}).setdefault("annotations", {})[
+                    "pgv2.percona.com/backup-in-progress"] = bip
             if "-o" in rest and "yaml" in rest:
                 # cheap YAML render (only used for snapshots — kept raw anyway)
-                out(json.dumps(st["cr"], indent=2))
+                out(json.dumps(cr_doc, indent=2))
                 return 0
             if named:
                 if named[0] != st["cluster"]:
                     sys.stderr.write(f'Error from server (NotFound): {named[0]} not found\n')
                     return 1
-                out(json.dumps(st["cr"]))
+                out(json.dumps(cr_doc))
                 return 0
-            out(json.dumps({"items": [st["cr"]]}))
+            out(json.dumps({"items": [cr_doc]}))
+            return 0
+        if kind in ("perconapgbackup", "perconapgbackups", "pg-backup",
+                    "pg-backups"):
+            # FAKE_KUBE_BACKUP_BLOCK="Running:2" -> one active backup + 2 failed,
+            # to exercise the rollout blocker probe / WAL-archiving hint.
+            spec = os.environ.get("FAKE_KUBE_BACKUP_BLOCK", "")
+            items = []
+            if spec:
+                state, _, nf = spec.partition(":")
+                cl = st["cluster"]
+                items.append({"metadata": {"name": f"{cl}-repo1-incr-bdvd5"},
+                              "spec": {"clusterName": cl},
+                              "status": {"state": state or "Running"}})
+                for i in range(int(nf or 0)):
+                    items.append({"metadata": {"name": f"{cl}-repo1-incr-f{i}"},
+                                  "spec": {"clusterName": cl},
+                                  "status": {"state": "Failed"}})
+            out(json.dumps({"items": items}))
             return 0
         if kind in ("pvc", "persistentvolumeclaim", "persistentvolumeclaims"):
             name = args[2]
