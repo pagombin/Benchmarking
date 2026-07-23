@@ -584,10 +584,14 @@ def run_sql(st, sql):
     if "pg_database_size" in s:
         return "13100000000"
     if "clock_timestamp" in s:
-        # probe-style query answered inside the pod (not via pgbouncer)
+        # probe-style query: report the CURRENT leader's IP so a promotion
+        # shows up as an address flip (the election signal, distinct from TL).
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).isoformat()
-        return f"{ts}|f|10.244.0.20"
+        leader_inst = next((i for i in st["instances"]
+                            if i["name"] == st["leader"]), None)
+        addr = leader_inst["ip"] if leader_inst else "10.244.0.20"
+        return f"{ts}|f|{addr}"
     return ""
 
 
@@ -750,6 +754,23 @@ def handle_exec(st, pod, argv):
         for i, a in enumerate(argv):
             if a == "-c" and i + 1 < len(argv):
                 sql = argv[i + 1]
+        # In-cluster helper probe: connects to a service (host=<cr>-ha /
+        # <cr>-pgbouncer) rather than exec'ing on the leader. It sees an
+        # outage whenever the cluster has no writable primary — a restart
+        # window, a pending election, or a rolling restart.
+        via_service = "host=" in joined and (f"{st['cluster']}-ha" in joined
+                                             or f"{st['cluster']}-pgbouncer" in joined)
+        if via_service:
+            maybe_elect(st)
+            st = load()
+            down = (rolling(st)
+                    or (st.get("killed_at") and now() < st["killed_at"] + RESTART_S)
+                    or (st.get("elect_at") and now() < st["elect_at"])
+                    or not pod_alive(st, st["leader"]))
+            if down:
+                sys.stderr.write("psql: error: connection to server failed: "
+                                 "Connection refused\n")
+                return 2
         if st["killed_at"] and now() < st["killed_at"] + RESTART_S \
                 and pod == st["leader"]:
             sys.stderr.write("psql: error: connection to server failed: "

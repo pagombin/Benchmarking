@@ -1692,6 +1692,39 @@ def _fire_scenario(client, tid, case, extra=None, confirm="cluster1"):
                        auth=("admin", "apw"))
 
 
+def test_scenario_in_cluster_helper_dual_path(opsweb, monkeypatch):
+    """M2: the in-cluster helper pod runs dual-path probes (pgbouncer + ha),
+    survives the failover (real cluster DNS, not a port-forward), and is torn
+    down at the end."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_C1_ELECT", "1")
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    # no probe.mode -> pod-delete defaults to the in-cluster helper
+    r = _fire_scenario(client, tid, "pod-delete",
+                       extra={"settle_s": 8, "probe": {"hz": 5}})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    # both probe paths captured
+    assert (run_dir / "raw" / "probe.log").exists()          # pgbouncer (authoritative)
+    assert (run_dir / "raw" / "probe_ha.log").exists()       # direct-to-primary
+    assert "OK " in (run_dir / "raw" / "probe.log").read_text()
+    events = (run_dir / "events.jsonl").read_text()
+    assert "in-cluster helper probes started" in events
+    # the stitcher reports per-path downtime
+    stitched = json.loads((run_dir / "stitched.json").read_text())
+    assert "per_path" in stitched["probe"]
+    assert "ha" in stitched["probe"]["per_path"]
+    # helper pod was deleted (torn down)
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    helper_deleted = [n for n in st.get("deleted", {}) if n.startswith("pgb-probe-")]
+    assert helper_deleted, "helper pod should have been torn down"
+
+
 def test_scenario_case_b_pgkill_restart_in_place(opsweb):
     """Case B: kill -9 the postmaster. Patroni restarts Postgres in place —
     NOT a failover. Classification must say so (leader name unchanged)."""
