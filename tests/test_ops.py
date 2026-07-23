@@ -2023,6 +2023,46 @@ def test_invalid_ops_params_rejected_at_api(opsweb):
         assert r.status_code == 400, f"{path} {body} -> {r.status_code}"
 
 
+def test_ops_routes_never_500_on_malformed_input(opsweb):
+    """J: every ops mutation route must map bad input to a typed 4xx — never a
+    500. A 500 leaks internals and means an unhandled path; this sweeps the
+    mutation surface (including the routes added for logs / snapshots / revert)
+    with garbage payloads and asserts none of them crash."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    garbage = [
+        {"params": "notadict"},
+        {"params": {"sources": "notalist"}},
+        {"params": {"tail": "lots"}},
+        {"params": {"since": "yesterday"}},
+        {"params": {"snapshot_of": "../../etc/passwd"}},
+        {"params": {"action": "revert_snapshot"}},        # missing snapshot_of
+        {"params": {"checks": "notalist"}},
+        {"params": {"watch_s": "forever"}},
+        {"params": {"replicas": "many"}},
+        {"confirm": "cluster1", "params": {"operation": "explode"}},
+    ]
+    routes = ["logs", "cr-snapshot", "cr-revert", "diag", "operate", "monitor",
+              "cr-apply", "backup", "scenario", "health"]
+    for route in routes:
+        for body in garbage:
+            r = client.post(f"/api/kube-targets/{tid}/{route}", json=body,
+                            auth=("admin", "apw"))
+            assert r.status_code != 500, f"{route} {body} -> 500: {r.text[:200]}"
+            assert r.status_code in (200, 400, 403, 404, 409), \
+                f"{route} {body} -> unexpected {r.status_code}"
+    # unknown target id is a clean 404 everywhere, not a 500
+    for route in routes:
+        r = client.post(f"/api/kube-targets/999999/{route}",
+                        json={"params": {}}, auth=("admin", "apw"))
+        assert r.status_code in (400, 404), f"{route} missing target -> {r.status_code}"
+    # bad snapshot-diff / compare ids -> 4xx, not 500
+    assert client.get("/api/ops/runs/..%2F..%2Fetc/cr-snapshot-diff",
+                      auth=("viewer", "vpw")).status_code in (400, 404)
+    assert client.get("/api/ops/compare?runs=only-one",
+                      auth=("viewer", "vpw")).status_code == 400
+
+
 def test_worker_loop_monitor_does_not_block_benchmarks(opsweb, monkeypatch):
     """The queue wedge fix: a 'running' monitor thread must not stop the loop
     from claiming other jobs (the len(active) gate now excludes monitors)."""
