@@ -172,8 +172,12 @@ class HelperPod:
                 self.ready = True
                 return True
             time.sleep(2)
+        # Never Running in time: the pod (Pending/ImagePullBackOff) still
+        # exists — reap it so a failed launch can't leak a pod that run_scenario
+        # will never see again (it sets helper=None on a False return).
         self.run_ref.event("probe", "helper pod not Running in time",
                            "check image pull / scheduling")
+        self.teardown()
         return False
 
     def teardown(self) -> None:
@@ -208,13 +212,20 @@ class HelperProbeThread(threading.Thread):
             ("user", user), ("sslmode", sslmode), ("connect_timeout", "2")))
         self.pw = pw
 
+    # The password reaches psql via STDIN, never argv: `$(cat)` reads it from
+    # the piped stdin and command substitution strips the trailing newline, so
+    # the secret never appears in the kubectl-exec argv (worker process table)
+    # nor in the pod's process table — only ProbeThread's env-var contract,
+    # applied to the in-cluster path.
+    _PROBE_SH = ('PGPASSWORD="$(cat)" psql "$1" -X -q -A -t -c "$2" -c "$3"')
+
     def tick(self) -> None:
         local = _now_iso_ms()
-        argv = ["env", f"PGPASSWORD={self.pw}", "psql", self.conninfo,
-                "-X", "-q", "-A", "-t", "-c", PROBE_WRITE_SQL,
-                "-c", PROBE_SELECT_SQL]
+        argv = ["sh", "-c", self._PROBE_SH, "probe", self.conninfo,
+                PROBE_WRITE_SQL, PROBE_SELECT_SQL]
         try:
-            res = self.kube.exec(self.helper, "", argv, timeout_s=4)
+            res = self.kube.exec(self.helper, "", argv, timeout_s=4,
+                                 input_text=self.pw)
         except KubeError:
             self._log(f"FAIL {local} exec-error")
             self.consecutive_ok = 0
