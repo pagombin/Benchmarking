@@ -92,7 +92,7 @@ export function LiveCompare() {
   }, [ids]);
 
   if (ids.length < 2) {
-    return <div className="banner-err">Live compare needs two or more runs — open it from Compare with soaks selected.</div>;
+    return <div className="banner-err">Live compare needs two or more runs — open it from Compare with 2–6 same-mode runs selected.</div>;
   }
 
   // ── alignment on a shared real-time axis ──────────────────────────────

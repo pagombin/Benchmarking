@@ -34,9 +34,16 @@ export function Compare() {
     () => new Set((runs ?? []).filter((r) => sel.has(r.run_id)).map((r) => r.mode)),
     [runs, sel]);
   const mixed = selModes.size > 1;
-  // Live compare overlays runs on a shared real-time axis — soak-only (a sweep's
-  // per-level timeline can't be wall-clock aligned), 2–6 runs.
-  const canLive = sel.size >= 2 && sel.size <= 6 && selModes.size === 1 && [...selModes][0] === "soak";
+  // Live compare overlays 2–6 same-mode runs on a shared real-time axis. Soaks
+  // align cleanly (continuous wall-clock); sweeps still overlay but the live
+  // view warns that their per-level timelines won't line up exactly. Mixing
+  // modes on one axis is meaningless, so require a single mode.
+  const canLive = sel.size >= 2 && sel.size <= 6 && selModes.size === 1;
+  const liveReason = sel.size < 2 ? "Select 2–6 runs to overlay live"
+    : sel.size > 6 ? "Live compare overlays at most 6 runs"
+      : mixed ? "Select runs of a single mode (all sweep or all soak)"
+        : "Overlay these runs live on a shared real-time axis"
+          + ([...selModes][0] !== "soak" ? " (sweeps align approximately)" : "");
 
   if (viewing) {
     return (
@@ -60,8 +67,7 @@ export function Compare() {
         <span className="subtle">{sel.size} selected</span>
         {mixed && <span className="subtle" style={{ color: "var(--bad, #c0392b)" }}>
           same type only (sweep or soak)</span>}
-        <button disabled={!canLive}
-          title={canLive ? "Overlay these soaks live on a shared real-time axis" : "Select 2–6 soak runs"}
+        <button disabled={!canLive} title={liveReason}
           onClick={() => navigate(`/compare/live?runs=${[...sel].map(encodeURIComponent).join(",")}`)}>
           ▶ Live compare
         </button>
