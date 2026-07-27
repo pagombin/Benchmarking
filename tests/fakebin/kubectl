@@ -442,6 +442,9 @@ PG_CATALOG = {
     "huge_pages": ("try", None, "enum", None, None, ["off", "on", "try"],
                    "postmaster", "Resource Usage / Memory",
                    "Use of huge pages on Linux or Windows."),
+    "track_commit_timestamp": ("off", None, "bool", None, None, None,
+                               "postmaster", "Replication / Sending Servers",
+                               "Collects transaction commit time."),
     "shared_preload_libraries": ("pgaudit", None, "string", None, None, None,
                                  "postmaster", "Client Connection Defaults / Shared Library Preloading",
                                  "Lists shared libraries to preload into server."),
@@ -489,16 +492,35 @@ def pg_catalog_rows(st):
     """pg_settings rows (dicts) for the json_agg catalog query."""
     params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
               ["parameters"])
+    # FAKE_KUBE_CMDLINE_PARAMS="track_commit_timestamp=on,..." — the operator
+    # owns these on the postgres command line: their live value is FIXED and
+    # never reflects a dynamicConfiguration patch, and source is 'command line'.
+    cmdline = {}
+    for kv in os.environ.get("FAKE_KUBE_CMDLINE_PARAMS", "").split(","):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            cmdline[k.strip()] = v.strip()
     rows = []
     for name in sorted(PG_CATALOG):
         setting, unit, vartype, mn, mx, enums, context, cat, desc = PG_CATALOG[name]
-        live = normalize_setting(params.get(name, setting), unit)
+        if name in cmdline:
+            live = normalize_setting(cmdline[name], unit)
+            source = "command line"
+        else:
+            live = normalize_setting(params.get(name, setting), unit)
+            source = "configuration file" if name in params else "default"
+            # FAKE_KUBE_SPL_DECORATE: mimic the operator decorating the preload
+            # list at runtime — inject pgaudit and double entries — so an
+            # exact-string verify fails but a set-containment verify converges.
+            if (name == "shared_preload_libraries" and name in params
+                    and os.environ.get("FAKE_KUBE_SPL_DECORATE")):
+                base = str(params[name])
+                live = f"{base},{base},pgaudit"
         rows.append({
             "name": name, "setting": live, "unit": unit, "vartype": vartype,
             "min_val": mn, "max_val": mx, "enumvals": enums, "context": context,
             "category": cat, "short_desc": desc, "boot_val": setting,
-            "reset_val": live,
-            "source": "configuration file" if name in params else "default",
+            "reset_val": live, "source": source,
             "pending_restart": name in st.get("pending_restart", []),
         })
     return rows

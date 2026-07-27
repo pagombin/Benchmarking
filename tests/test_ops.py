@@ -970,6 +970,50 @@ def test_cr_apply_verifies_live_values(opsweb):
     assert "patronictl_show_config.txt" in detail["raw_files"]
 
 
+def test_cr_apply_spl_converges_as_a_set_despite_operator_decoration(opsweb, monkeypatch):
+    """The operator injects pgaudit and doubles shared_preload_libraries at
+    runtime. An exact-string verify would flag that as a permanent miss; the
+    set-containment compare converges as long as the requested lib is loaded."""
+    monkeypatch.setenv("FAKE_KUBE_SPL_DECORATE", "1")   # runtime -> "<v>,<v>,pgaudit"
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters":
+                                         {"shared_preload_libraries": "pg_stat_statements"},
+                                     "verify_timeout_s": 8})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run          # set-compare converged
+    assert run["headline"]["verified"] is True
+
+
+def test_cr_apply_reports_operator_managed_param_clearly(opsweb, monkeypatch):
+    """A param the operator pins on the postgres command line can't be set via
+    patroni params. The verify must NAME it as operator-managed (with its source)
+    instead of spinning to a blind 'did not converge' — the real-world
+    track_commit_timestamp case."""
+    monkeypatch.setenv("FAKE_KUBE_CMDLINE_PARAMS", "track_commit_timestamp=on")
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"track_commit_timestamp": "off",
+                                                    "min_wal_size": "2048"},
+                                     "verify_timeout_s": 6, "rollout_timeout_s": 2})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "warning"                # not a clean success
+    assert run["headline"]["applied"] is True        # the CR patch DID land
+    assert run["headline"]["operator_managed"] == ["track_commit_timestamp"]
+    # it must NOT be reported as pending-restart (a restart won't help)
+    assert run["headline"]["pending_restart"] == []
+    assert run["headline"]["outcome"] == "applied; operator-managed params overridden"
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "operator-managed" in events and "source=command line" in events
+    assert "EXPECT A FAILOVER" not in events         # no bogus rollout watch
+
+
 def test_cr_apply_pending_restart_fails_loudly(opsweb, monkeypatch):
     client, cfg = opsweb
     monkeypatch.setenv("FAKE_KUBE_PENDING_PARAMS", "max_wal_size")

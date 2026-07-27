@@ -646,7 +646,17 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                 if meta is None or (meta.get("target") or {}).get("name") != kt["name"]:
                     continue
                 rows.append({"dir": d, "meta": meta})
-        rows.sort(key=lambda r: r["meta"].get("created_utc", ""), reverse=True)
+        # created_utc is second-granularity, so two snapshots taken in the same
+        # second would sort ambiguously and "live" (rows[0]) could be the older
+        # one — making a real change read as no diff. Break ties by the snapshot
+        # file's sub-second mtime so the newest is always first.
+        def _sort_key(r: dict[str, Any]) -> tuple:
+            try:
+                mtime = (r["dir"] / "cr_snapshot.json").stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            return (r["meta"].get("created_utc", ""), mtime)
+        rows.sort(key=_sort_key, reverse=True)
         live: dict[str, Any] = {}
         if rows:
             try:

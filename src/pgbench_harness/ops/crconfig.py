@@ -177,37 +177,70 @@ def _snapshot_cr(kube: Kube, run: OpsRun, cr_kind: str, cr_name: str) -> dict[st
     return cr
 
 
+# Postgres GUC sources that the OPERATOR controls — a value set here outranks
+# anything a patroni.dynamicConfiguration patch writes to a config file (command
+# line > config files in Postgres precedence), so the operator, not the user,
+# owns the parameter. Verifying against such a param will NEVER converge to the
+# requested value: report it as operator-managed, not as a mysterious timeout.
+_OPERATOR_MANAGED_SOURCES = {"command line", "override", "environment variable"}
+
+# Parameters whose value is a list the operator DECORATES (it injects its own
+# baseline libraries, e.g. pgaudit, and reconcile-doubles entries). Compare these
+# as a normalized set-containment: the request is satisfied when every library it
+# asks for is present at runtime, regardless of order, duplicates, or extras.
+_SET_VALUED_PARAMS = {"shared_preload_libraries"}
+
+
+def _lib_set(value: Any) -> set:
+    return {p.strip().strip("'\"").strip()
+            for p in str(value or "").split(",") if p.strip().strip("'\"").strip()}
+
+
 def verify_pg_settings(kube: Kube, leader: str, expected: dict[str, Any],
                        timeout_s: float, poll_s: float = 2.0,
                        logger: Any = None,
                        rows: Optional[dict[str, dict[str, Any]]] = None
-                       ) -> tuple[dict[str, str], list[str], bool]:
+                       ) -> tuple[dict[str, str], list[str], bool,
+                                  dict[str, str], list[str]]:
     """Poll pg_settings on the leader until every expected value is live.
 
     Values are compared NORMALIZED (paramcheck): ``pg_settings.setting`` is
     always the base-unit number, so a CR value written as "1GB" or "on" must
     be converted before comparing or a correct, live value reads as a verify
-    failure. The query returns one JSON document — a value containing '|'
-    can never corrupt the parse.
+    failure. ``shared_preload_libraries`` is compared as a set (the operator
+    injects pgaudit and doubles entries). The query returns one JSON document —
+    a value containing '|' can never corrupt the parse.
 
-    Returns (live values, pending_restart names, all_matched)."""
+    Returns (live values, pending_restart names, all_matched, overridden) where
+    ``overridden`` maps each param the OPERATOR controls (pg_settings.source is
+    command-line/override/env) to that source — those can't be set via patroni
+    params, so the caller reports them plainly instead of as a failed verify."""
     from pgbench_harness.ops.paramcheck import values_equal
     if not expected:
         # Nothing with a target value to confirm (e.g. a removal-only change).
         # Return not-matched so the caller never reports a vacuous "verified".
-        return {}, [], False
+        return {}, [], False, {}, []
     # pg_settings names are validated GUC identifiers, but guard the interpolation
     # anyway — only word-characters can reach the IN () list.
     safe = [k for k in expected if re.match(r"^[A-Za-z0-9_.]+$", str(k))]
     names = ",".join(f"'{k}'" for k in safe)
     sql = ("SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM ("
-           "SELECT name, setting, unit, vartype, pending_restart "
+           "SELECT name, setting, unit, vartype, pending_restart, source "
            f"FROM pg_settings WHERE name IN ({names})) s")
 
     def _match(name: str, live_val: str, row: dict[str, Any]) -> bool:
+        if name in _SET_VALUED_PARAMS:
+            return _lib_set(expected[name]) <= _lib_set(live_val)
         meta = row or (rows or {}).get(name) or {}
         return values_equal(live_val, expected[name],
                             meta.get("unit"), meta.get("vartype"))
+
+    def _overridden(unconv: list[str],
+                    lr: dict[str, dict[str, Any]]) -> dict[str, str]:
+        return {nm: str((lr.get(nm) or {}).get("source") or "")
+                for nm in unconv
+                if str((lr.get(nm) or {}).get("source") or "")
+                in _OPERATOR_MANAGED_SOURCES}
 
     deadline = time.monotonic() + timeout_s
     live: dict[str, str] = {}
@@ -232,14 +265,19 @@ def verify_pg_settings(kube: Kube, leader: str, expected: dict[str, Any],
             unconverged = [nm for nm in expected
                            if not (nm in live and _match(nm, live[nm],
                                                          live_rows.get(nm, {})))]
-            # pending_restart params will NEVER converge without a restart —
-            # stop polling for them, surface loudly instead.
-            if not unconverged or all(nm in pending for nm in unconverged):
-                return live, pending, not unconverged
+            overridden = _overridden(unconverged, live_rows)
+            # A param will NEVER converge here if it needs a restart OR the
+            # operator owns it (command-line/override source) — stop polling for
+            # those and surface them; only keep waiting on genuine reload lag.
+            if not unconverged or all(nm in pending or nm in overridden
+                                      for nm in unconverged):
+                return live, pending, not unconverged, overridden, unconverged
         if time.monotonic() >= deadline:
-            return live, pending, all(
-                nm in live and _match(nm, live[nm], live_rows.get(nm, {}))
-                for nm in expected)
+            unconverged = [nm for nm in expected
+                           if not (nm in live and _match(nm, live[nm],
+                                                         live_rows.get(nm, {})))]
+            return (live, pending, not unconverged,
+                    _overridden(unconverged, live_rows), unconverged)
         if logger:
             logger.info("verify: waiting for pg_settings to converge "
                         "(%s pending)", len(expected) - sum(
@@ -1111,12 +1149,26 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
                               dict(params.get("prep") or {}))
                 run.finalize("complete", headline=headline)
                 return EXIT_OK
-            live, pending, matched = verify_pg_settings(
+            live, pending, matched, overridden, unconverged = verify_pg_settings(
                 kube, leader, expected, verify_timeout, logger=log, rows=rows)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(
-                {"live": live, "pending_restart": pending, "matched": matched},
-                indent=2))
-            headline.update({"verified": matched, "pending_restart": pending})
+                {"live": live, "pending_restart": pending, "matched": matched,
+                 "operator_managed": overridden}, indent=2))
+            headline.update({"verified": matched, "pending_restart": pending,
+                             "operator_managed": sorted(overridden)})
+            # Operator-owned params (source=command-line/override) can't be set
+            # via patroni.dynamicConfiguration — say so plainly rather than let
+            # them read as a failed verify. Exclude them from the pending-restart
+            # path (a restart won't help; the operator re-asserts its value).
+            if overridden:
+                run.event("operator-managed",
+                          f"{len(overridden)} parameter(s) are set by the operator "
+                          "and cannot be overridden via patroni params",
+                          "; ".join(f"{nm} (source={src}; live={live.get(nm, '?')})"
+                                    for nm, src in sorted(overridden.items()))
+                          + " — drop these from the change, or set them where the "
+                          "operator manages them")
+            pending = [nm for nm in pending if nm not in overridden]
             if pending:
                 run.event("pending-restart",
                           f"{len(pending)} parameter(s) require a restart",
@@ -1135,7 +1187,7 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
                         kube, t.cr_name, list(expected), rollout_timeout)
                     if ok:
                         leader2 = detail
-                        live2, pending2, matched2 = verify_pg_settings(
+                        live2, pending2, matched2, _ov2, _un2 = verify_pg_settings(
                             kube, leader2, expected,
                             min(60.0, verify_timeout), logger=log, rows=rows)
                         atomic_write_text(run.run_dir / "verify.json", json.dumps(
@@ -1186,6 +1238,19 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
                               dict(params.get("prep") or {}))
                 run.finalize("warning", headline=headline)
                 return EXIT_WARNING
+            genuine_miss = [nm for nm in unconverged if nm not in overridden]
+            if not matched and not genuine_miss and overridden:
+                # Everything the user CAN control applied; the only misses are
+                # operator-owned params (already reported above). That's not a
+                # verify failure — it's an operator policy the change can't beat.
+                headline["outcome"] = "applied; operator-managed params overridden"
+                _prep_actions(kube, run, leader, t.db_name,
+                              dict(params.get("prep") or {}))
+                run.finalize("warning", headline=headline,
+                             error=f"{len(overridden)} operator-managed param(s) "
+                                   f"could not be set via patroni params: "
+                                   f"{', '.join(sorted(overridden))}")
+                return EXIT_WARNING
             if not matched:
                 # The patch DID land (the CR carries it) — only pg_settings
                 # never showed the value. That is amber, not red: 'failed'
@@ -1193,15 +1258,18 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
                 diag = verify_diagnostics(kube, t.cr_name)
                 atomic_write_text(run.run_dir / "verify.json", json.dumps(
                     {"live": live, "pending_restart": pending,
-                     "matched": matched, "diagnostics": diag}, indent=2))
+                     "matched": matched, "diagnostics": diag,
+                     "operator_managed": overridden}, indent=2))
                 summary = diagnostics_summary(diag)
                 headline["outcome"] = "applied, verify failed"
+                miss_note = (f" ({', '.join(genuine_miss)} still not live)"
+                             if genuine_miss else "")
                 run.event("verify", "values did not converge in pg_settings",
-                          json.dumps(live)[:300]
+                          json.dumps(live)[:300] + miss_note
                           + (f" — {summary}" if summary else ""))
                 run.finalize("warning", headline=headline,
                              error="verify timeout: CR patched but pg_settings "
-                                   "never showed the new values"
+                                   "never showed the new values" + miss_note
                                    + (f" — {summary}" if summary else ""))
                 return EXIT_WARNING
             headline["outcome"] = "applied+verified"
