@@ -119,6 +119,27 @@ def test_run_id_linked_live_before_completion(web, monkeypatch):
     assert early is not None and terminal is not None and early < terminal
 
 
+def test_dry_run_budget_breakdown_explains_per_level_duration(web):
+    """A sweep's duration_s is PER thread level: the dry-run budget must be
+    levels × duration + cooldowns, and budget_breakdown must spell that out so a
+    '5-minute' duration over several levels never reads as ignored."""
+    client, _cfg = web
+    sweep = _spec_yaml("sweep").replace(
+        "sweep:\n  threads: [1]\n  duration_s: 2\n  warmup_s: 1\n  cooldown_s: 0\n  repetitions: 1\n",
+        "sweep:\n  threads: [1, 4]\n  duration_s: 300\n  warmup_s: 60\n  cooldown_s: 30\n  repetitions: 1\n")
+    r = client.post("/api/dry-run", json={"spec_yaml": sweep}, auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    d = r.json()
+    assert d["mode"] == "sweep"
+    assert d["budget_s"] == 2 * 300 + 1 * 30            # two levels, one cooldown
+    assert d["budget_breakdown"] == "2 thread levels × 5:00 each + 1×0:30 cooldown"
+
+    r = client.post("/api/dry-run", json={"spec_yaml": _spec_yaml("soak")}, auth=("viewer", "vpw"))
+    d = r.json()
+    assert d["mode"] == "soak" and d["budget_s"] == 2   # soak duration is a single total window
+    assert d["budget_breakdown"].startswith("single 0:02 window")
+
+
 def test_live_run_loads_from_filesystem_before_indexed(web):
     """A started-but-not-yet-indexed run (no DB row) must still load the cockpit
     via its on-disk manifest — the fix for 'run not found' on a live run link."""
@@ -171,6 +192,38 @@ def test_compare_same_type_only(web):
                                       encoding="utf-8")
     r = client.get(f"/compare/view?runs={sweeps[0]},run-bare", auth=("viewer", "vpw"))
     assert r.status_code == 400 and "Internal Server Error" not in r.text
+
+
+def test_compare_download_is_a_self_contained_shareable_file(web):
+    """The whole comparison downloads as ONE self-contained .html attachment
+    (inlined CSS + embedded charts) named from the runs' labels — the artifact a
+    user hands to their manager, not a single printed screen."""
+    client, cfg = web
+
+    def _make(label):
+        spec = _spec_yaml("sweep").replace("label: web-test", f"label: {label}")
+        client.post("/api/runs", json={"spec_yaml": spec, "password": WEB_PW},
+                    auth=("op", "oppw"))
+        return _run_worker_once(cfg)[2]["run_id"]
+    a, b = _make("standard"), _make("advanced")
+
+    r = client.get(f"/compare/download?runs={a},{b}", auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    cd = r.headers.get("content-disposition", "")
+    assert "attachment" in cd and cd.endswith('.html"')
+    assert "standard" in cd and "advanced" in cd            # manager-friendly name
+    body = r.text
+    assert body.lstrip().lower().startswith("<!doctype html")  # a complete document
+    assert "<style>" in body                                 # CSS inlined, not linked
+    assert 'src="data:image' in body                         # charts embedded, not external
+    assert "<link" not in body and "<script src=" not in body  # no external assets
+
+    # cross-type still refuses cleanly through the download path too
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml("soak"), "password": WEB_PW},
+                auth=("op", "oppw"))
+    soak = _run_worker_once(cfg)[2]["run_id"]
+    r = client.get(f"/compare/download?runs={a},{soak}", auth=("viewer", "vpw"))
+    assert r.status_code == 400 and "same type" in r.text.lower()
 
 
 def test_resume_reuses_saved_target(web):
@@ -849,6 +902,56 @@ def test_targets_crud_rbac_and_no_password_exposed(web):
     assert client.delete(f"/api/targets/{tid}", auth=("op", "oppw")).status_code == 200
     assert store.get("target:nyc3:password") is None              # secret erased with the target
     assert all(t["id"] != tid for t in client.get("/api/targets", auth=("op", "oppw")).json())
+
+
+def test_target_delete_with_job_history_is_not_a_500(web):
+    """J1 regression: jobs.target_id references targets(id) with FKs ON —
+    deleting a target that ever ran a job used to die with an IntegrityError
+    the API surfaced as a 500. Delete now ALWAYS succeeds: it detaches every
+    job (any state) and cancels queued ones, so an ORPHANED job left 'running'
+    by a worker restart can never wedge the delete (the exact reported bug)."""
+    client, cfg = web
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    _make_target(client)
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    # Simulate an ORPHANED job: worker restarted, job stuck 'running' with a
+    # dead pid — the state that made the target undeletable.
+    conn = connect(cfg.db_path)
+    jid = queries.list_jobs(conn)[0]["id"]
+    queries.update_job(conn, jid, state="running", pid=999999999)
+    conn.close()
+    r = client.delete(f"/api/targets/{tid}", auth=("op", "oppw"))
+    assert r.status_code == 200, r.text            # NOT 409, NOT 500
+    assert all(t["id"] != tid for t in client.get("/api/targets", auth=("op", "oppw")).json())
+    # the job row survives with its target link detached (no dangling FK)
+    conn = connect(cfg.db_path)
+    job = queries.get_job(conn, jid)
+    assert job["target_id"] is None
+    conn.close()
+
+
+def test_target_delete_cancels_queued_jobs(web):
+    """A queued job that would launch against a now-deleted target (and its
+    erased password secret) is canceled, not left to fail cryptically."""
+    client, cfg = web
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    _make_target(client)
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid},
+                auth=("op", "oppw"))
+    conn = connect(cfg.db_path)
+    jid = queries.list_jobs(conn)[0]["id"]         # still 'queued'
+    conn.close()
+    r = client.delete(f"/api/targets/{tid}", auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["canceled_queued"] >= 1
+    conn = connect(cfg.db_path)
+    assert queries.get_job(conn, jid)["state"] == "canceled"
+    conn.close()
 
 
 def test_target_backed_run_reuses_password_and_surfaces_host(web):

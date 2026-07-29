@@ -12,6 +12,7 @@ import difflib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -548,10 +549,24 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         tgt = queries.get_target(conn, target_id)
         if tgt is None:
             raise HTTPException(404, "target not found")
+        # Delete always succeeds: jobs.target_id references targets(id) with
+        # foreign_keys=ON, so delete_target detaches every job (any state)
+        # first — a running job keeps its already-resolved password in the
+        # child's env, it only loses the saved-target convenience link. A
+        # QUEUED job that would launch against this target is canceled so it
+        # can't start against a target (and secret) that no longer exists.
+        # (An earlier 'block while a job is active' guard wedged delete on
+        # ORPHANED jobs left 'running' by a worker restart — the exact state
+        # the user hit — so deletion no longer blocks on job state at all.)
+        canceled = conn.execute(
+            "UPDATE jobs SET state='canceled', finished_utc=?, "
+            "error='target deleted' WHERE target_id=? AND state='queued'",
+            (utc_now_iso(), target_id)).rowcount
         queries.delete_target(conn, target_id)
         store.delete(tgt["password_ref"])
-        queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
-        return JSONResponse({"deleted": True})
+        queries.audit(conn, user["username"], "target_delete", target=tgt["name"],
+                      detail=(f"canceled {canceled} queued job(s)" if canceled else ""))
+        return JSONResponse({"deleted": True, "canceled_queued": canceled})
 
     @app.post("/api/targets/{target_id}")
     def api_update_target(target_id: int, request: Request, payload: dict,
@@ -779,8 +794,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def compare_to_console() -> Response:
         return RedirectResponse("/ui/compare", status_code=307)
 
-    @app.get("/compare/view", response_class=HTMLResponse)
-    def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+    def _render_compare(runs: str) -> Path:
+        """Generate the self-contained comparison report for the given run ids and
+        return the on-disk HTML path (CSS inlined, charts embedded as data URIs —
+        the file stands alone, so it can be served inline or downloaded as-is)."""
         ids = [_safe_segment(r) for r in runs.split(",") if r]
         dirs = [cfg.results_dir / r for r in ids]
         for d in dirs:
@@ -788,13 +805,43 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                 raise HTTPException(404, f"run not found: {d.name}")
         out = cfg.data_dir / "tmp"
         out.mkdir(parents=True, exist_ok=True)
+        return harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
+
+    def _compare_filename(runs: str) -> str:
+        """A manager-friendly download name from the runs' labels, e.g.
+        comparison-standard-vs-advanced.html."""
+        parts = []
+        for r in runs.split(","):
+            if not r:
+                continue
+            lbl = str(_manifest(cfg.results_dir / _safe_segment(r)).get("label") or r)
+            slug = re.sub(r"[^A-Za-z0-9._-]+", "-", lbl).strip("-").lower() or "run"
+            parts.append(slug[:40])
+        base = "-vs-".join(parts) if parts else "comparison"
+        return f"comparison-{base}.html"[:120]
+
+    @app.get("/compare/view", response_class=HTMLResponse)
+    def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
         try:
-            path = harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
+            path = _render_compare(runs)
         except harness_api.HarnessError as exc:
             # e.g. mixed run types, or a run with no parsed summary — show the
             # reason in the iframe instead of an opaque 500.
             return HTMLResponse(_compare_error_html(exc), status_code=400)
         return HTMLResponse(path.read_text(encoding="utf-8"))
+
+    @app.get("/compare/download")
+    def compare_download(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+        """The full comparison as one self-contained .html file to save and share —
+        the whole report, not just whatever fit on the printed screen."""
+        try:
+            path = _render_compare(runs)
+        except harness_api.HarnessError as exc:
+            return HTMLResponse(_compare_error_html(exc), status_code=400)
+        return Response(
+            path.read_text(encoding="utf-8"), media_type="text/html",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{_compare_filename(runs)}"'})
 
     # ── admin: users / audit (legacy paths redirect into the console) ──
     @app.get("/admin/users")
@@ -1072,7 +1119,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
     pg_tail = _CsvTail()
     sent_any = {"samples": False, "pg": False}
     cur_file: Optional[str] = None
-    budget_s = _planned_budget_s(run_dir)
+    budget_s, budget_breakdown = _planned_budget(run_dir)
 
     def _samples_path() -> tuple[Optional[str], Optional[Path]]:
         for rel in ("parsed/soak_timeseries.csv", "parsed/samples.csv"):
@@ -1109,6 +1156,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
     yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
                            "status": _run_status(run_dir), "budget_s": budget_s,
+                           "budget_breakdown": budget_breakdown,
                            "start_utc": _run_start_utc(run_dir),
                            "backfill_cap": SSE_BACKFILL_ROWS})
     for _ in range(max_ticks):
@@ -1312,15 +1360,22 @@ def _run_start_utc(run_dir: Path) -> str:
     return str(soak_start or m.get("created_utc", "") or "")
 
 
-def _planned_budget_s(run_dir: Path) -> int:
-    """Planned wall-clock budget from the spec (for live ETA); 0 if unknown."""
+def _planned_budget(run_dir: Path) -> tuple[int, str]:
+    """Planned wall-clock budget + human breakdown from the spec (for live ETA).
+    Returns (0, "") if unknown — the ETA is best-effort and never breaks the stream."""
     spec = run_dir / "spec.yaml"
     if not spec.exists():
-        return 0
+        return 0, ""
     try:
-        return int(harness_api.dry_run(spec.read_text(encoding="utf-8")).get("budget_s", 0))
+        dr = harness_api.dry_run(spec.read_text(encoding="utf-8"))
+        return int(dr.get("budget_s", 0)), str(dr.get("budget_breakdown", ""))
     except Exception:  # noqa: BLE001  (ETA is best-effort, never breaks the stream)
-        return 0
+        return 0, ""
+
+
+def _planned_budget_s(run_dir: Path) -> int:
+    """Planned wall-clock budget only (kept for callers that don't need the breakdown)."""
+    return _planned_budget(run_dir)[0]
 
 
 def _progress(run_dir: Path, budget_s: int) -> dict:

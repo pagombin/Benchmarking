@@ -970,21 +970,71 @@ def test_cr_apply_verifies_live_values(opsweb):
     assert "patronictl_show_config.txt" in detail["raw_files"]
 
 
+def test_cr_apply_spl_converges_as_a_set_despite_operator_decoration(opsweb, monkeypatch):
+    """The operator injects pgaudit and doubles shared_preload_libraries at
+    runtime. An exact-string verify would flag that as a permanent miss; the
+    set-containment compare converges as long as the requested lib is loaded."""
+    monkeypatch.setenv("FAKE_KUBE_SPL_DECORATE", "1")   # runtime -> "<v>,<v>,pgaudit"
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters":
+                                         {"shared_preload_libraries": "pg_stat_statements"},
+                                     "verify_timeout_s": 8})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run          # set-compare converged
+    assert run["headline"]["verified"] is True
+
+
+def test_cr_apply_reports_operator_managed_param_clearly(opsweb, monkeypatch):
+    """A param the operator pins on the postgres command line can't be set via
+    patroni params. The verify must NAME it as operator-managed (with its source)
+    instead of spinning to a blind 'did not converge' — the real-world
+    track_commit_timestamp case."""
+    monkeypatch.setenv("FAKE_KUBE_CMDLINE_PARAMS", "track_commit_timestamp=on")
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"track_commit_timestamp": "off",
+                                                    "min_wal_size": "2048"},
+                                     "verify_timeout_s": 6, "rollout_timeout_s": 2})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "warning"                # not a clean success
+    assert run["headline"]["applied"] is True        # the CR patch DID land
+    assert run["headline"]["operator_managed"] == ["track_commit_timestamp"]
+    # it must NOT be reported as pending-restart (a restart won't help)
+    assert run["headline"]["pending_restart"] == []
+    assert run["headline"]["outcome"] == "applied; operator-managed params overridden"
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "operator-managed" in events and "source=command line" in events
+    assert "EXPECT A FAILOVER" not in events         # no bogus rollout watch
+
+
 def test_cr_apply_pending_restart_fails_loudly(opsweb, monkeypatch):
     client, cfg = opsweb
     monkeypatch.setenv("FAKE_KUBE_PENDING_PARAMS", "max_wal_size")
     tid = _ready_target(client, cfg)
     r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
                                      "parameters": {"max_wal_size": "49152"},
-                                     "verify_timeout_s": 6})
+                                     "verify_timeout_s": 6,
+                                     "rollout_timeout_s": 2})
     assert r.status_code == 200
     _drain_queue(cfg)
     run = _last_ops_run(client, "cr-apply")
     assert run["status"] == "warning"            # NOT silent success
     assert run["headline"]["pending_restart"] == ["max_wal_size"]
-    # the event feed carries the operator-facing warning
+    # A2/E3: applied-change accounting survives regardless of verify outcome
+    assert run["headline"]["applied"] is True
+    assert run["headline"]["changed"]["max_wal_size"] == ["4096", "49152"]
+    assert run["headline"]["outcome"] == "applied, rollout not confirmed"
+    # the event feed carries the operator-facing warning AND the rollout watch
     events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
     assert "EXPECT A FAILOVER" in events
+    assert "watching the operator's rolling restart" in events
 
 
 def test_cr_apply_pgbackrest_global_rendered_verify(opsweb):
@@ -1023,6 +1073,64 @@ def test_cr_apply_rollback_restores_previous_values(opsweb):
     state = json.loads((cfg.data_dir.parent / "fakekube" / "state.json").read_text())
     params = state["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]
     assert params["max_wal_size"] == "4096"
+
+
+def test_cr_snapshot_browser_and_revert(opsweb):
+    """N: manual snapshot -> apply a change -> the snapshot browser lists both
+    with a diff-vs-live summary -> revert restores the snapshot's values via a
+    targeted patch (managed sections only)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # 1) manual snapshot of the pristine CR
+    r = client.post(f"/api/kube-targets/{tid}/cr-snapshot", json={},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    snap = _last_ops_run(client, "cr-apply")
+    assert snap["headline"]["action"] == "snapshot"
+    # 2) change a managed param, then snapshot again so "current" reflects it
+    #    (snapshots are captured pre-patch, so the freshest captured state is
+    #    the newest snapshot)
+    _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                 "parameters": {"max_wal_size": "8192"},
+                                 "verify_timeout_s": 10})
+    _drain_queue(cfg)
+    client.post(f"/api/kube-targets/{tid}/cr-snapshot", json={}, auth=("op", "oppw"))
+    _drain_queue(cfg)
+    # 3) the browser lists snapshots with a diff summary vs the latest snapshot
+    snaps = client.get(f"/api/kube-targets/{tid}/cr-snapshots",
+                       auth=("viewer", "vpw")).json()["snapshots"]
+    assert any(s["op_run_id"] == snap["op_run_id"] for s in snaps)
+    the_snap = next(s for s in snaps if s["op_run_id"] == snap["op_run_id"])
+    assert the_snap["diff_total"] >= 1 and "max_wal_size" not in the_snap  # summary only
+    diff = client.get(f"/api/ops/runs/{snap['op_run_id']}/cr-snapshot-diff",
+                      auth=("viewer", "vpw")).json()
+    assert diff["sections"]["patroni_params"]["max_wal_size"][1] == "4096"
+    # 4) dry-run revert changes nothing
+    r = client.post(f"/api/kube-targets/{tid}/cr-revert",
+                    json={"params": {"snapshot_of": snap["op_run_id"],
+                                     "dry_run": True}}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    st = json.loads(_fake_state_file(cfg).read_text())
+    assert st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]["max_wal_size"] == "8192"
+    # 5) real revert restores 4096 (needs the typed confirmation)
+    r = client.post(f"/api/kube-targets/{tid}/cr-revert",
+                    json={"confirm": "cluster1",
+                          "params": {"snapshot_of": snap["op_run_id"]}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["action"] == "revert_snapshot"
+    st = json.loads(_fake_state_file(cfg).read_text())
+    assert st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]["max_wal_size"] == "4096"
+    # revert without confirmation is refused
+    r = client.post(f"/api/kube-targets/{tid}/cr-revert",
+                    json={"params": {"snapshot_of": snap["op_run_id"]}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400
 
 
 def test_schedules_pause_and_restore_with_nag(opsweb):
@@ -1065,6 +1173,381 @@ def test_cr_apply_prep_actions(opsweb):
     events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
     assert "checkpointer stats reset" in events
     assert "recreated" in events
+
+
+# ── huge_pages-incident regressions (2026-07-23): verify vs recovery races,
+#    persisted apply accounting, guardrails, rollout watch ──
+
+def _fake_state_file(cfg):
+    return cfg.data_dir.parent / "fakekube" / "state.json"
+
+
+def test_cr_apply_survives_rolling_restart_and_verifies(opsweb, monkeypatch):
+    """Section-D end-to-end: a restart-required param rolls the cluster; the
+    op must (a) record the applied diff, (b) poll until a leader is elected,
+    (c) report applied+verified — never 'failed: patroni reports no leader'
+    600 ms after the patch."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_ROLL_OUTAGE_S", "2")
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "8192"},
+                                     "verify_timeout_s": 10,
+                                     "rollout_timeout_s": 60})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["applied"] is True
+    assert run["headline"]["changed"]["max_wal_size"] == ["4096", "8192"]
+    assert run["headline"]["outcome"].startswith("applied+verified")
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "transiently leaderless" in events     # it polled, not failed
+
+
+def test_cr_apply_rollout_failure_is_red_and_rollbackable(opsweb, monkeypatch):
+    """The incident timeline: the patch lands, every member crash-loops with
+    an allocation failure. The op must finish 'failed' with the FATAL evidence
+    in the error, keep the applied diff in meta (rollback source!), and a
+    subsequent rollback must restore the previous values."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_ROLL_OUTAGE_S", "30")
+    monkeypatch.setenv("FAKE_KUBE_FATAL_LOG", "1")
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "16384"},
+                                     "verify_timeout_s": 4,
+                                     "rollout_timeout_s": 2})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    failed = _last_ops_run(client, "cr-apply")
+    assert failed["status"] == "failed", failed
+    assert failed["headline"]["outcome"] == "applied, rollout failed"
+    # E3/A2: the applied diff survived the failure — rollback has its source
+    assert failed["headline"]["applied"] is True
+    assert failed["headline"]["changed"]["max_wal_size"] == ["4096", "16384"]
+    meta = json.loads((cfg.results_dir / "ops" / failed["op_run_id"] /
+                       "meta.json").read_text())
+    assert "Cannot allocate memory" in meta.get("error", "")
+    # verify.json carries the A4 diagnostics (member states + FATAL lines)
+    vj = json.loads((cfg.results_dir / "ops" / failed["op_run_id"] /
+                     "verify.json").read_text())
+    assert vj["diagnostics"]["fatal_lines"]
+    # recover the fake cluster, then roll back using the failed run as source
+    monkeypatch.delenv("FAKE_KUBE_ROLL_OUTAGE_S")
+    monkeypatch.delenv("FAKE_KUBE_FATAL_LOG")
+    st = json.loads(_fake_state_file(cfg).read_text())
+    st["roll_until"] = 0
+    st["pending_restart"] = []
+    _fake_state_file(cfg).write_text(json.dumps(st))
+    r = _apply_cr(client, cfg, tid, {"action": "rollback",
+                                     "rollback_of": failed["op_run_id"],
+                                     "verify_timeout_s": 10})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    rb = _last_ops_run(client, "cr-apply")
+    assert rb["status"] == "complete", rb
+    st = json.loads(_fake_state_file(cfg).read_text())
+    params = st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]
+    assert params["max_wal_size"] == "4096"
+
+
+def test_cr_apply_verify_failure_is_amber_not_red(opsweb):
+    """A3: when the patch landed but pg_settings never converged, the badge
+    must read 'applied, verify failed' (warning) — a red 'failed' invited
+    dangerous re-runs of changes that HAD landed."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # force=true pushes an unknown GUC through validation; the fake catalog
+    # never shows it live, so verify times out with the cluster healthy
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"bogus_tuning_knob": "1"},
+                                     "force": True, "verify_timeout_s": 2,
+                                     "rollout_timeout_s": 5})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "warning", run
+    assert run["headline"]["outcome"] == "applied, verify failed"
+    assert run["headline"]["applied"] is True
+    vj = json.loads((cfg.results_dir / "ops" / run["op_run_id"] /
+                     "verify.json").read_text())
+    assert "diagnostics" in vj                    # A4: never a bare one-liner
+
+
+def test_cr_apply_validation_refuses_unknown_param(opsweb):
+    """E1: the raw API path re-validates in the worker — an unknown GUC would
+    stop the postmaster from starting ('unrecognized configuration parameter')."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"definitely_not_a_guc": "1"}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "aborted", run
+    assert run["headline"]["outcome"] == "refused by validation"
+    assert any("unknown parameter" in b for b in run["headline"]["blockers"])
+    # nothing was patched
+    st = json.loads(_fake_state_file(cfg).read_text())
+    params = st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]
+    assert "definitely_not_a_guc" not in params
+
+
+def test_cr_apply_validation_range_and_enum(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # out-of-range integer
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "1"}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "aborted"
+    assert any("allowed range" in b for b in run["headline"]["blockers"])
+    # bad enum value
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"huge_pages": "maybe"}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "aborted"
+    assert any("is not one of" in b for b in run["headline"]["blockers"])
+    # patroni-locked names are refused even though the UI hides them
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"port": "5433"}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "aborted"
+    assert any("patroni-locked" in b for b in run["headline"]["blockers"])
+
+
+def test_cr_apply_huge_pages_guardrail(opsweb):
+    """A5 — the check that would have prevented the outage: huge_pages=on
+    with no hugepages-2Mi pod resources is refused; 'try' proceeds with a
+    warning."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"huge_pages": "on"}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "aborted", run
+    assert any("hugepages-2Mi" in b for b in run["headline"]["blockers"])
+    st = json.loads(_fake_state_file(cfg).read_text())
+    params = st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]
+    assert "huge_pages" not in params
+    # huge_pages=try applies (with a verify-later warning recorded)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"huge_pages": "try"},
+                                     "verify_timeout_s": 10})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    val = json.loads((cfg.results_dir / "ops" / run["op_run_id"] /
+                      "validation.json").read_text())
+    assert any("huge_pages=try" in w for w in val["warnings"])
+
+
+def test_cr_apply_unit_normalization(opsweb):
+    """E2/E5: '8GB' vs live '8192' (unit MB) is a match, not a verify failure;
+    re-applying an equal value in different spelling is 'nothing to do'."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "8GB"},
+                                     "verify_timeout_s": 10})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True    # live shows 8192, CR says 8GB
+    # spurious-diff guard: 4GB == the original 4096 → after rolling back by
+    # hand, re-applying "4GB" must be a no-op, not a phantom change
+    st = json.loads(_fake_state_file(cfg).read_text())
+    st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]["max_wal_size"] = "4096"
+    _fake_state_file(cfg).write_text(json.dumps(st))
+    r = _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                     "parameters": {"max_wal_size": "4GB"},
+                                     "verify_timeout_s": 5})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete"
+    assert run["headline"]["changed"] == {}
+    assert run["headline"].get("applied") is False
+
+
+def test_patroni_dcs_ttl_invariant_enforced(opsweb):
+    """E8: staging ttl=15 against default loop_wait=10/retry_timeout=10
+    violates loop_wait + 2*retry_timeout <= ttl — refuse, don't let Patroni
+    clamp silently."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "patroni_dcs",
+                                     "settings": {"ttl": "15"}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "failed", run
+    meta = json.loads((cfg.results_dir / "ops" / run["op_run_id"] /
+                       "meta.json").read_text())
+    assert "invariant" in meta["error"]
+    # the full trio staged consistently passes
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "patroni_dcs",
+                                     "settings": {"ttl": "15", "loop_wait": "5",
+                                                  "retry_timeout": "5"}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] in ("complete", "warning"), run
+
+
+def test_health_oom_and_alloc_findings(opsweb, monkeypatch):
+    """G: both OOM signatures are caught — cgroup OOMKilled in container
+    status, and the in-log allocation failure that keeps the container
+    running (the huge_pages signature)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("FAKE_KUBE_OOM", "1")
+    monkeypatch.setenv("FAKE_KUBE_FATAL_LOG", "1")
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    doc = client.get(f"/api/kube-targets/{tid}/health",
+                     auth=("viewer", "vpw")).json()["health"]
+    assert doc["status"] == "crit"
+    ids = [f["id"] for f in doc["findings"]]
+    assert any(i.startswith("oom_") for i in ids)
+    assert any(i.startswith("alloc_") for i in ids)
+    oom = next(f for f in doc["findings"] if f["id"].startswith("oom_"))
+    assert "OOMKilled" in oom["value"]
+    assert "pg_stat_statements" in oom["remediation"]
+    assert doc["metrics"]["oom_events"] >= 1
+
+
+def test_kube_target_delete_with_health_history_is_not_a_500(opsweb):
+    """J1 twin: health_history carries a NOT NULL FK to kube_targets — a
+    target with recorded health checks used to be undeletable (500)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    hist = client.get(f"/api/kube-targets/{tid}/health-history",
+                      auth=("viewer", "vpw")).json()["history"]
+    assert hist                                    # history exists pre-delete
+    r = client.delete(f"/api/kube-targets/{tid}", auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    assert client.get(f"/api/kube-targets/{tid}",
+                      auth=("viewer", "vpw")).status_code == 404
+
+
+def test_logs_op_follows_selected_containers(opsweb):
+    """H: the Logs tab backend — a worker op follows the selected containers
+    into raw/ capture files (the web tier never runs kubectl)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = client.post(f"/api/kube-targets/{tid}/logs",
+                    json={"params": {"sources": [
+                        {"pod": "cluster1-instance1-abcd-0",
+                         "container": "database"}],
+                        "tail": 100, "max_duration_s": 2}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "logs")
+    assert run["status"] == "complete", run
+    raw = cfg.results_dir / "ops" / run["op_run_id"] / "raw"
+    files = sorted(raw.glob("logs_*.log"))
+    assert files and "database" in files[0].name
+    assert files[0].read_text().strip()          # captured actual lines
+    # the SSE manifest (status.json) labels each stream by category
+    status = json.loads((cfg.results_dir / "ops" / run["op_run_id"] /
+                         "status.json").read_text())
+    assert status["sources"][0]["category"] == "postgres"
+    # malformed 'since' is a clean 400, not an enqueued dead job
+    r = client.post(f"/api/kube-targets/{tid}/logs",
+                    json={"params": {"since": "yesterday"}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 400
+
+
+def test_paramcheck_normalization_and_hazards():
+    from pgbench_harness.ops.paramcheck import (hazard_findings,
+                                                normalize_value,
+                                                pgbackrest_hazards,
+                                                validate_against_catalog,
+                                                values_equal)
+    assert normalize_value("1GB", "8kB", "integer") == "131072"
+    assert normalize_value("on", None, "bool") == "on"
+    assert normalize_value("true", None, "bool") == "on"
+    assert normalize_value("0.90", None, "real") == "0.9"
+    assert values_equal("300", "5min", "s", "integer")
+    assert not values_equal("300", "5min", "ms", "integer")
+    rows = {"work_mem": {"name": "work_mem", "setting": "4096", "unit": "kB",
+                         "vartype": "integer", "min_val": "64",
+                         "max_val": "2147483647", "context": "user"}}
+    b, w = validate_against_catalog(rows, {"work_mem": "32"}, {})
+    assert any("allowed range" in x for x in b)
+    b, w = validate_against_catalog(rows, {"pgml.venv": "x"}, {})
+    assert not b and any("extension parameter" in x for x in w)
+    # shared-memory arithmetic vs the container limit
+    cr = {"spec": {"instances": [{
+        "resources": {"limits": {"memory": "4Gi"}},
+        "dataVolumeClaimSpec": {"resources": {"requests": {"storage": "50Gi"}}},
+    }]}}
+    rows = {"shared_buffers": {"setting": "524288", "unit": "8kB",
+                               "vartype": "integer"},
+            "max_connections": {"setting": "100", "unit": None,
+                                "vartype": "integer"},
+            "max_wal_size": {"setting": "4096", "unit": "MB",
+                             "vartype": "integer"}}
+    b, w = hazard_findings({"shared_buffers": "6GB"}, cr, rows)
+    assert any("memory limit" in x for x in b)     # 6GB > 4Gi limit
+    b, w = hazard_findings({"max_wal_size": "49152"}, cr, rows)
+    assert any("half the" in x and "PVC" in x for x in w)   # 48G > 25G
+    assert any("data volume" in x
+               for x in pgbackrest_hazards({"archive-async": "y",
+                                            "spool-path": "/pgdata"}))
+
+
+def test_pmm_defaults_flipped_to_pg_stat_statements():
+    """F: the spec-level defaults pair pgstatements/pg_stat_statements."""
+    from pgbench_harness.ops.opspec import parse_ops_spec
+    spec = parse_ops_spec({"op": "pmm-enable",
+                           "target": {"name": "t", "cr_name": "c"},
+                           "params": {"server_host": "pmm.example.com"}})
+    assert spec.params.get("query_source") in (None, "pgstatements")
+    from pgbench_harness.ops.pmm import _cfg, _CR_QUERY_SOURCE
+    cfg = _cfg({"server_host": "x"})
+    assert cfg["query_source"] == "pgstatements"
+    assert cfg["extension"] == "pg_stat_statements"
+    # the CR field must use the operator's enum spelling, not the agent value
+    assert _CR_QUERY_SOURCE["pgstatements"] == "pgstatstatements"
+    assert _CR_QUERY_SOURCE["pgstatmonitor"] == "pgstatmonitor"
+
+
+def test_pmm_enable_rejects_bad_query_source_at_cr(pmmops, monkeypatch):
+    """Regression for the reported failure: the operator CR enum spells
+    pg_stat_statements 'pgstatstatements'; writing the agent value
+    'pgstatements' straight into spec.pmm.querySource made the operator reject
+    the patch. The enable must write the operator spelling and succeed."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    st = _fake_state()
+    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatstatements"
+    # and the QAN agent / extension still resolve to the statements pairing
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    val = json.loads((run_dir / "validation.json").read_text())
+    assert val["query_source"] == "pgstatements"    # agent value unchanged
 
 
 # ── Phase 3: backups ──
@@ -1182,6 +1665,55 @@ def test_backup_from_replica_records_source(opsweb):
     assert "--backup-standby=y" in patches
 
 
+@pytest.mark.parametrize("source,path,btype,suffix", [
+    ("leader", "direct", "full", "F"),
+    ("leader", "direct", "diff", "D"),
+    ("leader", "direct", "incr", "I"),
+    ("leader", "operator", "full", "F"),
+    ("leader", "operator", "incr", "I"),
+    ("replica", "operator", "full", "F"),
+    ("replica", "operator", "incr", "I"),
+])
+def test_backup_matrix_cell(opsweb, source, path, btype, suffix):
+    """L: every source × path × type cell reaches a verified 'complete' with the
+    right label suffix and source role (one named case per matrix cell)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": btype, "path": path, "source": source,
+                                   "timeout_s": 30, "sample_interval_s": 0.2,
+                                   "settle_s": 0.3})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["type"] == btype and h["label"].endswith(suffix)
+    assert h["source_role"] == source
+    # completion verified against pgbackrest info (a fresh set is present)
+    assert (cfg.results_dir / "ops" / run["op_run_id"] / "raw" /
+            "pgbackrest_info_after.json").exists()
+
+
+def test_schedules_round_trip_preserves_cron_exactly(opsweb):
+    """L: snapshot -> pause -> restore must reproduce the CR's cron specs
+    byte-for-byte (a schedule silently dropped is a missed backup)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    before = json.loads(_fake_state_file(cfg).read_text())
+    orig = before["cr"]["spec"]["backups"]["pgbackrest"]["repos"][0]["schedules"]
+    r = client.post(f"/api/kube-targets/{tid}/schedules/pause",
+                    json={"confirm": "cluster1"}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    r = client.post(f"/api/kube-targets/{tid}/schedules/restore",
+                    json={"confirm": "cluster1"}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    after = json.loads(_fake_state_file(cfg).read_text())
+    restored = after["cr"]["spec"]["backups"]["pgbackrest"]["repos"][0]["schedules"]
+    assert restored == orig                        # exact round-trip
+
+
 def test_backup_requires_confirmation_and_mutex(opsweb):
     client, cfg = opsweb
     tid = _ready_target(client, cfg)
@@ -1220,6 +1752,90 @@ def _fire_scenario(client, tid, case, extra=None, confirm="cluster1"):
     return client.post(f"/api/kube-targets/{tid}/scenario",
                        json={"params": params, "confirm": confirm},
                        auth=("admin", "apw"))
+
+
+def test_scenario_in_cluster_helper_dual_path(opsweb, monkeypatch):
+    """M2: the in-cluster helper pod runs dual-path probes (pgbouncer + ha),
+    survives the failover (real cluster DNS, not a port-forward), and is torn
+    down at the end."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_C1_ELECT", "1")
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    # no probe.mode -> pod-delete defaults to the in-cluster helper
+    r = _fire_scenario(client, tid, "pod-delete",
+                       extra={"settle_s": 8, "probe": {"hz": 5}})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    # both probe paths captured
+    assert (run_dir / "raw" / "probe.log").exists()          # pgbouncer (authoritative)
+    assert (run_dir / "raw" / "probe_ha.log").exists()       # direct-to-primary
+    assert "OK " in (run_dir / "raw" / "probe.log").read_text()
+    events = (run_dir / "events.jsonl").read_text()
+    assert "in-cluster helper probes started" in events
+    # the stitcher reports per-path downtime
+    stitched = json.loads((run_dir / "stitched.json").read_text())
+    assert "per_path" in stitched["probe"]
+    assert "ha" in stitched["probe"]["per_path"]
+    # helper pod was deleted (torn down)
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    helper_deleted = [n for n in st.get("deleted", {}) if n.startswith("pgb-probe-")]
+    assert helper_deleted, "helper pod should have been torn down"
+
+
+def test_scenario_helper_probe_never_puts_password_in_argv(opsweb, monkeypatch):
+    """Bug-bash: the in-cluster helper probe must pass the DB password via
+    STDIN, never in the kubectl-exec argv (worker/pod process tables)."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_C1_ELECT", "1")
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "pod-delete",
+                       extra={"settle_s": 6, "probe": {"hz": 5}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    # nothing the harness wrote may contain the fake pguser password
+    pw = os.environ.get("FAKE_KUBE_PGPASS", "k8s-secret-pw-fake")
+    for p in (cfg.results_dir / "ops" / run["op_run_id"]).rglob("*"):
+        if p.is_file():
+            assert pw not in p.read_text(errors="replace"), p
+
+
+def test_health_sigkill_is_not_oom(opsweb, monkeypatch):
+    """Bug-bash: a container that exited 137 (SIGKILL from a failover/crash
+    test) with reason!=OOMKilled must NOT be reported as an OOM kill."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("FAKE_KUBE_SIGKILL", "1")   # exit 137, reason 'Error'
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    doc = client.get(f"/api/kube-targets/{tid}/health",
+                     auth=("viewer", "vpw")).json()["health"]
+    assert not any(f["id"].startswith("oom_") for f in doc["findings"])
+    assert doc["metrics"].get("oom_events", 0) == 0
+
+
+def test_cr_snapshots_route_survives_corrupt_snapshot(opsweb):
+    """Bug-bash: a cr_snapshot.json that is valid JSON but not an object must
+    not 500 the snapshot browser or the diff-preview route."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    client.post(f"/api/kube-targets/{tid}/cr-snapshot", json={}, auth=("op", "oppw"))
+    _drain_queue(cfg)
+    snap = _last_ops_run(client, "cr-apply")
+    # corrupt the snapshot to a JSON array
+    (cfg.results_dir / "ops" / snap["op_run_id"] / "cr_snapshot.json").write_text('["not", "a", "cr"]')
+    r = client.get(f"/api/kube-targets/{tid}/cr-snapshots", auth=("viewer", "vpw"))
+    assert r.status_code == 200, r.text
+    r = client.get(f"/api/ops/runs/{snap['op_run_id']}/cr-snapshot-diff",
+                   auth=("viewer", "vpw"))
+    assert r.status_code == 200, r.text
 
 
 def test_scenario_case_b_pgkill_restart_in_place(opsweb):
@@ -1290,6 +1906,25 @@ def test_scenario_case_c1_pod_delete_election(opsweb, monkeypatch):
     assert h["flip"] is True and h["kind"] == "election"
     assert h["tl_after"] == h["tl_before"] + 1
     assert h["downtime_ms"] >= 1000
+
+
+def test_scenario_case_c2_node_loss_via_sysrq(opsweb, monkeypatch):
+    """M1: node-loss fires a sysrq kernel panic from a privileged node-pinned
+    pod (never cordon+delete, which signals PG). The leader's node dies, a
+    replica is elected."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "node-loss", extra={"settle_s": 8})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "sysrq kernel panic" in events          # not cordon+delete
+    h = run["headline"]
+    assert h["flip"] is True and h["kind"] == "election"
 
 
 def test_scenario_refuses_to_fire_during_backup(opsweb, monkeypatch):
@@ -1532,6 +2167,46 @@ def test_invalid_ops_params_rejected_at_api(opsweb):
         r = client.post(f"/api/kube-targets/{tid}/{path}", json=body,
                         auth=("admin", "apw"))
         assert r.status_code == 400, f"{path} {body} -> {r.status_code}"
+
+
+def test_ops_routes_never_500_on_malformed_input(opsweb):
+    """J: every ops mutation route must map bad input to a typed 4xx — never a
+    500. A 500 leaks internals and means an unhandled path; this sweeps the
+    mutation surface (including the routes added for logs / snapshots / revert)
+    with garbage payloads and asserts none of them crash."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    garbage = [
+        {"params": "notadict"},
+        {"params": {"sources": "notalist"}},
+        {"params": {"tail": "lots"}},
+        {"params": {"since": "yesterday"}},
+        {"params": {"snapshot_of": "../../etc/passwd"}},
+        {"params": {"action": "revert_snapshot"}},        # missing snapshot_of
+        {"params": {"checks": "notalist"}},
+        {"params": {"watch_s": "forever"}},
+        {"params": {"replicas": "many"}},
+        {"confirm": "cluster1", "params": {"operation": "explode"}},
+    ]
+    routes = ["logs", "cr-snapshot", "cr-revert", "diag", "operate", "monitor",
+              "cr-apply", "backup", "scenario", "health"]
+    for route in routes:
+        for body in garbage:
+            r = client.post(f"/api/kube-targets/{tid}/{route}", json=body,
+                            auth=("admin", "apw"))
+            assert r.status_code != 500, f"{route} {body} -> 500: {r.text[:200]}"
+            assert r.status_code in (200, 400, 403, 404, 409), \
+                f"{route} {body} -> unexpected {r.status_code}"
+    # unknown target id is a clean 404 everywhere, not a 500
+    for route in routes:
+        r = client.post(f"/api/kube-targets/999999/{route}",
+                        json={"params": {}}, auth=("admin", "apw"))
+        assert r.status_code in (400, 404), f"{route} missing target -> {r.status_code}"
+    # bad snapshot-diff / compare ids -> 4xx, not 500
+    assert client.get("/api/ops/runs/..%2F..%2Fetc/cr-snapshot-diff",
+                      auth=("viewer", "vpw")).status_code in (400, 404)
+    assert client.get("/api/ops/compare?runs=only-one",
+                      auth=("viewer", "vpw")).status_code == 400
 
 
 def test_worker_loop_monitor_does_not_block_benchmarks(opsweb, monkeypatch):
@@ -1790,12 +2465,16 @@ def test_pmm_enable_end_to_end_with_inventory_confirmation(pmmops):
     # cluster converged: pmm block, PMM3 secret, extension, SPL
     st = _fake_state()
     assert st["cr"]["spec"]["pmm"]["enabled"] is True
-    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatmonitor"
+    # default query source is pg_stat_statements (pg_stat_monitor memory leak,
+    # field report 2026-07). The CR field uses the operator's enum spelling
+    # 'pgstatstatements' (translated from the agent value 'pgstatements') —
+    # writing the agent value straight in made the operator reject the patch.
+    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatstatements"
     assert st["pmm_secret"] == "cluster1-pmm-secret"
-    assert "pg_stat_monitor" in st["extensions"]
+    assert "pg_stat_statements" in st["extensions"]
     spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
            ["parameters"]["shared_preload_libraries"])
-    assert spl == "pgaudit,pg_stat_monitor"
+    assert spl == "pgaudit,pg_stat_statements"
     # HA-preserving bounce: the leader is deleted LAST, after every replica
     deletes = [json.loads(ln) for ln in
                (run_dir / "events.jsonl").read_text().splitlines()
@@ -1842,6 +2521,62 @@ def test_pmm_rollout_wait_is_spec_aware_not_fooled_by_ready_old_pods(pmmops, mon
     assert meta["status"] == "warning"
     assert meta["headline"]["rolled"] is False
     assert meta["headline"]["healthy"] is False
+
+
+def test_pmm_enable_disables_builtin_counterpart_extension(pmmops, monkeypatch):
+    """A 2.9 cluster enables pg_stat_monitor via the built-in extensions toggle
+    (spec.extensions.builtin.pgStatMonitor), independent of
+    shared_preload_libraries. Switching to pg_stat_statements must ALSO flip that
+    toggle off, or the operator's Validate() keeps rejecting the CR (both stat
+    modules 'enabled') and the whole reconcile — rollout included — never runs."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("FAKE_KUBE_BUILTIN_PGSM", "1")   # base CR: monitor builtin on
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops)
+    assert rc == 0                                       # accepted + rolled + healthy
+    # the CR patch turned the counterpart's built-in toggle OFF
+    patches = (Path(os.environ["FAKE_KUBE_STATE"]) / "patches.log").read_text()
+    assert '"pgStatMonitor": false' in patches
+    # and the operator's stored CR reflects it (Validate passed)
+    st = _fake_state()
+    assert (st["cr"]["spec"]["extensions"]["builtin"]["pgStatMonitor"]) is False
+    assert st["cr"]["spec"].get("pmm", {}).get("enabled") is True
+
+
+def test_pmm_rollout_timeout_surfaces_operator_blocker(pmmops, monkeypatch):
+    """When the operator won't roll the pods because a pgBackRest backup is
+    serializing the rollout, the wait must NAME that blocker (the real cause of
+    a PMM change never rolling) instead of a blind timeout — both an early
+    'BLOCKED' event and the blocker detail on the timeout line."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("FAKE_KUBE_ROLL_S", "600")          # pods never roll
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_IN_PROGRESS",
+                       "cluster1-repo1-incr-bdvd5")        # CR annotation set
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_BLOCK", "Running:3")  # 1 active + 3 failed
+    rc = run_pmm_enable(
+        _pmm_ops_spec("pmm-enable", rollout_timeout_s=1.5, poll_s=0.3,
+                      qan_timeout_s=0.5, discover_timeout_s=5), pmmops)
+    assert rc == 1
+    events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "BLOCKED by the operator" in events              # early diagnosis
+    assert "backup-in-progress" in events                   # the annotation cause
+    assert "backup still in flight" in events               # the active backup
+    assert "WAL archiving" in events                        # the failed-loop hint
+    assert "TIMEOUT waiting for rollout" in events
+
+
+def test_rollout_blockers_probe_reads_backup_state(pmmops, monkeypatch):
+    """The blocker probe itself: reads the CR annotation and the PerconaPGBackup
+    list, and stays silent (empty) when nothing is blocking."""
+    from pgbench_harness.ops.kube import Kube
+    from pgbench_harness.ops.pmm import run_pmm_enable, _rollout_blockers
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0  # seed a CR
+    kube = Kube(namespace="percona")
+    assert _rollout_blockers(kube, "perconapgcluster", "cluster1") == []
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_IN_PROGRESS", "cluster1-repo1-incr-bdvd5")
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_BLOCK", "Running:0")
+    blockers = _rollout_blockers(kube, "perconapgcluster", "cluster1")
+    assert any("backup-in-progress" in b for b in blockers)
+    assert any("in flight" in b for b in blockers)
 
 
 def test_pmm_status_reports_without_mutating(pmmops):
@@ -1992,6 +2727,25 @@ def test_merge_spl_preserves_and_dedupes():
         "pgvector,pgaudit,pg_stat_statements"         # order kept, dupes dropped
 
 
+def test_merge_spl_mutually_exclusive_stat_libs():
+    # The Percona operator REJECTS a CR with both pg_stat_monitor and
+    # pg_stat_statements in shared_preload_libraries. Enabling one must drop the
+    # other while preserving every unrelated library.
+    from pgbench_harness.ops.pmm import _merge_spl
+    # switching a monitor cluster to statements: monitor removed, pgaudit kept
+    assert _merge_spl("pg_stat_monitor,pgaudit", "pg_stat_statements") == \
+        "pgaudit,pg_stat_statements"
+    # and the reverse direction
+    assert _merge_spl("pgaudit,pg_stat_statements", "pg_stat_monitor") == \
+        "pgaudit,pg_stat_monitor"
+    # counterpart at the head with nothing else -> falls back to the baseline
+    assert _merge_spl("pg_stat_monitor", "pg_stat_statements") == \
+        "pgaudit,pg_stat_statements"
+    # quoted/spaced operator rendering is still matched, dropped, and canonicalized
+    assert _merge_spl(" 'pg_stat_monitor' , pgaudit ", "pg_stat_statements") == \
+        "pgaudit,pg_stat_statements"
+
+
 def test_pmm_enable_preserves_existing_preload_libraries(pmmops):
     """The cluster already loads custom libraries (pgvector, pg_cron): the PMM
     patch must append the extension, never clobber the existing list."""
@@ -2008,15 +2762,15 @@ def test_pmm_enable_preserves_existing_preload_libraries(pmmops):
     st = _fake_state()
     spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
            ["parameters"]["shared_preload_libraries"])
-    assert spl == "pgaudit,pgvector,pg_cron,pg_stat_monitor"
+    assert spl == "pgaudit,pgvector,pg_cron,pg_stat_statements"
     run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
     events = (run_dir / "events.jsonl").read_text()
-    assert "pgaudit,pgvector,pg_cron,pg_stat_monitor" in events
+    assert "pgaudit,pgvector,pg_cron,pg_stat_statements" in events
     assert "preserved" in events
     # validation verified every preserved library, not just the extension
     val = json.loads((run_dir / "validation.json").read_text())
     assert val["libs"] == {"pgaudit": True, "pgvector": True, "pg_cron": True,
-                           "pg_stat_monitor": True}
+                           "pg_stat_statements": True}
 
 
 # ── PMM via the console API (web routes) ──
@@ -2111,7 +2865,7 @@ def test_pmm_enable_twice_is_idempotent(pmmops):
     st = _fake_state()
     spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
            ["parameters"]["shared_preload_libraries"])
-    assert spl == "pgaudit,pg_stat_monitor"          # merged, not doubled
+    assert spl == "pgaudit,pg_stat_statements"       # merged, not doubled
     assert st["pmm_secret"] == "cluster1-pmm-secret"
 
 

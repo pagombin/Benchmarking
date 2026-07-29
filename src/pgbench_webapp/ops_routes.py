@@ -11,6 +11,7 @@ executes.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -206,6 +207,11 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             ("cr_kind", "perconapgcluster"), ("cr_name", ""),
             ("pguser_secret", ""), ("pguser_secret_key", "password"),
             ("db_user", "doadmin"), ("db_name", "defaultdb"))}
+        # Auto-health defaults ON (15 min) so the registry badge reflects the
+        # CURRENT cluster, not the state at registration time — a frozen
+        # 'crit' badge against a recovered cluster misdirected an incident
+        # response (2026-07-23). 0 disables per target.
+        fields["auto_health_s"] = 900
         tid = queries.create_kube_target(conn, name=name, kubeconfig_path=path,
                                          kubeconfig_ref=ref, **fields)
         queries.audit(conn, user["username"], "kube_target_create", target=name,
@@ -422,6 +428,49 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                               payload.get("label") or "", user["username"], mutex)
         return JSONResponse({"job_id": job_id})
 
+    @app.post("/api/kube-targets/{target_id}/cr-snapshot")
+    def ops_cr_snapshot_now(target_id: int, request: Request, payload: dict,
+                            conn: sqlite3.Connection = Depends(get_conn),
+                            user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Manual 'snapshot now, before I do something' — read-only capture of
+        the current CR, so operator role and no confirmation."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        job_id = _enqueue_ops(conn, kt, "cr-apply", {"action": "snapshot"},
+                              payload.get("label") or f"cr-snapshot-{kt['name']}",
+                              user["username"])
+        return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/kube-targets/{target_id}/cr-revert")
+    def ops_cr_revert(target_id: int, request: Request, payload: dict,
+                      conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        """Revert the managed CR sections to a prior snapshot (targeted patch
+        from the diff). Destructive: typed confirmation + mutex; dry-run needs
+        neither."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        src = str(params.get("snapshot_of") or "").strip()
+        if not src:
+            raise HTTPException(400, "snapshot_of (the op run id to revert to) "
+                                     "is required")
+        _safe_segment(src)                      # 400 on traversal shapes
+        params["action"] = "revert_snapshot"
+        dry_run = bool(params.get("dry_run"))
+        mutex: tuple[str, ...] = ()
+        if not dry_run:
+            _require_confirm(kt, payload)
+            mutex = DESTRUCTIVE_KINDS
+        job_id = _enqueue_ops(conn, kt, "cr-apply", params,
+                              payload.get("label") or f"cr-revert-{kt['name']}",
+                              user["username"], mutex)
+        return JSONResponse({"job_id": job_id})
+
     @app.post("/api/kube-targets/{target_id}/backup")
     def ops_backup(target_id: int, request: Request, payload: dict,
                    conn: sqlite3.Connection = Depends(get_conn),
@@ -569,6 +618,109 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                               user["username"], DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
 
+    @app.get("/api/kube-targets/{target_id}/cr-snapshots")
+    def ops_cr_snapshots(target_id: int,
+                         conn: sqlite3.Connection = Depends(get_conn),
+                         user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Every CR snapshot across this target's op runs, newest first, each
+        with a one-line diff summary vs the FRESHEST captured CR state (the
+        newest snapshot). Snapshots are captured pre-patch, so 'snapshot now'
+        after a change gives an up-to-date baseline; the diff is informational,
+        the revert restores the selected snapshot's managed sections regardless.
+
+        Every cr-apply/pmm/schedules/operate op already writes cr_snapshot.json
+        before patching — this surfaces them as a browsable, revertable list."""
+        kt = _kt_or_404(conn, target_id)
+        from pgbench_harness.ops.crconfig import snapshot_diff_summary
+        # The live CR: prefer the freshest snapshot from the newest op run, or
+        # the cached params overlay. (A dedicated live fetch is a worker job;
+        # the newest snapshot is the cheapest honest "current" we have here.)
+        ops_dir = cfg.results_dir / "ops"
+        rows: list[dict[str, Any]] = []
+        if ops_dir.exists():
+            for d in ops_dir.iterdir():
+                snap = d / "cr_snapshot.json"
+                if not snap.is_file():
+                    continue
+                meta = read_meta(d)
+                if meta is None or (meta.get("target") or {}).get("name") != kt["name"]:
+                    continue
+                rows.append({"dir": d, "meta": meta})
+        # created_utc is second-granularity, so two snapshots taken in the same
+        # second would sort ambiguously and "live" (rows[0]) could be the older
+        # one — making a real change read as no diff. Break ties by the snapshot
+        # file's sub-second mtime so the newest is always first.
+        def _sort_key(r: dict[str, Any]) -> tuple:
+            try:
+                mtime = (r["dir"] / "cr_snapshot.json").stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            return (r["meta"].get("created_utc", ""), mtime)
+        rows.sort(key=_sort_key, reverse=True)
+        live: dict[str, Any] = {}
+        if rows:
+            try:
+                live = json.loads((rows[0]["dir"] / "cr_snapshot.json")
+                                  .read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                live = {}
+        out = []
+        prev_summary = None
+        for r in rows:
+            try:
+                snap = json.loads((r["dir"] / "cr_snapshot.json")
+                                  .read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            diff = snapshot_diff_summary(snap, live)
+            # Dedupe identical consecutive snapshots in the list view.
+            if diff["summary"] == prev_summary == "identical to live":
+                continue
+            prev_summary = diff["summary"]
+            m = r["meta"]
+            out.append({
+                "op_run_id": m.get("op_run_id", r["dir"].name),
+                "op": m.get("op", ""),
+                "action": (m.get("headline") or {}).get("action", ""),
+                "created_utc": m.get("created_utc", ""),
+                "status": m.get("status", ""),
+                "diff_summary": diff["summary"],
+                "diff_total": diff["total"],
+            })
+        return JSONResponse({"snapshots": out})
+
+    @app.get("/api/ops/runs/{op_run_id}/cr-snapshot-diff")
+    def ops_cr_snapshot_diff(op_run_id: str,
+                             conn: sqlite3.Connection = Depends(get_conn),
+                             user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Full section-grouped diff of one snapshot vs the newest snapshot
+        for its target (the revert preview)."""
+        run_dir = _op_run_dir(op_run_id)
+        snap_p = run_dir / "cr_snapshot.json"
+        if not snap_p.is_file():
+            raise HTTPException(404, "this op run has no CR snapshot")
+        meta = read_meta(run_dir) or {}
+        tname = (meta.get("target") or {}).get("name", "")
+        from pgbench_harness.ops.crconfig import snapshot_diff_summary
+        ops_dir = cfg.results_dir / "ops"
+        newest = None
+        for d in ops_dir.iterdir() if ops_dir.exists() else []:
+            if not (d / "cr_snapshot.json").is_file():
+                continue
+            m = read_meta(d)
+            if m is None or (m.get("target") or {}).get("name") != tname:
+                continue
+            key = m.get("created_utc", "")
+            if newest is None or key > newest[0]:
+                newest = (key, d)
+        try:
+            snap = json.loads(snap_p.read_text(encoding="utf-8"))
+            live = json.loads((newest[1] / "cr_snapshot.json").read_text(
+                encoding="utf-8")) if newest else {}
+        except (OSError, ValueError):
+            raise HTTPException(500, "snapshot unreadable")
+        return JSONResponse(snapshot_diff_summary(snap, live))
+
     @app.get("/api/kube-targets/{target_id}/health-history")
     def ops_health_history(target_id: int,
                            conn: sqlite3.Connection = Depends(get_conn),
@@ -584,6 +736,47 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             out.append({"ts_utc": r["ts_utc"], "status": r["status"],
                         "crit": r["crit"], "warn": r["warn"], "metrics": metrics})
         return JSONResponse({"history": out})
+
+    @app.post("/api/kube-targets/{target_id}/logs")
+    def ops_logs_start(target_id: int, request: Request, payload: dict,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Start a log-follow op (the Logs tab backend). Read-only on the
+        cluster, so operator role and no confirmation; one per target at a
+        time so a re-tune of the selection replaces the previous follower."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        srcs = params.get("sources")
+        if srcs is not None:
+            if not isinstance(srcs, list) or not all(
+                    isinstance(s, dict) and s.get("pod") for s in srcs):
+                raise HTTPException(400, "'sources' must be a list of "
+                                         "{pod, container} objects")
+        try:
+            tail = int(params.get("tail") or 1000)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "'tail' must be an integer")
+        if not 10 <= tail <= 20000:
+            raise HTTPException(400, "'tail' must be between 10 and 20000")
+        since = str(params.get("since") or "")
+        if since and not re.fullmatch(r"\d+[smh]", since):
+            raise HTTPException(400, "'since' must look like 15m / 1h / 90s")
+        job_id = _enqueue_ops(conn, kt, "logs", params,
+                              payload.get("label") or f"logs-{kt['name']}",
+                              user["username"], ("ops_logs",))
+        return JSONResponse({"job_id": job_id})
+
+    @app.get("/ops/runs/{op_run_id}/logs-stream")
+    def ops_logs_stream(op_run_id: str,
+                        user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
+        """SSE tail of every raw/logs_*.log capture file in the run dir —
+        the browser-facing half of the Logs tab (the op writes, this reads)."""
+        run_dir = _op_run_dir(op_run_id)
+        return StreamingResponse(_logs_sse(run_dir),
+                                 media_type="text/event-stream")
 
     @app.post("/api/kube-targets/{target_id}/monitor")
     def ops_monitor_start(target_id: int, request: Request, payload: dict,
@@ -613,8 +806,13 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             if not kt["schedules_snapshot"]:
                 raise HTTPException(400, "no schedules snapshot recorded — nothing to restore")
             params["snapshot"] = json.loads(kt["schedules_snapshot"])
+        # This patches the CR (backups.pgbackrest.repos[].schedules), so it is
+        # destructive and must share the per-target mutex — otherwise a pause
+        # could interleave with a concurrent cr-apply/pmm/backup patch and one
+        # merge would clobber the other.
         job_id = _enqueue_ops(conn, kt, "cr-apply", params,
-                              f"{action}-schedules-{kt['name']}", user["username"])
+                              f"{action}-schedules-{kt['name']}", user["username"],
+                              DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
 
     # ── op runs: index, artifacts, live stream ──
@@ -725,6 +923,67 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         if not p.exists():
             raise HTTPException(404, "no timeline for this run")
         return PlainTextResponse(p.read_text(encoding="utf-8"))
+
+
+def _logs_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:
+    """Tail every ``raw/logs_*.log`` file with per-file offsets.
+
+    Events: ``hello`` (sources manifest from status.json), ``lines``
+    ({file, lines: [...]}) for each new complete-line chunk, ``done`` when
+    the run turns terminal. Only \\n-terminated lines are emitted so a line
+    read mid-append is never split across events."""
+    from pgbench_webapp.app import _event
+
+    raw = run_dir / "raw"
+    sent: dict[str, int] = {}
+    status_path = run_dir / "status.json"
+    sources: Any = None
+    if status_path.exists():
+        try:
+            sources = json.loads(status_path.read_text(encoding="utf-8")).get("sources")
+        except (OSError, ValueError):
+            sources = None
+    meta = read_meta(run_dir) or {}
+    yield _event("hello", {"op_run_id": run_dir.name,
+                           "status": meta.get("status", ""),
+                           "sources": sources})
+    for _ in range(max_ticks):
+        if sources is None and status_path.exists():
+            try:
+                sources = json.loads(status_path.read_text(encoding="utf-8")).get("sources")
+                if sources is not None:
+                    yield _event("sources", sources)
+            except (OSError, ValueError):
+                pass
+        if raw.is_dir():
+            for p in sorted(raw.glob("logs_*.log")):
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                offset = sent.get(p.name, 0)
+                if size <= offset:
+                    continue
+                try:
+                    with open(p, "rb") as fh:
+                        fh.seek(offset)
+                        data = fh.read(min(size - offset, 512 * 1024))
+                except OSError:
+                    continue
+                nl = data.rfind(b"\n")
+                if nl < 0:
+                    continue
+                lines = data[:nl].decode("utf-8", "replace").split("\n")
+                sent[p.name] = offset + nl + 1
+                # bound each event so one chatty container can't starve others
+                for i in range(0, len(lines), 500):
+                    yield _event("lines", {"file": p.name,
+                                           "lines": lines[i:i + 500]})
+        meta = read_meta(run_dir) or meta
+        if meta.get("status") in OPS_TERMINAL:
+            yield _event("done", {"status": meta.get("status", "")})
+            return
+        time.sleep(1)
 
 
 def _ops_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:

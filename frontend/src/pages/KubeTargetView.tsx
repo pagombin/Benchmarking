@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import type { HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
+import type { CrSnapshot, HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
-import { CheckList } from "./ClusterOps";
+import { CheckList, relTime } from "./ClusterOps";
 import { Crumbs } from "../components/Crumbs";
 
 const SEV_BADGE: Record<string, string> = {
@@ -54,20 +54,11 @@ function seriesFromCsv(text: string, valueOf: (cols: string[], f: string[]) => n
   return [...byEpoch.values()].slice(-maxPts);
 }
 
-const PATRONI_BUNDLE = JSON.stringify({
-  max_wal_size: "49152", min_wal_size: "2048", archive_timeout: "300",
-  wal_keep_size: "2048", checkpoint_timeout: "900",
-  checkpoint_completion_target: "0.9",
-}, null, 2);
-const PGBACKREST_BUNDLE = JSON.stringify({
-  "process-max": "4", "archive-async": "y", "spool-path": "/pgdata",
-}, null, 2);
-
 const CASES = [
   ["switchover", "Case A — graceful switchover (patronictl --force). Ref: ~4.6s, TL+1"],
   ["pgkill", "Case B — kill -9 the postmaster. Ref: restart in place, ~12–16s, no TL change"],
   ["pod-delete", "Case C1 — force-delete the leader pod. Ref: 22–31s write downtime at low load"],
-  ["node-loss", "Case C2 — cordon + delete the leader's node (EXPERIMENTAL)"],
+  ["node-loss", "Case C2 — hard node loss via sysrq kernel panic (privileged node-pinned pod; true crash, no signal to PG)"],
 ] as const;
 
 export function KubeTargetView({ me }: { me: Me }) {
@@ -91,9 +82,6 @@ export function KubeTargetView({ me }: { me: Me }) {
   const canOp = me.role !== "viewer";
 
   // launcher state
-  const [crAction, setCrAction] = useState<"patroni_params" | "pgbackrest_global">("patroni_params");
-  const [crParams, setCrParams] = useState(PATRONI_BUNDLE);
-  const [prepReset, setPrepReset] = useState(false);
   const [bkType, setBkType] = useState("full");
   const [bkPath, setBkPath] = useState("direct");
   const [bkSource, setBkSource] = useState("leader");
@@ -105,7 +93,10 @@ export function KubeTargetView({ me }: { me: Me }) {
   const [monInterval, setMonInterval] = useState(60);
   const [pmmHost, setPmmHost] = useState(
     () => localStorage.getItem(`pmm-host-${targetId}`) ?? "");
-  const [pmmSource, setPmmSource] = useState<"pgstatmonitor" | "pgstatements">("pgstatmonitor");
+  // pg_stat_statements is the default query source: pg_stat_monitor has a
+  // known memory-growth issue under sustained load (field report 2026-07).
+  const [pmmSource, setPmmSource] = useState<"pgstatmonitor" | "pgstatements">("pgstatements");
+  const [snapshots, setSnapshots] = useState<CrSnapshot[]>([]);
 
   const load = useCallback(() => {
     api.get<KubeTarget>(`/api/kube-targets/${targetId}`).then(setKt).catch((e) => setErr(e.message));
@@ -122,6 +113,8 @@ export function KubeTargetView({ me }: { me: Me }) {
       setBenchRuns(rs.filter((r) => r.status && !["complete", "partial", "failed", "canceled"].includes(r.status)))
     ).catch(() => undefined);
     api.get<Job[]>("/api/jobs").then(setJobs).catch(() => undefined);
+    api.get<{ snapshots: CrSnapshot[] }>(`/api/kube-targets/${targetId}/cr-snapshots`)
+      .then((r) => setSnapshots(r.snapshots)).catch(() => undefined);
   }, [targetId]);
   useEffect(load, [load]);
 
@@ -153,10 +146,6 @@ export function KubeTargetView({ me }: { me: Me }) {
       window.scrollTo({ top: 0, behavior: "smooth" });
       return null;
     }
-  }
-
-  function parsedCrParams(): Record<string, string> | null {
-    try { return JSON.parse(crParams); } catch { return null; }
   }
 
   // Sparklines feed from the newest monitor run's parsed CSVs (live or done).
@@ -202,8 +191,20 @@ export function KubeTargetView({ me }: { me: Me }) {
         <Link className="btn primary" to={`/ops/targets/${targetId}/operate`}>Operations</Link>{" "}
         <Link className="btn" to={`/ops/targets/${targetId}/params`}>Parameter map</Link>{" "}
         <Link className="btn" to={`/ops/targets/${targetId}/diag`}>Diagnostics</Link>{" "}
+        <Link className="btn" to={`/ops/targets/${targetId}/logs`}>Logs</Link>{" "}
         <Link className="btn" to="/ops">← targets</Link>
       </div>
+
+      {/* In-page section nav — the target page is a long scroll of cards;
+          these anchor-jump to each so it's navigable without scrubbing. */}
+      <nav className="section-nav">
+        {[["health", "Health"], ["topology", "Topology"],
+          ...(isAdmin ? [["operations", "Operations"]] : []),
+          ["snapshots", "CR snapshots"], ["monitor", "Monitor"],
+          ["pmm", "PMM"], ["runs", "Op runs"]].map(([id, label]) => (
+          <a key={id} href={`#${id}`} className="section-nav-link">{label}</a>
+        ))}
+      </nav>
 
       <div className="kpi-row" style={{ marginBottom: 16 }}>
         <div className="kpi"><div className="label">Leader</div>
@@ -248,12 +249,13 @@ export function KubeTargetView({ me }: { me: Me }) {
         </div>
       )}
 
-      <div className="card">
+      <div id="health" className="card">
         <div className="card-head">
           <h2>Health
             {health && <span className={`badge ${SEV_BADGE[health.status] ?? "ok"}`} style={{ marginLeft: 8 }}>
               {health.status === "ok" ? "✓ healthy" : health.status}</span>}
-            {healthUtc && <span className="subtle mono" style={{ marginLeft: 8 }}>as of {healthUtc}</span>}
+            {healthUtc && <span className="subtle mono" style={{ marginLeft: 8 }}
+                                title={healthUtc}>checked {relTime(healthUtc)}</span>}
           </h2>
           <div className="spacer" />
           {isAdmin && (
@@ -311,7 +313,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         )}
       </div>
 
-      <div className="card" style={{ marginTop: 16 }}>
+      <div id="topology" className="card" style={{ marginTop: 16 }}>
         <div className="card-head">
           <h2>Topology {topoUtc ? <span className="subtle mono">as of {topoUtc}</span> : null}</h2>
           <div className="spacer" />
@@ -391,7 +393,7 @@ export function KubeTargetView({ me }: { me: Me }) {
       </div>
 
       {isAdmin && (
-        <div className="card" style={{ marginTop: 16 }}>
+        <div id="operations" className="card" style={{ marginTop: 16 }}>
           <div className="card-head"><h2>Operations</h2>
             <span className="subtle">destructive actions require typing the cluster name:&nbsp;</span>
             <input value={confirm} onChange={(e) => setConfirm(e.target.value)}
@@ -400,36 +402,15 @@ export function KubeTargetView({ me }: { me: Me }) {
           <div className="grid2">
             <div>
               <h3 className="section-label">CR configuration</h3>
-              <div className="field"><label>Bundle</label>
-                <select value={crAction} onChange={(e) => {
-                  const v = e.target.value as typeof crAction;
-                  setCrAction(v);
-                  setCrParams(v === "patroni_params" ? PATRONI_BUNDLE : PGBACKREST_BUNDLE);
-                }}>
-                  <option value="patroni_params">Patroni dynamicConfiguration parameters</option>
-                  <option value="pgbackrest_global">pgBackRest global options</option>
-                </select></div>
-              <div className="field"><label>Parameters (JSON, editable)</label>
-                <textarea rows={8} className="mono" style={{ width: "100%" }}
-                          value={crParams} onChange={(e) => setCrParams(e.target.value)} /></div>
-              {crAction === "patroni_params" && (
-                <div className="field"><label>
-                  <input type="checkbox" checked={prepReset} onChange={(e) => setPrepReset(e.target.checked)} />
-                  &nbsp;prep: reset checkpointer stats after verify</label></div>
-              )}
-              <button onClick={() => {
-                const p = parsedCrParams();
-                if (!p) { setErr("parameters are not valid JSON"); return; }
-                launch("cr-apply", { params: { action: crAction, dry_run: true,
-                  [crAction === "patroni_params" ? "parameters" : "global"]: p } });
-              }}>Dry-run (show patch + diff)</button>{" "}
-              <button className="primary" onClick={() => {
-                const p = parsedCrParams();
-                if (!p) { setErr("parameters are not valid JSON"); return; }
-                launch("cr-apply", { confirm, params: { action: crAction,
-                  [crAction === "patroni_params" ? "parameters" : "global"]: p,
-                  prep: prepReset ? { reset_checkpointer: true } : {} } });
-              }}>Apply & verify</button>
+              <p className="subtle" style={{ marginTop: 0 }}>
+                Configuration changes go through the <strong>Parameter map</strong> — a
+                typed, validated, per-parameter surface where a bad name or out-of-range
+                value can&apos;t be staged, and the proven tuning bundles stage as one click
+                into that same validated flow. (The old raw-JSON editor was retired: two
+                apply paths to the same CR let a hand-typed value bypass validation.)
+              </p>
+              <Link className="btn primary" to={`/ops/targets/${targetId}/params`}>
+                Open the Parameter map</Link>
               <h3 className="section-label" style={{ marginTop: 24 }}>Backup schedules</h3>
               <p className="subtle">Pause the operator&apos;s schedules for a test window (snapshot kept;
                 the UI nags until restored).</p>
@@ -525,7 +506,46 @@ export function KubeTargetView({ me }: { me: Me }) {
       )}
 
       {canOp && (
-        <div className="card" style={{ marginTop: 16 }}>
+        <div id="snapshots" className="card" style={{ marginTop: 16 }}>
+          <div className="card-head"><h2>CR snapshots</h2>
+            <span className="subtle" style={{ fontSize: 12 }}>
+              every apply/PMM/schedules op snapshots the CR before patching</span>
+            <div className="spacer" />
+            <button onClick={() => launch("cr-snapshot", {}, false)}>Snapshot now</button>
+          </div>
+          {snapshots.length === 0 ? (
+            <p className="empty">No CR snapshots yet — they appear here after the first
+              config op (or click “Snapshot now”).</p>
+          ) : (
+            <table>
+              <thead><tr><th>Taken by</th><th>When</th><th>Diff vs latest</th><th /></tr></thead>
+              <tbody>
+                {snapshots.map((s) => (
+                  <tr key={s.op_run_id}>
+                    <td><Link className="mono" to={`/ops/runs/${s.op_run_id}`}>
+                      {s.action || s.op}</Link></td>
+                    <td className="mono">{relTime(s.created_utc)}</td>
+                    <td className="subtle" style={{ fontSize: 12 }}>{s.diff_summary}</td>
+                    <td>{isAdmin && s.diff_total > 0 && (
+                      <button className="btn-sm" onClick={() => {
+                        if (!confirm) { setErr("type the cluster name in the Operations box to revert"); return; }
+                        if (!window.confirm(`Revert the managed CR sections to this snapshot (${s.diff_total} field(s))? A snapshot of the current CR is taken first, so this is undoable.`)) return;
+                        launch("cr-revert", { confirm, params: { snapshot_of: s.op_run_id } });
+                      }}>Revert…</button>)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {isAdmin && <p className="subtle" style={{ margin: "8px 0 0", fontSize: 12 }}>
+            Revert builds a targeted patch from the diff (managed sections only:
+            Patroni parameters, pgBackRest/pgBouncer globals) — never a blind apply of
+            the whole document. Type the cluster name in the Operations box first.</p>}
+        </div>
+      )}
+
+      {canOp && (
+        <div id="monitor" className="card" style={{ marginTop: 16 }}>
           <div className="card-head"><h2>Telemetry monitor</h2>
             {activeMonitor && <span className="badge running">running (job {activeMonitor.id})</span>}
           </div>
@@ -557,7 +577,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         const lastPmm = runs.find((r) => ["pmm-enable", "pmm-status", "pmm-disable"].includes(r.kind));
         const pmmParams = { server_host: pmmHost.trim(), query_source: pmmSource, extension: pmmExt };
         return (
-          <div className="card" style={{ marginTop: 16 }}>
+          <div id="pmm" className="card" style={{ marginTop: 16 }}>
             <div className="card-head"><h2>PMM monitoring</h2>
               {instPods.length > 0 && (
                 <span className={`badge ${pmmPods === instPods.length ? "ok" : pmmPods > 0 ? "running" : "failed"}`}>
@@ -589,10 +609,22 @@ export function KubeTargetView({ me }: { me: Me }) {
                        }} /></div>
               <div className="field"><label>Query source (extension is paired automatically)</label>
                 <select value={pmmSource} onChange={(e) => setPmmSource(e.target.value as typeof pmmSource)}>
-                  <option value="pgstatmonitor">pg_stat_monitor (richer QAN — recommended)</option>
-                  <option value="pgstatements">pg_stat_statements (built-in)</option>
+                  <option value="pgstatements">pg_stat_statements (built-in — recommended)</option>
+                  <option value="pgstatmonitor">pg_stat_monitor (richer QAN — ⚠ memory-growth issue)</option>
                 </select></div>
             </div>
+            {pmmSource === "pgstatmonitor" && (
+              <p className="subtle" style={{ marginTop: 0 }}>
+                ⚠ <strong>pg_stat_monitor has a known memory-growth issue under sustained
+                load</strong> (verified 2026-07 on long TPC-C runs — it took down multi-hour
+                tests). Prefer pg_stat_statements for anything longer than an hour. Already
+                running pg_stat_monitor? Switch by re-enabling PMM with pg_stat_statements
+                selected: the agent query source is re-registered and the extension created;
+                then remove <code>pg_stat_monitor</code> from{" "}
+                <code>shared_preload_libraries</code> in the parameter map (restart-required)
+                and <code>DROP EXTENSION pg_stat_monitor</code>.
+              </p>
+            )}
             <button disabled={!pmmHost.trim()} onClick={() =>
               launch("pmm/status", { params: pmmParams })}>
               Check status (read-only)</button>{" "}
@@ -658,7 +690,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         </div>
       )}
 
-      <div className="card" style={{ marginTop: 16 }}>
+      <div id="runs" className="card" style={{ marginTop: 16 }}>
         <div className="card-head"><h2>Op runs on this target</h2>
           <div className="spacer" /><Link className="btn" to="/ops/runs">all ops runs →</Link></div>
         <OpsRunsTable runs={runs} />
@@ -686,6 +718,7 @@ export function OpsRunsTable({ runs, selectable, selected, onToggle }: {
     if (r.kind === "cr-apply") {
       const n = h.changed ? Object.keys(h.changed).length : 0;
       return [h.action, h.dry_run ? "dry-run" : "", `${n} changed`,
+              h.outcome ? String(h.outcome) : "",
               (h.pending_restart?.length ?? 0) > 0 ? "⚠ pending_restart" : ""].filter(Boolean).join(" · ");
     }
     if (r.kind === "monitor") return h.cycles ? `${h.cycles} cycles` : "";

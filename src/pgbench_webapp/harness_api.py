@@ -48,8 +48,22 @@ def _spec_from_yaml(spec_yaml: str) -> Spec:
     return parse_spec(yaml.safe_load(spec_yaml))
 
 
+def _hms(seconds: float) -> str:
+    """Compact m:ss / h:mm:ss for a budget breakdown."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
 def dry_run(spec_yaml: str) -> dict[str, Any]:
-    """Exact planned sysbench commands + wall-clock budget (mirrors `--dry-run`)."""
+    """Exact planned sysbench commands + wall-clock budget (mirrors `--dry-run`).
+
+    Every mode returns ``budget_breakdown``: a one-line explanation of HOW the
+    wall-clock budget is built from the configured settings. For a sweep the
+    per-level ``duration_s`` is multiplied by the number of thread levels — so a
+    "5 minute" duration over four levels is a ~21 minute run — and the UI shows
+    this so the configured duration never reads as ignored."""
     spec = _spec_from_yaml(spec_yaml)
     if spec.is_suite:
         from pgbench_harness.runner import print_suite_dry_run
@@ -60,9 +74,13 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
         lines = buf.getvalue().splitlines()
         n = sum(1 for ln in lines if ln.startswith("["))
         assert spec.suite is not None
+        cd = spec.suite.cooldown_s
         return {"mode": "suite",
                 "budget_s": n * spec.suite.duration_s
-                            + max(0, n - 1) * spec.suite.cooldown_s,
+                            + max(0, n - 1) * cd,
+                "budget_breakdown":
+                    f"{n} segment{'s' if n != 1 else ''} × {_hms(spec.suite.duration_s)} each"
+                    + (f" + {n - 1}×{_hms(cd)} stabilization" if n > 1 and cd else ""),
                 "commands": lines}
     if spec.device_probe is not None and spec.sweep is None and spec.soak is None:
         import contextlib, io as _io
@@ -71,27 +89,43 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
             from pgbench_harness.evidencepack import PACK_VARIANTS, run_evidence_pack
             with contextlib.redirect_stdout(buf):
                 run_evidence_pack(spec, Path("."), dry_run=True)
+            nvar = len(PACK_VARIANTS)
             return {"mode": "evidence-pack",
-                    "budget_s": len(PACK_VARIANTS) * spec.device_probe.duration_s,
+                    "budget_s": nvar * spec.device_probe.duration_s,
+                    "budget_breakdown":
+                        f"{nvar} probe variants × {_hms(spec.device_probe.duration_s)} each",
                     "commands": buf.getvalue().splitlines()}
         from pgbench_harness.deviceprobe import run_device_probe
         with contextlib.redirect_stdout(buf):
             run_device_probe(spec, Path("."), dry_run=True)
         return {"mode": "device-probe",
                 "budget_s": spec.device_probe.duration_s,
+                "budget_breakdown": f"single {_hms(spec.device_probe.duration_s)} probe",
                 "commands": buf.getvalue().splitlines()}
     if spec.is_soak:
         assert spec.soak is not None
         cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
         return {"mode": "soak", "budget_s": spec.soak.duration_s,
+                "budget_breakdown":
+                    f"single {_hms(spec.soak.duration_s)} window at "
+                    f"{spec.soak.threads} threads",
                 "commands": [cmd.display()]}
     assert spec.sweep is not None
+    sw = spec.sweep
+    nlev = len(sw.threads)
+    n = nlev * sw.repetitions
     cmds = []
-    for rep in range(1, spec.sweep.repetitions + 1):
-        for threads in spec.sweep.threads:
+    for rep in range(1, sw.repetitions + 1):
+        for threads in sw.threads:
             cmds.append(f"[rep {rep}, {threads} threads] "
                         + sysbench.build_run_command(spec, threads).display())
-    return {"mode": "sweep", "budget_s": int(runner.planned_budget_s(spec)), "commands": cmds}
+    breakdown = (f"{nlev} thread level{'s' if nlev != 1 else ''}"
+                 + (f" × {sw.repetitions} reps" if sw.repetitions > 1 else "")
+                 + f" × {_hms(sw.duration_s)} each"
+                 + (f" + {n - 1}×{_hms(sw.cooldown_s)} cooldown"
+                    if n > 1 and sw.cooldown_s else ""))
+    return {"mode": "sweep", "budget_s": int(runner.planned_budget_s(spec)),
+            "budget_breakdown": breakdown, "commands": cmds}
 
 
 def generate_report(run_dir: Path) -> Path:

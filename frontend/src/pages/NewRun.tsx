@@ -32,6 +32,18 @@ function yamlScalar(v: unknown): string {
 
 const WORKLOADS = ["tpcc", "oltp_read_only", "oltp_read_write", "oltp_write_only", "oltp_point_select", "io_stress"];
 
+// The run's mode is whichever top-level block the spec declares. Detected from
+// the YAML text (no yaml dep, CSP-safe) so the Mode dropdown mirrors a pasted or
+// cloned spec instead of drifting from it — a soak spec must never launch as the
+// sweep the dropdown happened to be left on.
+function detectMode(y: string): "sweep" | "soak" | "suite" | "probe" | null {
+  if (/^soak:/m.test(y)) return "soak";
+  if (/^suite:/m.test(y)) return "suite";
+  if (/^device_probe:/m.test(y)) return "probe";
+  if (/^sweep:/m.test(y)) return "sweep";
+  return null;
+}
+
 export function NewRun({ me }: { me: Me }) {
   const canRun = me.role === "operator" || me.role === "admin";
   const navigate = useNavigate();
@@ -149,6 +161,16 @@ export function NewRun({ me }: { me: Me }) {
     if (autoSync) setYaml(toYaml(doc) + "\n");
   }, [doc, autoSync]);
 
+  // While the YAML is authoritative (raw editing / a cloned or pasted spec),
+  // keep the Mode dropdown pointed at whatever the spec actually declares, so
+  // the control never disagrees with what will run.
+  useEffect(() => {
+    if (autoSync) return;
+    const m = detectMode(yaml);
+    if (m && m !== mode) setMode(m);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [yaml, autoSync]);
+
   async function validate() {
     setErr(null);
     try {
@@ -162,8 +184,10 @@ export function NewRun({ me }: { me: Me }) {
   async function dryRun() {
     setErr(null);
     try {
-      const d = await api.post<{ mode: string; budget_s: number; commands: string[] }>("/api/dry-run", { spec_yaml: yaml });
-      setDryOut(`# ${d.mode} — planned wall-clock ~${Math.round(d.budget_s / 60)} min (${d.budget_s}s)\n` + d.commands.join("\n"));
+      const d = await api.post<{ mode: string; budget_s: number; budget_breakdown?: string; commands: string[] }>("/api/dry-run", { spec_yaml: yaml });
+      setDryOut(`# ${d.mode} — planned wall-clock ~${Math.round(d.budget_s / 60)} min (${d.budget_s}s)`
+        + (d.budget_breakdown ? `\n# budget = ${d.budget_breakdown}` : "")
+        + `\n` + d.commands.join("\n"));
     } catch (e) { setDryOut("error: " + (e as Error).message); }
   }
   function credBody(): Record<string, unknown> {
@@ -174,8 +198,25 @@ export function NewRun({ me }: { me: Me }) {
     if (!inline.host.trim()) throw new Error("enter a host (or choose a saved target)");
     return { password: inline.password };
   }
+  // The spec in the editor is what actually runs. If a raw edit left it on a
+  // different mode than the dropdown shows, refuse — silently running a 4-level
+  // sweep when the operator picked a single soak window is exactly the failure
+  // we're guarding against. Returns true when it's safe to proceed.
+  function modeMatchesEditor(): boolean {
+    const ym = detectMode(yaml);
+    if (ym && ym !== mode) {
+      const block = mode === "probe" ? "device_probe" : mode;
+      setErr(`The spec in the editor is a ${ym} run, but “${mode}” is selected. `
+        + `Click “↻ Rebuild from fields” to regenerate a ${mode} spec, or edit the `
+        + `YAML so it has a ${block}: block — the editor spec is what runs.`);
+      return false;
+    }
+    return true;
+  }
+
   async function start() {
     setErr(null);
+    if (!modeMatchesEditor()) return;
     if (mode === "probe" && !kubeTargetId) {
       setErr("the device probe needs an attached cluster (it runs inside the cluster) — pick one under “Attach cluster”");
       return;

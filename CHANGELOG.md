@@ -14,6 +14,105 @@
   fixed retroactively by regenerating their report (write_parsed
   rebuilds samples.csv from raw logs with the new column).
 
+## Unreleased — failover lab, CR snapshot revert, target-delete fix
+
+- **Target delete no longer 500s** (J1): `jobs.target_id` / `health_history`
+  foreign keys made a target that had ever run a job or health check
+  undeletable (IntegrityError → 500). Delete now detaches finished job
+  history and refuses with a 409 while a job is still active.
+- **Case C2 node-loss is a real crash** (M1): fires a sysrq kernel panic
+  from a privileged, node-pinned pod instead of cordon+delete — DO
+  power-off (ACPI) and cordon/drain all let PostgreSQL checkpoint
+  cleanly and invalidate the run as node loss (DBAAS-8917).
+- **Stitcher parity with the Aries field scripts** (M4): effective-kill
+  (T0′) auto-detection so an out-of-band kill's delivery delay isn't
+  charged to downtime; three-way transition classification (election vs
+  in-place re-promotion vs plain restart); and a crash-validity check
+  that stamps a run INVALID-AS-CRASH when a graceful-shutdown marker
+  appears in the kill window.
+- **CR snapshot browser + one-click revert** (N): every config op already
+  snapshots the CR before patching — these are now a browsable list per
+  target (diff summary vs the freshest capture), with a manual "snapshot
+  now" and a guarded revert that rebuilds a targeted patch over the
+  managed sections only (never a blind whole-document apply), with the
+  full confirm/dry-run/verify envelope. The revert snapshots first, so
+  it is itself undoable.
+- **Backup matrix + API bug-bash tests** (L/J): an explicit
+  source × path × type backup grid, a schedules pause/restore
+  byte-for-byte round-trip, and a sweep asserting no ops mutation route
+  returns a 500 on malformed input.
+
+## Unreleased — cr-apply correctness, guardrails, OOM detection, log viewer
+
+Fixes distilled from the huge_pages incident (2026-07-23, cluster
+`advance-standard-compare-pa2`) and the pg_stat_monitor memory-leak field
+report (2026-07-22).
+
+- **cr-apply verify no longer races cluster recovery** (A1/E4): after a
+  patch the leader is re-resolved with retry/backoff (default 5 min,
+  `rollout_timeout_s`); transient leaderlessness right after a
+  restart-required change is treated as expected, never an instant
+  failure.
+- **Applied-change accounting is durable** (A2/E3): the applied diff is
+  persisted to `meta.json` the moment the patch lands, so the summary
+  card can never show "Changed 0" for a run that patched, and rollback
+  always has its source — including from runs whose verify crashed
+  (plus a `diff.json` fallback for older runs).
+- **Distinct terminal outcomes** (A3): `applied+verified` (complete),
+  `applied, verify failed` / `applied, rollout not confirmed` (warning),
+  `applied, rollout failed` (failed, with FATAL evidence),
+  `refused by validation` (aborted), `apply failed` — the badge no
+  longer implies "the change didn't land" when it did.
+- **Verify failures carry diagnostics** (A4): patronictl member states +
+  the last FATAL/PANIC lines from each database container land in
+  `verify.json` and the error message — "still crash-looping" vs
+  "recovering, be patient" is now visible at a glance.
+- **Server-side validation + hazard guardrails** (A5/E1): the worker
+  re-validates every `patroni_params` apply against the LIVE pg_settings
+  catalog (unknown names, types, ranges, enums, locked channels) and
+  runs precondition checks for dangerous parameters: `huge_pages=on`
+  without hugepages pod resources is refused (the outage cause),
+  shared-memory arithmetic vs the container limit, `max_wal_size` vs
+  the data PVC, pgBackRest `spool-path` on /pgdata. `force: true`
+  overrides with a loud event; validation degrades gracefully when the
+  cluster is down so a recovery apply is never blocked by its own outage.
+- **Rollout watch after pending-restart** (A6/E14): a restart-required
+  change now watches the operator's roll (leader + members healthy + no
+  pending flags) and re-verifies after convergence; prep actions run
+  after the roll, not against a cluster about to restart.
+- **GUC value normalization** (E2/E5): verify and diff compare
+  unit-normalized values ("1GB" == "1024" for unit MB, "on" == "true",
+  "0.9" == "0.90") — no more false verify failures or phantom diffs;
+  verify queries return one JSON document (E9, no separator pitfalls).
+- **Section-aware ini verification** (E6/E7): pgBackRest and pgBouncer
+  rendered-config checks track ini sections ([global] / [pgbouncer])
+  with anchored, escaped key patterns.
+- **Patroni DCS invariant** (E8): `loop_wait + 2*retry_timeout <= ttl`
+  is enforced (pulling live values for unstaged members of the trio);
+  float values coerce correctly.
+- **Default query-stats extension → pg_stat_statements** (F):
+  pg_stat_monitor showed sustained memory growth that took down
+  long-running tests; it stays selectable with a warning, and health
+  checks flag it whenever it's in `shared_preload_libraries`.
+- **OOM detection** (G): health findings for OOMKilled containers,
+  in-log allocation failures and memory pressure; monitor writes
+  per-member `memory.csv` (working set, limit, restarts, OOM count) and
+  emits an event the moment a restart/OOM appears; sustained
+  working-set growth raises a `mem_leak_suspect` trend finding.
+- **Health badge freshness** (B1): auto-health defaults ON (15 min) for
+  new targets, the registry shows "checked Xm ago · stale" next to
+  every badge, and the badge links to the findings that produced it.
+- **Cluster registration redesigned** (C): full-width grouped steps
+  (Connection → Target CR → DB access), inline validation with required
+  markers, client-side sandbox-path warning, wide inputs that never
+  clip, API-server middle-ellipsis + copy, health column in the table.
+- **Live log viewer** (H): a Logs tab per target — a worker op follows
+  selected pod/containers (`kubectl logs -f` capture into the run dir,
+  web tier still never runs kubectl), streamed to the browser over SSE
+  with per-component severity parsing (Postgres/Patroni split within
+  the database container), severity/component/text filters, tail/since
+  history, follow/pause/clear/download.
+
 ## Unreleased — cross-provider comparison report overhaul (DO vs Aiven ready)
 
 - **Environment & identity cards** in both sweep and soak comparisons:

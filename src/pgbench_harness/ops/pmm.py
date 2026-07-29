@@ -52,6 +52,16 @@ TOKEN_ENV = "PGB_PMM_TOKEN"
 
 PAIRINGS = {"pgstatmonitor": "pg_stat_monitor", "pgstatements": "pg_stat_statements"}
 
+# The Percona operator's spec.pmm.querySource CRD enum spells pg_stat_statements
+# as "pgstatstatements" (doubled "stat"), then translates it to the pmm-agent's
+# own --query-source value ("pgstatements") + QAN agent name. So ONLY the CR
+# field needs the operator spelling; everything downstream (prerun script,
+# qan_postgresql_<src>_agent) uses the agent value. pg_stat_monitor is spelled
+# the same on both sides. Writing the agent value straight into the CR made the
+# operator reject the patch ("Unsupported value: pgstatements").
+_CR_QUERY_SOURCE = {"pgstatmonitor": "pgstatmonitor",
+                    "pgstatements": "pgstatstatements"}
+
 
 def _cfg(params: dict[str, Any]) -> dict[str, Any]:
     """Normalize the pmm params with the reference script's defaults."""
@@ -59,8 +69,11 @@ def _cfg(params: dict[str, Any]) -> dict[str, Any]:
         "server_host": str(params.get("server_host") or ""),
         "client_image": str(params.get("client_image")
                             or "docker.io/percona/pmm-client:3.8.1"),
-        "query_source": str(params.get("query_source") or "pgstatmonitor"),
-        "extension": str(params.get("extension") or "pg_stat_monitor"),
+        # Default flipped to pg_stat_statements (2026-07): pg_stat_monitor
+        # showed sustained memory growth on long-running tests in the field —
+        # it stays selectable, but multi-hour tests should not default onto it.
+        "query_source": str(params.get("query_source") or "pgstatements"),
+        "extension": str(params.get("extension") or "pg_stat_statements"),
         # empty = auto-detect the cluster's existing libraries and preserve them
         "base_libs": str(params.get("base_libs") or ""),
         "database": str(params.get("database") or "postgres"),
@@ -99,15 +112,48 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
     return token
 
 
+# pg_stat_monitor and pg_stat_statements are MUTUALLY EXCLUSIVE to the Percona
+# operator: its admission Validate (perconapgcluster_types.go) REJECTS any CR
+# whose shared_preload_libraries lists both — "pg_stat_monitor and
+# pg_stat_statements cannot both be enabled". A cluster already loading
+# pg_stat_monitor therefore cannot simply have pg_stat_statements appended; the
+# operator refuses the whole patch and NOTHING rolls (spec silently rejected in
+# a reconcile loop, pods stay on the old spec). So enabling one half of the pair
+# must DROP the other half from the preload list.
+_STAT_PAIR = {"pg_stat_statements": "pg_stat_monitor",
+              "pg_stat_monitor": "pg_stat_statements"}
+
+# The operator's Validate() counts an extension as "enabled" through a SECOND,
+# independent path: the built-in extensions toggle spec.extensions.builtin.<key>
+# (pgv2 2.x manages shared_preload_libraries + CREATE EXTENSION from it). So
+# removing pg_stat_monitor from shared_preload_libraries is NOT enough — while
+# spec.extensions.builtin.pgStatMonitor stays true the operator still sees both
+# stat modules enabled and rejects EVERY reconcile (the rejection is at the top
+# of Reconcile, so the whole cluster — rollout included — stops progressing).
+# Enabling one half of the pair must therefore also switch off the OTHER half's
+# built-in toggle.
+_EXT_BUILTIN_KEY = {"pg_stat_monitor": "pgStatMonitor",
+                    "pg_stat_statements": "pgStatStatements"}
+
+
 def _merge_spl(existing: str, extension: str) -> str:
     """Merge the PMM extension into the cluster's existing preload libraries:
     keep every existing library in order, dedupe, append the extension if
-    missing. Never drops a library the cluster already loads."""
+    missing. Preserves every library the cluster already loads EXCEPT the
+    mutually-exclusive pg_stat_* counterpart of *extension*, which is dropped —
+    leaving both in shared_preload_libraries makes the operator reject the CR."""
+    exclusive = _STAT_PAIR.get(extension)
     libs: list[str] = []
     for part in (existing or "").split(","):
-        p = part.strip()
-        if p and p not in libs:
-            libs.append(p)
+        # normalize quotes/spaces so the counterpart is matched (and dropped)
+        # even when the operator renders SPL as 'pg_stat_monitor', pgaudit —
+        # and so the value we write back to the CR is canonical.
+        p = _norm_lib(part)
+        if not p or p in libs:
+            continue
+        if p == exclusive:               # mutually exclusive with `extension`
+            continue
+        libs.append(p)
     if not libs:
         libs = ["pgaudit"]                # the operator's own baseline
     if extension not in libs:
@@ -141,15 +187,75 @@ def _resolve_spl(kube: Kube, run: OpsRun, cfg: dict[str, Any],
     else:
         cur, src = _current_spl(kube, cr, leader, cfg["database"])
     spl = _merge_spl(cur, cfg["extension"])
-    run.event("preflight", f"shared_preload_libraries -> {spl}",
-              f"existing libraries ({src}: '{cur or 'none declared'}') are "
-              f"preserved; {cfg['extension']} appended if missing")
+    dropped = _STAT_PAIR.get(cfg["extension"])
+    note = (f"existing libraries ({src}: '{cur or 'none declared'}') are "
+            f"preserved; {cfg['extension']} appended if missing")
+    if dropped and dropped in {_norm_lib(x) for x in cur.split(",")}:
+        note += (f"; {dropped} REMOVED — the operator rejects a CR with both "
+                 f"{dropped} and {cfg['extension']} in shared_preload_libraries")
+    run.event("preflight", f"shared_preload_libraries -> {spl}", note)
     return spl
 
 
 def _instance_pods(kube: Kube, cr_name: str) -> list[dict[str, Any]]:
     items = kube.json(["get", "pods"]).get("items") or []
     return classify_pods(items, cr_name)["instances"]
+
+
+# The Percona operator serializes instance rollouts behind pgBackRest backups: a
+# backup marked "in progress" (or a stuck PerconaPGBackup that left the
+# backup-in-progress annotation behind) silently DEFERS every pod restart. That
+# turns a config change into an endless "waiting for rollout" with no error — the
+# real-world cause of a PMM/shared_preload_libraries change never rolling.
+_BACKUP_IN_PROGRESS_ANN = "pgv2.percona.com/backup-in-progress"
+_BACKUP_ACTIVE_STATES = {"Running", "Starting", "Waiting", "New"}
+
+
+def _rollout_blockers(kube: Kube, cr_kind: str, cr_name: str) -> list[str]:
+    """Operator-level reasons an instance rollout can't proceed — surfaced so a
+    blocked rollout never reads as a blind timeout. Best-effort: any probe that
+    errors is simply skipped (the caller still reports the plain timeout)."""
+    blockers: list[str] = []
+    # 1) the CR's backup-in-progress annotation pins the whole cluster
+    try:
+        cr = kube.cluster_cr(cr_kind, cr_name)
+        bip = ((cr.get("metadata") or {}).get("annotations") or {}).get(
+            _BACKUP_IN_PROGRESS_ANN)
+        if bip:
+            blockers.append(
+                f"a pgBackRest backup is marked in progress "
+                f"({_BACKUP_IN_PROGRESS_ANN}={bip}) — the operator serializes "
+                "instance rollouts behind backups; clear it with: kubectl "
+                f"annotate {cr_kind} {cr_name} {_BACKUP_IN_PROGRESS_ANN}-")
+    except KubeError:
+        pass
+    # 2) a PerconaPGBackup for this cluster still in a non-terminal state, plus a
+    #    failed-backup retry loop (usually broken WAL archiving) as context
+    try:
+        items = kube.json(["get", "perconapgbackup"]).get("items") or []
+    except KubeError:
+        items = []
+    active, failed = [], []
+    for it in items:
+        meta, spec, status = (it.get("metadata") or {}, it.get("spec") or {},
+                              it.get("status") or {})
+        name = meta.get("name", "")
+        if cr_name not in name and spec.get("clusterName") != cr_name:
+            continue
+        state = str(status.get("state") or "")
+        if state in _BACKUP_ACTIVE_STATES:
+            active.append(f"{name} [{state}]")
+        elif state == "Failed":
+            failed.append(name)
+    if active:
+        blockers.append("backup still in flight: " + ", ".join(active[:3])
+                        + " — instance rollout waits for it to finish or be deleted")
+    if failed:
+        blockers.append(
+            f"{len(failed)} failed backup(s) in a retry loop (e.g. {failed[0]}) "
+            "— check WAL archiving (pgBackRest error 082 = WAL not archived); a "
+            "stuck backup here is what pins the rollout")
+    return blockers
 
 
 def _pod_raw(kube: Kube, name: str) -> Optional[dict[str, Any]]:
@@ -194,17 +300,23 @@ def _pod_ready(pod_raw: dict[str, Any]) -> bool:
     return bool(cs) and all(c.get("ready") for c in cs)
 
 
-def _wait_rollout(kube: Kube, run: OpsRun, cr_name: str, cfg: dict[str, Any],
-                  secret_name: str, pre_uids: dict[str, str],
+def _wait_rollout(kube: Kube, run: OpsRun, cr_kind: str, cr_name: str,
+                  cfg: dict[str, Any], secret_name: str, pre_uids: dict[str, str],
                   pre_matched: dict[str, bool], what: str) -> bool:
     """Spec-aware rollout wait (reference-script bug #1 fixed).
 
     Done only when every instance pod exists, is Running with all containers
     Ready, carries the patched spec, and — if its pre-patch spec did NOT
     already match — has a new UID (i.e. was actually recreated). A pod that
-    is merely Ready on the old spec counts as not-done."""
+    is merely Ready on the old spec counts as not-done.
+
+    If nothing has rolled for a while, probe for operator-level blockers (a
+    pgBackRest backup serializing the rollout) and surface them ONCE, so a
+    blocked rollout is diagnosed instead of silently burning the whole timeout."""
     deadline = time.monotonic() + cfg["rollout_timeout_s"]
     last = ""
+    blockers_reported = False
+    checks = 0
     while True:
         pods = _instance_pods(kube, cr_name)
         pending: list[str] = []
@@ -234,10 +346,21 @@ def _wait_rollout(kube: Kube, run: OpsRun, cr_name: str, cfg: dict[str, Any],
         if detail != last:
             run.status_update(phase=f"rollout ({what})", detail=detail)
             last = detail
+        # nothing has rolled AND we've waited a couple of polls -> diagnose why
+        checks += 1
+        stalled = all(": old spec" in p for p in pending) if pending else False
+        if not blockers_reported and checks >= 2 and stalled:
+            blockers = _rollout_blockers(kube, cr_kind, cr_name)
+            if blockers:
+                run.event("rollout", "rollout appears BLOCKED by the operator, "
+                          "not merely slow", "; ".join(blockers))
+                blockers_reported = True
         if time.monotonic() >= deadline:
+            blockers = _rollout_blockers(kube, cr_kind, cr_name)
+            extra = ("  BLOCKED: " + "; ".join(blockers)) if blockers else ""
             run.event("rollout", f"TIMEOUT waiting for rollout ({what})",
-                      detail + " — continuing to verification (never leaving "
-                      "the cluster half-configured silently)")
+                      detail + extra + " — continuing to verification (never "
+                      "leaving the cluster half-configured silently)")
             return False
         time.sleep(cfg["poll_s"])
 
@@ -607,13 +730,22 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         run.event("preflight", f"found {t.cr_kind}/{t.cr_name}")
 
         def build_patch(spl: str) -> dict[str, Any]:
-            return {"spec": {
+            patch: dict[str, Any] = {"spec": {
                 "pmm": {"enabled": True, "image": cfg["client_image"],
                         "imagePullPolicy": "IfNotPresent",
-                        "querySource": cfg["query_source"],
+                        "querySource": _CR_QUERY_SOURCE.get(
+                            cfg["query_source"], cfg["query_source"]),
                         "secret": secret_name, "serverHost": cfg["server_host"]},
                 "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
                     "shared_preload_libraries": spl}}}}}}
+            # Also switch OFF the counterpart's built-in extension toggle, or the
+            # operator keeps counting it as enabled (via spec.extensions.builtin)
+            # and rejects the CR at Validate() no matter what SPL says.
+            counterpart = _STAT_PAIR.get(cfg["extension"])
+            key = _EXT_BUILTIN_KEY.get(counterpart) if counterpart else None
+            if key:
+                patch["spec"]["extensions"] = {"builtin": {key: False}}
+            return patch
 
         if dry_run:
             # no exec in a dry-run: detect from the CR (re-checked live,
@@ -626,9 +758,12 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
             run.event("dry-run", "CR patch",
                       f"kubectl patch {t.cr_kind} {t.cr_name} --type merge -p "
                       f"'{json.dumps(patch)}'")
+            drop = _STAT_PAIR.get(cfg["extension"])
             run.event("dry-run", "then", "rollout wait -> re-discover -> "
                       f"CREATE EXTENSION IF NOT EXISTS {cfg['extension']} on the "
-                      "leader -> HA bounce -> validation")
+                      "leader -> "
+                      + (f"DROP EXTENSION IF EXISTS {drop} -> " if drop else "")
+                      + "HA bounce -> validation")
             run.finalize("complete", headline={"op": "pmm-enable",
                                                "dry_run": True,
                                                "secret": secret_name,
@@ -664,11 +799,15 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         # 5. single CR patch
         kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
                   "-p", json.dumps(patch)], check=True)
+        _dis = _EXT_BUILTIN_KEY.get(_STAT_PAIR.get(cfg["extension"]) or "")
         run.event("apply", "CR patched",
-                  f"pmm enabled + shared_preload_libraries={spl}")
+                  f"pmm enabled + shared_preload_libraries={spl}"
+                  + (f"; spec.extensions.builtin.{_dis}=false (operator counts "
+                     "the built-in toggle as an independent enable)"
+                     if _dis else ""))
 
         # 6. spec-aware rollout wait
-        rolled = _wait_rollout(kube, run, t.cr_name, cfg, secret_name,
+        rolled = _wait_rollout(kube, run, t.cr_kind, t.cr_name, cfg, secret_name,
                                pre_uids, pre_matched, "post CR-patch")
 
         # 7. post-rollout re-discovery (resilient — leader may have moved)
@@ -693,6 +832,25 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
             return EXIT_FAILED
         run.event("extension", f"{cfg['extension']} live on primary "
                   f"({cnt} rows)")
+
+        # 9b. drop the stale mutually-exclusive extension. Switching query
+        # sources removed the counterpart library from shared_preload_libraries
+        # (the operator forbids both); leaving the extension OBJECT behind makes
+        # its views error ("must be loaded via shared_preload_libraries") and
+        # keeps pg_stat_monitor holding the shared memory it reserved at the old
+        # load. DROP ... IF EXISTS is a no-op when it was never installed.
+        counterpart = _STAT_PAIR.get(cfg["extension"])
+        if counterpart:
+            res = kube.psql(leader, f"DROP EXTENSION IF EXISTS {counterpart};",
+                            database=cfg["database"], timeout_s=30)
+            if res.ok:
+                run.event("extension", f"stale {counterpart} extension dropped",
+                          f"mutually exclusive with {cfg['extension']} — no "
+                          "longer in shared_preload_libraries")
+            else:
+                run.event("extension", f"could not drop stale {counterpart} "
+                          "extension", (res.stderr or res.stdout).strip()[:150]
+                          + " — its views will error until dropped manually")
 
         # 10. HA-preserving sidecar bounce so QAN re-registers: replicas
         # first, the leader LAST (only after every replica is back and Ready)
