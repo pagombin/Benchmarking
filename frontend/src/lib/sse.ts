@@ -122,7 +122,10 @@ export function emptySeries(): Series {
 export function appendBatch(s: Series, batch: SampleBatch): void {
   const cols = batch.header.split(",");
   const ix = (name: string) => cols.indexOf(name);
-  const it = ix("t_offset") >= 0 ? ix("t_offset") : ix("t");
+  // Prefer t_wall (seconds since RUN start): t_offset restarts per sweep
+  // level, which stacked a 10-level sweep into one duration-wide window.
+  const iwall = ix("t_wall");
+  const ioff = ix("t_offset") >= 0 ? ix("t_offset") : ix("t");
   const itps = ix("tps"), iqps = ix("qps"), ip99 = ix("lat_p99");
   const ierr = ix("err_s"), irec = ix("reconn_s");
   const ir = ix("r") >= 0 ? ix("r") : ix("qps_r");   // sweep samples.csv: r/w/o; soak: qps_r/w/o
@@ -130,7 +133,10 @@ export function appendBatch(s: Series, batch: SampleBatch): void {
   const io = ix("o") >= 0 ? ix("o") : ix("qps_o");
   for (const line of batch.rows) {
     const f = line.split(",");
-    const t = parseFloat(f[it]);
+    // per-row fallback: a blank t_wall (legacy rows, missing anchor) must
+    // fall back to the level offset, never drop the sample
+    const tw = iwall >= 0 ? parseFloat(f[iwall]) : NaN;
+    const t = Number.isNaN(tw) ? parseFloat(f[ioff]) : tw;
     if (Number.isNaN(t)) continue;
     s.t.push(t);
     s.tps.push(num(f[itps]));

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — sweep cockpit charts on one continuous timeline
+
+- **Field bug**: sweep samples were stamped only with `t_offset`, which
+  restarts at 0 for every ladder level — the cockpit stacked a 10-level,
+  12,000-second sweep into a single 1,200-second window of overlapping
+  spaghetti while pg_timeseries (run-relative clock) spanned the whole
+  run cleanly. `samples.csv` gains a `t_wall` column (seconds since RUN
+  start, same clock basis as pg_timeseries), written live per interval
+  and rebuilt canonically at finalize; the cockpit prefers it with a
+  per-row fallback to `t_offset` for legacy rows. TPS/QPS/p99 charts now
+  lay out level-by-level like the database charts. Existing runs are
+  fixed retroactively by regenerating their report (write_parsed
+  rebuilds samples.csv from raw logs with the new column).
+
 ## Unreleased — cross-provider comparison report overhaul (DO vs Aiven ready)
 
 - **Environment & identity cards** in both sweep and soak comparisons:

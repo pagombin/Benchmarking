@@ -21,8 +21,15 @@ from pgbench_harness.util import atomic_write_json, atomic_write_text
 
 SAMPLE_COLUMNS = [
     "run_id", "rep", "threads", "t_offset", "tps", "qps", "r", "w", "o",
-    "lat_p99", "err_s", "reconn_s", "seg",
+    "lat_p99", "err_s", "reconn_s", "seg", "t_wall",
 ]
+# t_offset restarts at 0 for EVERY level — plotting a multi-level sweep
+# against it stacks all levels into one duration_s-wide window (the field
+# bug: a 12,000s sweep charted as 1,200s of spaghetti). t_wall is seconds
+# since RUN start, the same clock basis as pg_timeseries.csv, so the
+# cockpit lays levels out as one continuous timeline. Appended LAST so
+# header-name consumers and positional readers of the old prefix both keep
+# working.
 
 
 class IncrementalCsvWriter:
@@ -120,12 +127,26 @@ def _parse_level_log(log_path, seg: str) -> ParsedLog:
 
 
 def _samples_rows(run_id: str, rep: int, threads: int, parsed: ParsedLog,
-                  seg: str = "") -> list[list[Any]]:
+                  seg: str = "", wall_base: Optional[float] = None,
+                  ) -> list[list[Any]]:
     return [
         [run_id, rep, threads, s.t_offset, s.tps, s.qps, s.r, s.w, s.o,
-         s.lat_ms, s.err_s, s.reconn_s, seg]
+         s.lat_ms, s.err_s, s.reconn_s, seg,
+         round(wall_base + s.t_offset, 1) if wall_base is not None else ""]
         for s in parsed.samples
     ]
+
+
+def _wall_base(created_utc: str, level_started_utc: str) -> Optional[float]:
+    """Seconds from run start to a level's start (both harness UTC stamps)."""
+    from datetime import datetime, timezone
+    try:
+        t0 = datetime.strptime(created_utc, "%Y-%m-%dT%H:%M:%SZ")
+        t1 = datetime.strptime(level_started_utc, "%Y-%m-%dT%H:%M:%SZ")
+        return max(0.0, (t1.replace(tzinfo=timezone.utc)
+                         - t0.replace(tzinfo=timezone.utc)).total_seconds())
+    except (ValueError, TypeError):
+        return None
 
 
 BLOCK_BYTES = 8192      # PostgreSQL default block size; pg_stat_io counts 8 KB ops
@@ -206,7 +227,10 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
         log_path = run_dir / lvl.raw_log if lvl.raw_log else None
         if log_path is not None and log_path.exists():
             parsed = _parse_level_log(log_path, lvl.seg)
-            rows.extend(_samples_rows(manifest.run_id, lvl.rep, lvl.threads, parsed, lvl.seg))
+            rows.extend(_samples_rows(
+                manifest.run_id, lvl.rep, lvl.threads, parsed, lvl.seg,
+                wall_base=_wall_base(manifest.created_utc,
+                                     lvl.started_utc or "")))
             if lvl.status == STATUS_OK:
                 entry.update(summarize_level(parsed, spec, pcts))
                 if lvl.seg.startswith("pgbench"):

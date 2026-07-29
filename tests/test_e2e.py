@@ -51,6 +51,31 @@ def test_sweep_live_samples_written_during_run(fake_env, spec_file, results_dir)
     assert len(samples) > 1                       # real per-second rows, not just '--'
 
 
+def test_sweep_samples_carry_run_relative_t_wall(fake_env, spec_file, results_dir,
+                                                 monkeypatch) -> None:
+    """Field bug: t_offset restarts at 0 for every level, so the cockpit
+    stacked a whole multi-level sweep into one duration-wide window of
+    spaghetti while pg_timeseries spanned the full run. t_wall (seconds
+    since RUN start) must be present and non-decreasing across levels."""
+    import csv as _csv
+    # real pacing: wall-clock must actually advance between levels for the
+    # monotonicity assertion to mean anything
+    monkeypatch.setenv("FAKE_SYSBENCH_REALTIME", "1")
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    run_dir = find_run_dir(results_dir)
+    with open(run_dir / "parsed" / "samples.csv", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows and "t_wall" in rows[0]
+    walls = [float(r["t_wall"]) for r in rows if r["t_wall"] != ""]
+    assert len(walls) == len(rows)                # every row is anchored
+    assert walls == sorted(walls)                 # one continuous timeline
+    offs = [float(r["t_offset"]) for r in rows]
+    # multiple levels -> offsets reset while the wall clock keeps advancing
+    resets = sum(1 for a, b in zip(offs, offs[1:]) if b < a)
+    assert resets >= 1
+    assert max(walls) > max(offs)                 # levels laid out sequentially
+
+
 def test_run_streaming_on_line_fires_per_line(fake_env, spec_file) -> None:
     """run_streaming delivers each line to the on_line tap as the child runs (the
     hook that drives live per-second charts), before the process exits."""

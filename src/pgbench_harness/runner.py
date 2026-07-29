@@ -404,11 +404,17 @@ def _init_run(
 
 
 def _live_sweep_callback(
-    live: Optional[IncrementalCsvWriter], run_id: str, lvl: Level
+    live: Optional[IncrementalCsvWriter], run_id: str, lvl: Level,
+    run_start_epoch: Optional[float] = None,
 ) -> Optional[Callable[[str], None]]:
     """A per-line tap that appends each parsed interval to the live samples.csv
     (so the cockpit plots from second one). Mirrors summarize._samples_rows; the
-    canonical file is rebuilt by write_parsed at finalize."""
+    canonical file is rebuilt by write_parsed at finalize.
+
+    t_wall (seconds since RUN start, read-time clock) puts every level on one
+    continuous timeline — t_offset alone restarts at 0 per level, which
+    stacked a whole sweep into a single duration_s-wide window on the
+    cockpit charts."""
     if live is None:
         return None
     from pgbench_harness.parser import parse_interval_line
@@ -416,9 +422,22 @@ def _live_sweep_callback(
     def _cb(line: str) -> None:
         s = parse_interval_line(line)
         if s is not None:
+            t_wall = (round(time.time() - run_start_epoch, 1)
+                      if run_start_epoch is not None else "")
             live.append([run_id, lvl.rep, lvl.threads, s.t_offset, s.tps, s.qps,
-                         s.r, s.w, s.o, s.lat_ms, s.err_s, s.reconn_s, lvl.seg])
+                         s.r, s.w, s.o, s.lat_ms, s.err_s, s.reconn_s, lvl.seg,
+                         t_wall])
     return _cb
+
+
+def _run_start_epoch(manifest: Manifest) -> Optional[float]:
+    """manifest.created_utc as an epoch — the live t_wall anchor (same basis
+    as write_parsed's rebuild and the pg sampler's elapsed clock)."""
+    try:
+        return datetime.strptime(manifest.created_utc, "%Y-%m-%dT%H:%M:%SZ") \
+            .replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 DISK_ABORT_BYTES = 500 * 1024 * 1024
@@ -480,7 +499,8 @@ def _execute_level(
     logger.info("level %s: %s", lvl.key, cmd.display())
     rc = sysbench.run_streaming(
         cmd, sysbench.child_env(spec, password), run_dir / raw_rel, logger,
-        on_line=_live_sweep_callback(live, manifest.run_id, lvl),
+        on_line=_live_sweep_callback(live, manifest.run_id, lvl,
+                                     _run_start_epoch(manifest)),
         timeout_s=_level_watchdog_s(spec.sweep.duration_s))
     lvl.exit_code = rc
     lvl.finished_utc = utc_now_iso()
