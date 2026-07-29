@@ -319,7 +319,9 @@ def test_suite_e2e_capped_verdict_and_evidence_bundle(iops_env, monkeypatch):
     summary = json.loads((run_dir / "parsed" / "summary.json").read_text())
     assert any(lv.get("driver") == "pgbench" for lv in summary["levels"])
     head = (run_dir / "parsed" / "samples.csv").read_text().splitlines()[0]
-    assert head.endswith(",seg")
+    cols = head.split(",")
+    assert "seg" in cols                    # per-seg attribution present
+    assert cols[-1] == "t_wall"             # run-relative clock appended last
     # password + no-leak invariants hold for the new artifacts too
     for p in run_dir.rglob("*"):
         if p.is_file():
