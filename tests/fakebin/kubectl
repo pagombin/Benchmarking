@@ -1,0 +1,1460 @@
+#!/usr/bin/env python3
+"""Fake kubectl for tests and demos: a scriptable Percona-PG-Operator cluster.
+
+State lives in $FAKE_KUBE_STATE/state.json (auto-seeded on first call) and
+evolves with time so scenarios play out like a real cluster:
+
+* ``exec ... kill -9`` (Case B / pgkill): leader postgres restarts in place —
+  probe fails and Patroni shows state=starting for FAKE_KUBE_RESTART_S, then
+  recovers. Leader name and TL unchanged (the classification lesson).
+* ``delete pod <leader>`` (Case C1): the pod vanishes for FAKE_KUBE_RECREATE_S
+  then returns Running; restart-in-place by default, election if
+  FAKE_KUBE_C1_ELECT=1.
+* ``exec ... patronictl switchover`` (Case A): leader moves to the first
+  replica, TL bumps, probe blips for FAKE_KUBE_SWITCH_BLIP_S.
+* ``delete node`` / ``cordon`` (Case C2): pods on the node vanish; a replica
+  is elected after FAKE_KUBE_ELECT_S; TL bumps.
+* ``exec ... pgbackrest backup``: holds the stanza lock for FAKE_KUBE_BACKUP_S
+  (a second backup gets the field-famous rc=50 in 0.1s); archive queue depth
+  ramps while running. FAKE_KUBE_BACKUP_LOCKED=1 pins the lock (preflight
+  abort tests).
+
+Everything prints in the real formats the parsers expect (patronictl JSON,
+pgbackrest info text, kubectl -o json).
+"""
+import base64
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("FAKE_KUBE_STATE", "/tmp/fake-kube"))
+STATE = STATE_DIR / "state.json"
+RESTART_S = float(os.environ.get("FAKE_KUBE_RESTART_S", "3"))
+RECREATE_S = float(os.environ.get("FAKE_KUBE_RECREATE_S", "4"))
+ELECT_S = float(os.environ.get("FAKE_KUBE_ELECT_S", "5"))
+BACKUP_S = float(os.environ.get("FAKE_KUBE_BACKUP_S", "2"))
+BLIP_S = float(os.environ.get("FAKE_KUBE_SWITCH_BLIP_S", "1"))
+PGPASS = os.environ.get("FAKE_KUBE_PGPASS", "k8s-secret-pw-fake")
+CR_KIND = os.environ.get("FAKE_KUBE_CR_KIND", "perconapgcluster")
+# PMM enablement: after the CR gains spec.pmm, instance pods roll one at a
+# time — pod i is recreated (new UID + pmm-client sidecar) ROLL_S*(i+1)
+# seconds after the patch. A naive readiness poll passes instantly (old pods
+# stay Ready); the spec-aware wait must block until the stagger completes.
+ROLL_S = float(os.environ.get("FAKE_KUBE_ROLL_S", "0.5"))
+# Device-truth simulation: the block device behind /pgdata serves this many
+# IOPS (counters advance at this rate) at this utilization — the knob that
+# lets tests produce capped / exceeds / inconclusive verdicts on demand.
+DEV_IOPS = float(os.environ.get("FAKE_KUBE_DEV_IOPS", "9800"))
+DEV_UTIL = float(os.environ.get("FAKE_KUBE_DEV_UTIL", "98"))
+DEV_MAJMIN = "259:4"
+
+
+def default_state():
+    insts = ["cluster1-instance1-abcd-0", "cluster1-instance1-efgh-0",
+             "cluster1-instance1-ijkl-0"]
+    state = {
+        "cluster": "cluster1", "leader": insts[0], "tl": 5,
+        "instances": [{"name": n, "node": f"node-{i}", "ip": f"10.244.0.{20+i}"}
+                      for i, n in enumerate(insts)],
+        "pgbouncer": ["cluster1-pgbouncer-77f4-abc", "cluster1-pgbouncer-77f4-def"],
+        "killed_at": 0, "deleted": {}, "lost_nodes": [], "elect_at": 0,
+        "backup_until": 0, "backups": [
+            {"label": "20260701-000000F", "type": "full"}],
+        "archived_base": 1000,
+        "cr": {
+            "apiVersion": "pgv2.percona.com/v2", "kind": "PerconaPGCluster",
+            "metadata": {"name": "cluster1", "namespace": "percona",
+                         "generation": 3, "resourceVersion": "424242",
+                         "uid": "cr-uid-0001",
+                         "creationTimestamp": "2026-07-01T00:00:00Z"},
+            "status": {"state": "ready", "postgres": {"ready": 3, "size": 3}},
+            "spec": {
+                "postgresVersion": 18,
+                "instances": [{"name": "instance1", "replicas": 3}],
+                "proxy": {"pgBouncer": {"replicas": 2, "config": {"global": {
+                    "pool_mode": "session"}}}},
+                "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
+                    "max_wal_size": "4096", "min_wal_size": "1024",
+                    "checkpoint_timeout": "300"}}}},
+                "backups": {"pgbackrest": {
+                    "global": {"repo1-retention-full": "2"},
+                    "repos": [{"name": "repo1", "schedules": {
+                        "full": "0 0 * * *", "differential": "0 */6 * * *",
+                        "incremental": "0 * * * *"}}]}},
+            }},
+        "pending_restart": [], "roll_until": 0,
+        "extensions": ["pgaudit"], "pmm_roll": {}, "pmm_secret": "",
+    }
+    # FAKE_KUBE_BUILTIN_PGSM: mirror a real 2.9 cluster that enables
+    # pg_stat_monitor via the built-in extensions toggle (independent of
+    # shared_preload_libraries) — so Validate rejects until it's switched off.
+    if os.environ.get("FAKE_KUBE_BUILTIN_PGSM"):
+        state["cr"]["spec"]["extensions"] = {"builtin": {"pgStatMonitor": True}}
+    return state
+
+
+def load():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text())
+        except ValueError:
+            pass
+    st = default_state()
+    save(st)
+    return st
+
+
+def save(st):
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=1))
+    os.replace(tmp, STATE)
+
+
+def now():
+    return time.time()
+
+
+def sync_instances(st):
+    """Mirror spec.instances[0].replicas into the running pod list —
+    grow with fresh member names, shrink from the tail (never the leader)."""
+    sets = st["cr"]["spec"].get("instances") or []
+    want = int((sets[0] or {}).get("replicas", len(st["instances"]))) if sets \
+        else len(st["instances"])
+    cur = len(st["instances"])
+    suffixes = ["mnop", "qrst", "uvwx", "yz01", "2345"]
+    while len(st["instances"]) < want:
+        i = len(st["instances"])
+        name = f"{st['cluster']}-instance1-{suffixes[i % len(suffixes)]}-0"
+        st["instances"].append({"name": name, "node": f"node-{i}",
+                                "ip": f"10.244.0.{20 + i}"})
+    while len(st["instances"]) > want:
+        tail = st["instances"][-1]
+        if tail["name"] == st["leader"]:
+            break
+        st["instances"].pop()
+    if cur != want:
+        st["deleted"] = {k: v for k, v in st["deleted"].items()
+                         if any(i["name"] == k for i in st["instances"])}
+
+
+def pod_alive(st, name):
+    del_at = st["deleted"].get(name, 0)
+    if del_at and now() < del_at + RECREATE_S:
+        return False
+    inst = next((i for i in st["instances"] if i["name"] == name), None)
+    if inst and inst["node"] in st["lost_nodes"]:
+        return False
+    return True
+
+
+def leader_state(st):
+    """Patroni state string for the current leader (time-driven recovery)."""
+    if st["killed_at"] and now() < st["killed_at"] + RESTART_S:
+        return "starting"
+    return "running"
+
+
+def maybe_elect(st):
+    """Complete a pending election (node loss) once ELECT_S has passed."""
+    if st.get("elect_at") and now() >= st["elect_at"]:
+        candidates = [i["name"] for i in st["instances"]
+                      if i["name"] != st["leader"] and pod_alive(st, i["name"])]
+        if candidates:
+            st["leader"] = candidates[0]
+            st["tl"] += 1
+        st["elect_at"] = 0
+        save(st)
+
+
+def rolling(st):
+    """Is the operator's rolling restart (FAKE_KUBE_ROLL_OUTAGE_S) in flight?"""
+    return st.get("roll_until", 0) and now() < st["roll_until"]
+
+
+def settle_roll(st):
+    """Finish a simulated rolling restart: leader back, pending flags clear."""
+    if st.get("roll_until", 0) and now() >= st["roll_until"]:
+        st["roll_until"] = 0
+        st["pending_restart"] = []
+        st["tl"] += 1
+        save(st)
+
+
+def out(s=""):
+    sys.stdout.write(s if s.endswith("\n") or not s else s + "\n")
+
+
+def pmm_rolled(st, name):
+    """Has this pod been recreated with the PMM sidecar yet? (time-staged)"""
+    pmm = st["cr"]["spec"].get("pmm") or {}
+    if not pmm.get("enabled"):
+        return False
+    return now() >= st.get("pmm_roll", {}).get(name, 0)
+
+
+# The Percona CR enum -> pmm-agent --query-source / QAN agent value. The
+# operator spells pg_stat_statements 'pgstatstatements' in the CR but the agent
+# uses 'pgstatements'; pg_stat_monitor is the same on both sides.
+PMM_CR_QUERY_SOURCES = ("pgstatmonitor", "pgstatstatements")
+
+
+def agent_query_source(cr_value):
+    return {"pgstatstatements": "pgstatements",
+            "pgstatmonitor": "pgstatmonitor"}.get(cr_value, cr_value)
+
+
+def pmm_client_container(st):
+    """The sidecar the operator injects, with the env the verifier inspects
+    (PMM3 markers: --query-source in the prerun, non-/pmm2/ config path)."""
+    pmm = st["cr"]["spec"].get("pmm") or {}
+    qs = agent_query_source(pmm.get("querySource", "pgstatmonitor"))
+    return {"name": "pmm-client", "image": pmm.get("image", ""),
+            "envFrom": [{"secretRef": {"name": pmm.get("secret", "")}}],
+            "env": [
+                {"name": "PMM_AGENT_SERVER_ADDRESS",
+                 "value": str(pmm.get("serverHost", ""))},
+                {"name": "PMM_AGENT_CONFIG_FILE",
+                 "value": "/usr/local/percona/pmm/config/pmm-agent.yaml"},
+                {"name": "PMM_AGENT_PRERUN_SCRIPT",
+                 "value": "pmm-admin status --wait=10s; pmm-admin add postgresql "
+                          f"--skip-connection-check --query-source={qs} "
+                          "--tls-skip-verify $(hostname)"},
+            ]}
+
+
+def pod_json(st, name, kind):
+    alive = pod_alive(st, name)
+    rolled = False
+    if kind == "instance":
+        containers = [{"name": "database"}, {"name": "replication-cert-copy"},
+                      {"name": "pgbackrest"}, {"name": "pgbackrest-config"}]
+        rolled = pmm_rolled(st, name)
+        if rolled:
+            containers.append(pmm_client_container(st))
+        labels = {"postgres-operator.crunchydata.com/cluster": st["cluster"],
+                  "postgres-operator.crunchydata.com/instance-set": "instance1"}
+        if not os.environ.get("FAKE_KUBE_NO_ROLE_LABEL"):
+            labels["postgres-operator.crunchydata.com/role"] = \
+                "master" if name == st["leader"] else "replica"
+    else:
+        containers = [{"name": "pgbouncer"}, {"name": "pgbouncer-config"}]
+        labels = {"postgres-operator.crunchydata.com/cluster": st["cluster"],
+                  "postgres-operator.crunchydata.com/role": "pgbouncer"}
+    inst = next((i for i in st["instances"] if i["name"] == name), None)
+    node = inst["node"] if inst else "node-9"
+    ip = inst["ip"] if inst else "10.244.1.9"
+    starting = (kind == "instance"
+                and ((name == st["leader"] and leader_state(st) == "starting")
+                     or rolling(st)))
+    ready = alive and not starting
+    # UID changes when the pod is recreated: the PMM roll and every delete.
+    uid = f"uid-{name}-{'pmm' if rolled else 'base'}-{int(st['deleted'].get(name, 0))}"
+    volumes = ([{"name": "postgres-data",
+                 "persistentVolumeClaim": {"claimName": f"{name}-pgdata"}}]
+               if kind == "instance" else [])
+    statuses = []
+    for c in containers:
+        cs = {"name": c["name"], "ready": ready, "restartCount": 0}
+        # FAKE_KUBE_OOM: the database container was OOM-killed recently —
+        # exercises the health module's pod_oomkilled finding.
+        if (os.environ.get("FAKE_KUBE_OOM") and kind == "instance"
+                and c["name"] == "database"):
+            cs["restartCount"] = 4
+            cs["lastState"] = {"terminated": {
+                "reason": "OOMKilled", "exitCode": 137,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(now() - 120))}}
+        # A deliberate SIGKILL (failover/crash test): exit 137 but reason is
+        # NOT OOMKilled — the health/monitor OOM checks must ignore it.
+        if (os.environ.get("FAKE_KUBE_SIGKILL") and kind == "instance"
+                and c["name"] == "database"):
+            cs["restartCount"] = 1
+            cs["lastState"] = {"terminated": {
+                "reason": "Error", "exitCode": 137,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(now() - 30))}}
+        statuses.append(cs)
+    limits = ({"memory": os.environ["FAKE_KUBE_MEM_LIMIT"]}
+              if os.environ.get("FAKE_KUBE_MEM_LIMIT") else {})
+    if limits:
+        for c in containers:
+            if c["name"] == "database":
+                c["resources"] = {"limits": dict(limits)}
+    return {
+        "metadata": {"name": name, "namespace": "percona", "uid": uid,
+                     "labels": labels},
+        "spec": {"nodeName": node, "containers": containers,
+                 "volumes": volumes},
+        "status": {"phase": "Running" if alive else "Pending", "podIP": ip,
+                   "containerStatuses": statuses},
+    }
+
+
+def all_pods(st):
+    items = []
+    for i in st["instances"]:
+        if pod_alive(st, i["name"]):
+            items.append(pod_json(st, i["name"], "instance"))
+    for name in st["pgbouncer"]:
+        items.append(pod_json(st, name, "pgbouncer"))
+    return items
+
+
+def patronictl_list(st):
+    maybe_elect(st)
+    members = []
+    for i in st["instances"]:
+        if not pod_alive(st, i["name"]):
+            continue
+        is_leader = i["name"] == st["leader"]
+        if rolling(st):
+            # A restart-required change is rolling through: no leader,
+            # members restarting — the state the verify poller must survive.
+            m = {"Cluster": f"{st['cluster']}-ha", "Member": i["name"],
+                 "Host": i["ip"], "Role": "Replica", "State": "start failed"
+                 if os.environ.get("FAKE_KUBE_FATAL_LOG") else "starting",
+                 "TL": st["tl"]}
+            members.append(m)
+            continue
+        m = {"Cluster": f"{st['cluster']}-ha", "Member": i["name"], "Host": i["ip"],
+             "Role": "Leader" if is_leader else "Replica",
+             "State": leader_state(st) if is_leader else "streaming",
+             "TL": st["tl"]}
+        if not is_leader:
+            m["Lag in MB"] = 0
+        members.append(m)
+    return json.dumps(members)
+
+
+def backup_running(st):
+    return (os.environ.get("FAKE_KUBE_BACKUP_LOCKED") == "1"
+            or now() < st.get("backup_until", 0)
+            or (st.get("manual_started", 0)
+                and now() < st["manual_started"] + BACKUP_S))
+
+
+def settle_manual(st):
+    """Complete an operator-path (manual annotation) backup once its window ends."""
+    if st.get("manual_started", 0) and now() >= st["manual_started"] + BACKUP_S:
+        btype = st.get("manual_type", "incr")
+        label = time.strftime("%Y%m%d-%H%M%S") + \
+            {"full": "F", "diff": "D", "incr": "I"}.get(btype, "I")
+        st["backups"].append({"label": label, "type": btype})
+        st["manual_started"] = 0
+        save(st)
+
+
+def pgbackrest_info(st):
+    status = ("ok (backup/expire running)" if backup_running(st) else "ok")
+    lines = [f"stanza: db\n    status: {status}\n"
+             "    cipher: none\n\n    db (current)\n"
+             "        wal archive min/max (18): 000000050000000000000010/0000000500000000000000FF\n"]
+    for b in st["backups"][-4:]:
+        lines.append(
+            f"        {b['type']} backup: {b['label']}\n"
+            f"            timestamp start/stop: 2026-07-07 00:00:04 / 2026-07-07 00:29:59\n"
+            f"            wal start/stop: 000000050000000000000012 / 000000050000000000000034\n"
+            f"            database size: 12.2GB, database backup size: 12.2GB\n"
+            f"            repo1: backup set size: 1.9GB, backup size: 1.9GB\n")
+    return "\n".join(lines)
+
+
+def pgbackrest_info_json(st):
+    # Dynamic timestamps: newest backup finished an hour ago (healthy for the
+    # backup-staleness heuristic), each older one a day further back.
+    n = len(st["backups"])
+    return json.dumps([{
+        "name": "db",
+        "status": {"code": 0,
+                   "message": "ok (backup/expire running)" if backup_running(st) else "ok"},
+        "backup": [{"label": b["label"], "type": b["type"],
+                    "info": {"size": 13100000000, "delta": 13100000000,
+                             "repository": {"size": 2040000000, "delta": 2040000000}},
+                    "timestamp": {"start": int(now()) - (n - 1 - i) * 86400 - 5400,
+                                  "stop": int(now()) - (n - 1 - i) * 86400 - 3600}}
+                   for i, b in enumerate(st["backups"])],
+    }])
+
+
+PG_DEFAULTS = {
+    "max_wal_size": ("4096", "MB"), "min_wal_size": ("1024", "MB"),
+    "archive_timeout": ("60", "s"), "wal_keep_size": ("0", "MB"),
+    "checkpoint_timeout": ("300", "s"), "checkpoint_completion_target": ("0.9", ""),
+}
+
+# Full-catalog rows for the pg-params snapshot (a representative slice of
+# pg_settings with every metadata column the console's parameter map uses).
+# (setting, unit, vartype, min, max, enumvals, context, category, desc)
+PG_CATALOG = {
+    "max_wal_size": ("4096", "MB", "integer", "2", "2147483647", None,
+                     "sighup", "Write-Ahead Log / Checkpoints",
+                     "Sets the WAL size that triggers a checkpoint."),
+    "min_wal_size": ("1024", "MB", "integer", "2", "2147483647", None,
+                     "sighup", "Write-Ahead Log / Checkpoints",
+                     "Sets the minimum size to shrink the WAL to."),
+    "archive_timeout": ("60", "s", "integer", "0", "1073741823", None,
+                        "sighup", "Write-Ahead Log / Archiving",
+                        "Sets the amount of time to wait before forcing a switch to the next WAL file."),
+    "wal_keep_size": ("0", "MB", "integer", "0", "2147483647", None,
+                      "sighup", "Replication / Sending Servers",
+                      "Sets the size of WAL files held for standby servers."),
+    "checkpoint_timeout": ("300", "s", "integer", "30", "86400", None,
+                           "sighup", "Write-Ahead Log / Checkpoints",
+                           "Sets the maximum time between automatic WAL checkpoints."),
+    "checkpoint_completion_target": ("0.9", None, "real", "0", "1", None,
+                                     "sighup", "Write-Ahead Log / Checkpoints",
+                                     "Time spent flushing dirty buffers during checkpoint."),
+    "max_connections": ("100", None, "integer", "1", "262143", None,
+                        "postmaster", "Connections and Authentication",
+                        "Sets the maximum number of concurrent connections."),
+    "shared_buffers": ("16384", "8kB", "integer", "16", "1073741823", None,
+                       "postmaster", "Resource Usage / Memory",
+                       "Sets the number of shared memory buffers used by the server."),
+    "work_mem": ("4096", "kB", "integer", "64", "2147483647", None,
+                 "user", "Resource Usage / Memory",
+                 "Sets the maximum memory to be used for query workspaces."),
+    "listen_addresses": ("*", None, "string", None, None, None,
+                         "postmaster", "Connections and Authentication",
+                         "Sets the host name or IP address(es) to listen to."),
+    "port": ("5432", None, "integer", "1", "65535", None,
+             "postmaster", "Connections and Authentication",
+             "Sets the TCP port the server listens on."),
+    "wal_level": ("logical", None, "enum", None, None,
+                  ["minimal", "replica", "logical"],
+                  "postmaster", "Write-Ahead Log / Settings",
+                  "Sets the level of information written to the WAL."),
+    "synchronous_commit": ("on", None, "enum", None, None,
+                           ["local", "remote_write", "remote_apply", "on", "off"],
+                           "user", "Write-Ahead Log / Settings",
+                           "Sets the current transaction's synchronization level."),
+    "autovacuum": ("on", None, "bool", None, None, None,
+                   "sighup", "Autovacuum",
+                   "Starts the autovacuum subprocess."),
+    "log_min_duration_statement": ("-1", "ms", "integer", "-1", "2147483647", None,
+                                   "superuser", "Reporting and Logging / When to Log",
+                                   "Sets the minimum execution time above which all statements will be logged."),
+    "random_page_cost": ("4", None, "real", "0", "1.79769e+308", None,
+                         "user", "Query Tuning / Planner Cost Constants",
+                         "Sets the planner's estimate of the cost of a nonsequentially fetched disk page."),
+    "huge_pages": ("try", None, "enum", None, None, ["off", "on", "try"],
+                   "postmaster", "Resource Usage / Memory",
+                   "Use of huge pages on Linux or Windows."),
+    "track_commit_timestamp": ("off", None, "bool", None, None, None,
+                               "postmaster", "Replication / Sending Servers",
+                               "Collects transaction commit time."),
+    "shared_preload_libraries": ("pgaudit", None, "string", None, None, None,
+                                 "postmaster", "Client Connection Defaults / Shared Library Preloading",
+                                 "Lists shared libraries to preload into server."),
+    "archive_command": ("pgbackrest --stanza=db archive-push \"%p\"", None,
+                        "string", None, None, None,
+                        "sighup", "Write-Ahead Log / Archiving",
+                        "Sets the shell command that will be called to archive a WAL file."),
+    "block_size": ("8192", None, "integer", "8192", "8192", None,
+                   "internal", "Preset Options",
+                   "Shows the size of a disk block."),
+    "server_version_num": ("180000", None, "integer", "180000", "180000", None,
+                           "internal", "Preset Options",
+                           "Shows the server version as an integer."),
+}
+
+DIAG_SEP = "\x1f"
+
+
+_UNIT_FACTORS = {"B": 1, "kB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3,
+                 "TB": 1024 ** 4, "ms": 1, "s": 1000, "min": 60000,
+                 "h": 3600000, "d": 86400000}
+
+
+def normalize_setting(raw, unit):
+    """Like the real server: pg_settings.setting is the base-unit NUMBER even
+    when the config wrote '8GB' or '900s'."""
+    import re as _re
+    s = str(raw)
+    if not unit:
+        return s
+    m = _re.match(r"^(\d+(?:\.\d+)?)\s*([A-Za-z]+)$", s)
+    if not m:
+        return s
+    um = _re.match(r"^(\d+)?\s*([A-Za-z]+)$", str(unit))
+    if not um:
+        return s
+    base = int(um.group(1) or 1) * _UNIT_FACTORS.get(um.group(2), 0)
+    vfac = _UNIT_FACTORS.get(m.group(2), 0)
+    if not base or not vfac:
+        return s
+    return str(int(float(m.group(1)) * vfac / base))
+
+
+def pg_catalog_rows(st):
+    """pg_settings rows (dicts) for the json_agg catalog query."""
+    params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
+              ["parameters"])
+    # FAKE_KUBE_CMDLINE_PARAMS="track_commit_timestamp=on,..." — the operator
+    # owns these on the postgres command line: their live value is FIXED and
+    # never reflects a dynamicConfiguration patch, and source is 'command line'.
+    cmdline = {}
+    for kv in os.environ.get("FAKE_KUBE_CMDLINE_PARAMS", "").split(","):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            cmdline[k.strip()] = v.strip()
+    rows = []
+    for name in sorted(PG_CATALOG):
+        setting, unit, vartype, mn, mx, enums, context, cat, desc = PG_CATALOG[name]
+        if name in cmdline:
+            live = normalize_setting(cmdline[name], unit)
+            source = "command line"
+        else:
+            live = normalize_setting(params.get(name, setting), unit)
+            source = "configuration file" if name in params else "default"
+            # FAKE_KUBE_SPL_DECORATE: mimic the operator decorating the preload
+            # list at runtime — inject pgaudit and double entries — so an
+            # exact-string verify fails but a set-containment verify converges.
+            if (name == "shared_preload_libraries" and name in params
+                    and os.environ.get("FAKE_KUBE_SPL_DECORATE")):
+                base = str(params[name])
+                live = f"{base},{base},pgaudit"
+        rows.append({
+            "name": name, "setting": live, "unit": unit, "vartype": vartype,
+            "min_val": mn, "max_val": mx, "enumvals": enums, "context": context,
+            "category": cat, "short_desc": desc, "boot_val": setting,
+            "reset_val": live, "source": source,
+            "pending_restart": name in st.get("pending_restart", []),
+        })
+    return rows
+
+
+def run_sql(st, sql):
+    """Answer the SQL the ops runners issue, from cluster state."""
+    s = " ".join(sql.split()).lower()
+    params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
+              ["parameters"])
+    j = DIAG_SEP.join
+    # ── marker-dispatched queries (params catalog, diag, health) ──
+    # These must run before the generic substring branches below.
+    if "json_agg" in s and "pg_settings" in s:
+        return json.dumps(pg_catalog_rows(st))
+    if "show server_version" in s:
+        return "18.0"
+    if "show shared_preload_libraries" in s:
+        return str(params.get("shared_preload_libraries", "pgaudit"))
+    if "from pg_extension" in s and "extversion" in s:
+        return "\n".join(f"{e}|1.0"
+                         for e in sorted(st.get("extensions", ["pgaudit"])))
+    if "from pg_extension" in s:      # SELECT 1 FROM pg_extension WHERE extname='X'
+        return "1" if any(f"'{e}'" in s
+                          for e in st.get("extensions", ["pgaudit"])) else ""
+    if "diag:connections" in s or "health:connections" in s:
+        used, mx = 12, int(params.get("max_connections", 100))
+        if "health:" in s:
+            return j([str(used), str(mx)])
+        return j(["12", "3", "8", "1", "0", str(mx),
+                  str(round(100.0 * used / mx, 1))])
+    if "health:idle_tx" in s:
+        return j(["0", "0"]) if not os.environ.get("FAKE_KUBE_IDLE_TX") \
+            else j(["2", os.environ["FAKE_KUBE_IDLE_TX"]])
+    if "health:longtx" in s:
+        return "42"
+    if "diag:long_running" in s:
+        return j(["4242", "doadmin", "active", "", "42",
+                  "SELECT * FROM sbtest1 WHERE id = $1"])
+    if "diag:blocked" in s:
+        return ""
+    if "diag:replication" in s or "health:slots" in s or "diag:slots" in s:
+        replicas = [i for i in st["instances"]
+                    if i["name"] != st["leader"] and pod_alive(st, i["name"])]
+        if "health:slots" in s:
+            if os.environ.get("FAKE_KUBE_INACTIVE_SLOT"):
+                return j([str(2 << 30), "1"])
+            return j(["0", "0"])
+        if "diag:slots" in s:
+            rows = [j([f"{r['name']}_slot", "physical", "true", "8388608"])
+                    for r in replicas]
+            if os.environ.get("FAKE_KUBE_INACTIVE_SLOT"):
+                rows.append(j(["orphaned_slot", "physical", "false", str(2 << 30)]))
+            return "\n".join(rows)
+        return "\n".join(j([r["name"], "streaming", "1024", "2048", "0.1"])
+                         for r in replicas)
+    if "diag:wraparound" in s or "health:wraparound" in s:
+        if "health:" in s:
+            return "180000000"
+        return "\n".join([j(["defaultdb", "180000000", "8.38"]),
+                          j(["postgres", "120000000", "5.59"])])
+    if "diag:cache_hit" in s or "health:cache_hit" in s:
+        if "health:" in s:
+            return "0.9987"
+        return j(["defaultdb", "3212", "2453411", "0.9987"])
+    if "health:pending" in s:
+        return str(len(st.get("pending_restart", [])))
+    if "diag:dead_tuples" in s:
+        return "\n".join([j(["public.sbtest1", "1000000", "52000", "4.9",
+                             "2026-07-10 01:00:00+00"]),
+                          j(["public.sbtest2", "1000000", "1200", "0.1", "never"])])
+    if "diag:table_sizes" in s:
+        return "\n".join([j(["public.sbtest1", "2147483648", "2048 MB"]),
+                          j(["public.sbtest2", "1073741824", "1024 MB"])])
+    if "diag:temp_files" in s:
+        return j(["defaultdb", "3", "104857600"])
+    if "diag:checkpoints" in s:
+        return j(["48", "9", "15.8"])
+    if "op:shared_buffers" in s:
+        return str(16384 * 8192)
+    if "diag:wal_activity" in s:
+        return j([str((int(now()) % 100000) * 1048576), "5/AB000000"])
+    if "pg_stat_archiver" in s:
+        n = st["archived_base"] + int(now()) % 100000
+        return (f"{int(now())},{n},0,0000000500000000000000AB,"
+                f"{int(now()) - 2},,0")
+    if "pg_settings" in s:
+        rows = []
+        for name in sorted(PG_DEFAULTS):
+            val, unit = PG_DEFAULTS[name]
+            val = str(params.get(name, val))
+            pending = "t" if name in st.get("pending_restart", []) else "f"
+            rows.append(f"{name}|{val}|{unit}|{pending}")
+        return "\n".join(rows)
+    if "pg_stat_reset_shared" in s:
+        return ""
+    if "pg_stat_wal" in s or "wal_bytes" in s:
+        if "extract(epoch" in s:
+            return f"{int(now())},{(int(now()) % 100000) * 1048576},128"
+        return str((int(now()) % 100000) * 1048576)
+    if "checkpoints" in s or "pg_stat_checkpointer" in s or "pg_stat_bgwriter" in s:
+        return f"{int(now()) % 500},{int(now()) % 37}"
+    if "pg_stat_replication" in s:
+        lines = []
+        for i in st["instances"]:
+            if i["name"] != st["leader"] and pod_alive(st, i["name"]):
+                lines.append(f"{i['name']},streaming,1024,0.5")
+        return "\n".join(lines)
+    if "pg_database_size" in s:
+        return "13100000000"
+    if "clock_timestamp" in s:
+        # probe-style query: report the CURRENT leader's IP so a promotion
+        # shows up as an address flip (the election signal, distinct from TL).
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        leader_inst = next((i for i in st["instances"]
+                            if i["name"] == st["leader"]), None)
+        addr = leader_inst["ip"] if leader_inst else "10.244.0.20"
+        return f"{ts}|f|{addr}"
+    return ""
+
+
+def archive_queue_depth(st):
+    if backup_running(st):
+        elapsed = now() - (st.get("backup_until", 0) - BACKUP_S)
+        return min(32, 3 + int(elapsed * 15))
+    return 3
+
+
+def handle_exec(st, pod, argv):
+    joined = " ".join(argv)
+    if argv[0] == "cat" and "/proc/self/mountinfo" in joined:
+        out(MOUNTINFO)
+        return 0
+    if argv[0] == "cat" and "/proc/diskstats" in joined:
+        out(diskstats_text())
+        return 0
+    if argv[0] == "sh" and "diskstats" in joined and "while" in joined:
+        # FAKE_KUBE_STREAM_DIE_S: the stream dies after N seconds (rc 1) —
+        # exercises the sampler's auto-respawn on long runs
+        die = float(os.environ.get("FAKE_KUBE_STREAM_DIE_S", "0"))
+        deadline = now() + (die or float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30")))
+        while now() < deadline:
+            out(str(int(now() * 1000)))
+            out(diskstats_text())
+            out("===")
+            sys.stdout.flush()
+            time.sleep(1)
+        return 1 if die else 0
+    if argv[0] == "df" and "-Pk" in argv:
+        out("Filesystem 1024-blocks Used Available Capacity Mounted on")
+        out(f"/dev/nvme1n1 524288000 104857600 "
+            f"{os.environ.get('FAKE_KUBE_DF_AVAIL_KB', '419430400')} 20% /pgdata")
+        return 0
+    if argv[0] == "mkdir":
+        return 0
+    if argv[0] == "sh" and "rm -rf" in joined:
+        st["probe_files"] = False
+        save(st)
+        return 0
+    if argv[0] == "sh" and "ls /pgdata/pgb-fileio-probe" in joined:
+        return 0 if st.get("probe_files") else 1
+    if argv[0] == "sh" and "stat -c %s /pgdata/pgb-fileio-probe" in joined:
+        # geometry check: first-file size (or MISSING) + last-file presence
+        if st.get("probe_files"):
+            out(str(st.get("probe_file_bytes", 0)))
+            want_last = f"test_file.{st.get('probe_file_num', 1) - 1} "
+            out("LAST-YES" if want_last in joined + " " else "LAST-NO")
+        else:
+            out("MISSING")
+            out("LAST-NO")
+        return 0
+    if "sysbench" in joined and "fileio" in joined:
+        t_arg = next((a.split("=", 1)[1] for a in joined.split()
+                      if a.startswith("--time=")), "0")
+        if joined.rstrip().endswith("prepare"):
+            st["probe_files"] = True
+            args = {a.split("=", 1)[0]: a.split("=", 1)[1]
+                    for a in joined.split() if "=" in a}
+            num = int(args.get("--file-num", "128"))
+            size_mb = int(args.get("--file-total-size", "1024M").rstrip("MG"))
+            st["probe_file_num"] = num
+            st["probe_file_bytes"] = size_mb * 1048576 // num
+            save(st)
+            out("128 files, 8192Kb each, 1024Mb total")
+            out("Creating files for the test...")
+            return 0
+        if joined.rstrip().endswith("cleanup"):
+            out("Removing test files...")
+            return 0
+        if os.environ.get("FAKE_KUBE_FILEIO_RUN_RC"):
+            # simulate the load-driving exec dying instantly (API blip,
+            # fd-limit fatal, etc.) — exercises the salvage path
+            sys.stderr.write("error: unable to upgrade connection\n")
+            return int(os.environ["FAKE_KUBE_FILEIO_RUN_RC"])
+        run_t = min(int(t_arg or 1), 20)
+        time.sleep(run_t)                      # let the device sampler collect
+        r, w = DEV_IOPS * 0.6, DEV_IOPS * 0.4
+        out("sysbench 1.0.20 (using bundled LuaJIT 2.1.0-beta2)\n")
+        out("File operations:")
+        out(f"    reads/s:                      {r:.2f}")
+        out(f"    writes/s:                     {w:.2f}")
+        out("    fsyncs/s:                     0.00\n")
+        out("Throughput:")
+        out(f"    read, MiB/s:                  {r * 16 / 1024:.2f}")
+        out(f"    written, MiB/s:               {w * 16 / 1024:.2f}")
+        return 0
+    if argv[0] == "patronictl":
+        if argv[1] == "list":
+            out(patronictl_list(st))
+            return 0
+        if argv[1] == "show-config":
+            pat = st["cr"]["spec"].get("patroni", {})
+            dcs = json.loads(json.dumps(pat.get("dynamicConfiguration", {})))
+            dcs["ttl"] = pat.get("leaderLeaseDurationSeconds", 30)
+            dcs["loop_wait"] = pat.get("syncPeriodSeconds", 10)
+            dcs.setdefault("retry_timeout", 10)
+            out(json.dumps(dcs, indent=1))
+            return 0
+        if argv[1] in ("switchover", "failover"):
+            cand = None
+            if "--candidate" in argv:
+                cand = argv[argv.index("--candidate") + 1]
+            candidates = [i["name"] for i in st["instances"]
+                          if i["name"] != st["leader"] and pod_alive(st, i["name"])]
+            if cand is not None:
+                if cand not in candidates:
+                    sys.stderr.write(f"candidate {cand} is not a running replica\n")
+                    return 1
+                candidates = [cand]
+            if not candidates:
+                sys.stderr.write("no candidates for switchover\n")
+                return 1
+            st["killed_at"] = now() - RESTART_S + BLIP_S   # brief write blip
+            st["leader"] = candidates[0]
+            st["tl"] += 1
+            save(st)
+            out(f"Successfully switched over to \"{candidates[0]}\"")
+            return 0
+        if argv[1] == "restart":
+            member = next((a for a in argv[2:]
+                           if not a.startswith("-") and "-" in a
+                           and a != st["cluster"] + "-ha"), None)
+            (STATE_DIR / "restarts.log").open("a").write(
+                json.dumps({"member": member or "cluster", "t": now()}) + "\n")
+            out(f"Success: restart for member {member or '(all)'}")
+            return 0
+    if argv[0] == "pgbackrest" or (argv[0] == "bash" and "pgbackrest" in joined):
+        if "info" in argv:
+            if os.environ.get("FAKE_KUBE_PGBACKREST_INFO_RC"):
+                # exec/pgbackrest failure — the lock check must fail CLOSED
+                sys.stderr.write("error: unable to upgrade connection\n")
+                return int(os.environ["FAKE_KUBE_PGBACKREST_INFO_RC"])
+            out(pgbackrest_info_json(st) if "--output=json" in argv
+                else pgbackrest_info(st))
+            return 0
+        if "backup" in argv:
+            if backup_running(st):
+                sys.stderr.write(
+                    "ERROR: [050]: unable to acquire lock on file "
+                    "'/tmp/pgbackrest/db-backup.lock': Resource temporarily "
+                    "unavailable\n")
+                return 50
+            btype = next((a.split("=", 1)[1] for a in argv
+                          if a.startswith("--type=")), "incr")
+            st["backup_until"] = now() + BACKUP_S
+            save(st)
+            time.sleep(BACKUP_S)
+            st = load()
+            label = time.strftime("%Y%m%d-%H%M%S") + \
+                {"full": "F", "diff": "D", "incr": "I"}[btype]
+            st["backups"].append({"label": label, "type": btype})
+            st["backup_until"] = 0
+            save(st)
+            out(f"INFO: {btype} backup label = {label}")
+            return 0
+    # In-cluster helper probe: `sh -c 'PGPASSWORD="$(cat)" psql "$1" ... -c "$2"
+    # -c "$3"' probe <conninfo> <write_sql> <select_sql>` with the password on
+    # stdin (never in argv). Rewrite to the conninfo + trailing SQL so the
+    # normal psql branch handles it.
+    if (argv[0] == "sh" and len(argv) >= 7 and "-c" in argv[:2]
+            and "psql" in argv[2]):
+        conninfo = argv[4]
+        sql = argv[-1]                      # the SELECT (clock_timestamp) tick
+        argv = ["psql", conninfo, "-c", sql]
+        joined = " ".join(argv)
+    if argv[0] == "psql" or "psql" in joined.split():
+        sql = ""
+        for i, a in enumerate(argv):
+            if a == "-c" and i + 1 < len(argv):
+                sql = argv[i + 1]
+        # In-cluster helper probe: connects to a service (host=<cr>-ha /
+        # <cr>-pgbouncer) rather than exec'ing on the leader. It sees an
+        # outage whenever the cluster has no writable primary — a restart
+        # window, a pending election, or a rolling restart.
+        via_service = "host=" in joined and (f"{st['cluster']}-ha" in joined
+                                             or f"{st['cluster']}-pgbouncer" in joined)
+        if via_service:
+            maybe_elect(st)
+            st = load()
+            down = (rolling(st)
+                    or (st.get("killed_at") and now() < st["killed_at"] + RESTART_S)
+                    or (st.get("elect_at") and now() < st["elect_at"])
+                    or not pod_alive(st, st["leader"]))
+            if down:
+                sys.stderr.write("psql: error: connection to server failed: "
+                                 "Connection refused\n")
+                return 2
+        if st["killed_at"] and now() < st["killed_at"] + RESTART_S \
+                and pod == st["leader"]:
+            sys.stderr.write("psql: error: connection to server failed: "
+                             "Connection refused\n")
+            return 2
+        low = " ".join(sql.split()).lower()
+        if low.startswith("create extension"):
+            ext = low.replace(";", "").split()[-1]
+            exts = st.setdefault("extensions", ["pgaudit"])
+            if ext not in exts:
+                exts.append(ext)
+            save(st)
+            return 0
+        if "from pg_stat_monitor" in low or "from pg_stat_statements" in low:
+            view = "pg_stat_monitor" if "pg_stat_monitor" in low \
+                else "pg_stat_statements"
+            if view in st.get("extensions", []):
+                out("37")
+                return 0
+            sys.stderr.write(f'ERROR:  relation "{view}" does not exist\n')
+            return 1
+        if "pg_is_in_recovery" in low:
+            out("f" if pod == st["leader"] else "t")
+            return 0
+        out(run_sql(st, sql))
+        return 0
+    if argv[0] == "bash" and "kill" in joined and "postmaster.pid" in joined:
+        st["killed_at"] = now()
+        save(st)
+        return 0
+    if argv[0] == "grep" and "/etc/pgbouncer" in joined:
+        gl = (st["cr"]["spec"].get("proxy", {}).get("pgBouncer", {})
+              .get("config", {}).get("global", {}))
+        # Real pgbouncer.ini: [databases] first, then [pgbouncer] globals —
+        # the section-aware verifier must skip the [databases] entries.
+        hits = ["[databases]", "defaultdb = host=cluster1-primary port=5432",
+                "[pgbouncer]"] + [f"{k} = {v}" for k, v in sorted(gl.items())]
+        out("\n".join(hits))
+        return 0
+    if argv[0] == "grep" or (argv[0] == "bash" and "grep" in joined
+                             and "pgbackrest" in joined):
+        gl = st["cr"]["spec"]["backups"]["pgbackrest"].get("global", {})
+        conf = "/etc/pgbackrest/conf.d/~postgres-operator_server.conf"
+        # Section-anchored render: a [db] stanza key must never satisfy a
+        # [global] check (and vice versa).
+        hits = [f"{conf}:[db]", f"{conf}:pg1-path=/pgdata/pg18",
+                f"{conf}:[global]"] + \
+               [f"{conf}:{k}={v}" for k, v in sorted(gl.items())]
+        out("\n".join(hits))
+        return 0
+    if "archive_status" in joined:                # queue-depth sampler
+        out(str(archive_queue_depth(st)))
+        return 0
+    if argv[0] == "df":
+        out("Filesystem 1024-blocks Used Available Capacity Mounted on")
+        out("/dev/sda1 104857600 39845888 65011712 38% /pgdata")
+        return 0
+    if argv[0] == "du" and "pgdata" in joined:
+        out("38G /pgdata")
+        return 0
+    sys.stderr.write(f"fake kubectl exec: unhandled command: {joined}\n")
+    return 1
+
+
+def diskstats_text():
+    """Node diskstats with counters advancing at DEV_IOPS (reads 60/40 writes),
+    ~16KB per IO, utilization DEV_UTIL%."""
+    t = now()
+    reads = int(t * DEV_IOPS * 0.6)
+    writes = int(t * DEV_IOPS * 0.4)
+    rd_sec, wr_sec = reads * 32, writes * 32
+    io_ms = int(t * DEV_UTIL * 10)          # DEV_UTIL% of wall-clock, in ms
+    wt_ms = int(t * DEV_UTIL * 40)          # ~4 in-flight at full util
+    maj, minor = DEV_MAJMIN.split(":")
+    lines = [
+        f"   7       0 loop0 55 0 2288 10 0 0 0 0 0 20 10 0 0 0 0",
+        f" {maj}       {minor} nvme1n1 {reads} 12 {rd_sec} {reads // 3} "
+        f"{writes} 40 {wr_sec} {writes // 2} 2 {io_ms} {wt_ms} 0 0 0",
+        f" 259       0 nvme0n1 9000 5 720000 4000 8000 10 640000 6000 0 8000 10000 0 0 0",
+    ]
+    return "\n".join(lines)
+
+
+MOUNTINFO = (f"469 432 {DEV_MAJMIN} / /pgdata rw,relatime - ext4 "
+             "/dev/nvme1n1 rw\n"
+             "470 432 0:123 / /tmp rw - tmpfs tmpfs rw\n")
+
+
+def handle_pmm_logs(st, pod):
+    """pmm-client sidecar logs: the QAN agent line appears once the pod has
+    rolled AND the paired extension exists (FAKE_KUBE_NO_QAN suppresses it)."""
+    pmm = st["cr"]["spec"].get("pmm") or {}
+    qs = agent_query_source(pmm.get("querySource", "pgstatmonitor"))
+    ext = {"pgstatmonitor": "pg_stat_monitor",
+           "pgstatements": "pg_stat_statements"}.get(qs, "pg_stat_monitor")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S") + ",000Z"
+    out(f"{ts} INFO pmm-agent: connected to {pmm.get('serverHost', '')}")
+    if (pmm_rolled(st, pod) and ext in st.get("extensions", [])
+            and not os.environ.get("FAKE_KUBE_NO_QAN")):
+        out(f"{ts} INFO qan_postgresql_{qs}_agent: sending 4 metrics buckets")
+    return 0
+
+
+def handle_logs(st, pod, follow):
+    if "pgbouncer" in pod:
+        lines = ["pgbouncer: LOG stats: 60 xacts/s"]
+        if st["killed_at"]:
+            lines = [
+                "pgbouncer: LOG S-0x1: db/user@10.244.0.20:5432 closing because: "
+                "server conn crashed? (age=42s)",
+                "pgbouncer: WARNING S-0x2: db/user@10.244.0.20:5432 "
+                "login failed: FATAL: the database system is starting up",
+                "pgbouncer: LOG S-0x2: retrying in 15 s (server_login_retry)",
+            ]
+    else:
+        lines = [f"INFO: no action. I am ({pod}), the leader with the lock"
+                 if pod == st["leader"] else
+                 f"INFO: no action. I am ({pod}), a secondary, and following "
+                 f"a leader ({st['leader']})"]
+        if os.environ.get("FAKE_KUBE_FATAL_LOG") or rolling(st):
+            lines = [
+                "INFO: starting instance",
+                "FATAL:  could not map anonymous shared memory: Cannot "
+                "allocate memory",
+                "HINT:  This error usually means that PostgreSQL's request "
+                "for a shared memory segment exceeded available memory.",
+                "INFO: postmaster start failed",
+            ] if os.environ.get("FAKE_KUBE_FATAL_LOG") else \
+                ["INFO: restarting after config change", "INFO: starting instance"]
+        elif st["killed_at"] and pod == st["leader"]:
+            lines = ["WARNING: Postgres is not running.",
+                     "INFO: starting as readonly because i had the session lock",
+                     "INFO: establishing a new patroni heartbeat connection to postgres",
+                     f"INFO: no action. I am ({pod}), the leader with the lock"]
+    for ln in lines:
+        out(time.strftime("%Y-%m-%dT%H:%M:%S") + f",000Z {ln}")
+    if follow:
+        # keep the stream open briefly, emitting heartbeats; scenario runners
+        # kill us (process group) when capture stops.
+        deadline = now() + float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30"))
+        while now() < deadline:
+            time.sleep(0.5)
+            emitted = load()
+            if emitted["killed_at"] and pod == emitted["leader"] \
+                    and now() < emitted["killed_at"] + RESTART_S:
+                out(time.strftime("%Y-%m-%dT%H:%M:%S") +
+                    ",000Z WARNING: Postgres is not running.")
+            sys.stdout.flush()
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    # strip global flags
+    cleaned = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("--context", "-n", "--namespace"):
+            i += 2
+            continue
+        cleaned.append(args[i])
+        i += 1
+    args = cleaned
+    if not args:
+        return 2
+    # FAKE_KUBE_AUTH_FAIL=1: every API-touching command fails like an expired
+    # token / bad exec-credential kubeconfig (the DOKS doctl failure mode);
+    # client-only commands still work, exactly like real kubectl.
+    if os.environ.get("FAKE_KUBE_AUTH_FAIL") and args[0] not in ("version", "config"):
+        print("error: You must be logged in to the server (the server has asked "
+              "for the client to provide credentials)", file=sys.stderr)
+        return 1
+    st = load()
+    maybe_elect(st)
+    settle_manual(st)
+    settle_roll(st)
+    st = load()
+    cmd = args[0]
+
+    if cmd == "version":
+        out(json.dumps({"clientVersion": {"gitVersion": "v1.31.0-fake"}}))
+        return 0
+    if cmd == "config":
+        if "current-context" in args:
+            out("do-nyc1-fake")
+            return 0
+        if "view" in args:
+            out("https://fake-k8s.example.com:6443")
+            return 0
+    if cmd == "auth":
+        out("yes")
+        return 0
+    if cmd == "get":
+        kind = args[1] if len(args) > 1 else ""
+        rest = args[2:]
+        o_json = "-o" in rest and "json" in rest or "json" in " ".join(rest)
+        o_name = "-o" in rest and "name" in rest
+        if kind in ("ns", "namespaces"):
+            names = ["default", "kube-system", "percona"]
+            out("\n".join(f"namespace/{n}" for n in names) if o_name
+                else "\n".join(names))
+            return 0
+        if kind in ("pods", "pod"):
+            named = [a for a in rest if not a.startswith("-") and a != "json"]
+            if named and not o_name:
+                name = named[0]
+                extra = st.get("extra_pods", {}).get(name)
+                if extra is not None:
+                    out(json.dumps({
+                        "metadata": {"name": name, "uid": f"uid-{name}",
+                                     "labels": {"app": "pgbench-harness-device-probe"}},
+                        "spec": {"nodeName": extra["node"],
+                                 "containers": [{"name": "fileio",
+                                                 "image": extra["image"]}]},
+                        "status": {"phase": "Running",
+                                   "containerStatuses": [{"name": "fileio",
+                                                          "ready": True,
+                                                          "restartCount": 0}]}}))
+                    return 0
+                if not pod_alive(st, name):
+                    sys.stderr.write(f'Error from server (NotFound): pods "{name}" not found\n')
+                    return 1
+                is_inst = any(i["name"] == name for i in st["instances"])
+                out(json.dumps(pod_json(st, name, "instance" if is_inst else "pgbouncer")))
+                return 0
+            items = all_pods(st)
+            if o_name:
+                out("\n".join(f"pod/{p['metadata']['name']}" for p in items))
+                return 0
+            out(json.dumps({"items": items}))
+            return 0
+        if kind in (CR_KIND, "perconapgcluster", "postgrescluster",
+                    "perconapgclusters", "postgresclusters"):
+            if kind.rstrip("s") != CR_KIND and kind != CR_KIND:
+                sys.stderr.write(f'error: the server doesn\'t have a resource type "{kind}"\n')
+                return 1
+            named = [a for a in rest if not a.startswith("-")
+                     and a not in ("json", "yaml")]
+            cr_doc = st["cr"]
+            # FAKE_KUBE_BACKUP_IN_PROGRESS: stamp the operator's
+            # backup-in-progress annotation so the rollout-blocker probe sees a
+            # pinned cluster (a stuck backup serializing the instance rollout).
+            bip = os.environ.get("FAKE_KUBE_BACKUP_IN_PROGRESS")
+            if bip:
+                cr_doc = json.loads(json.dumps(cr_doc))
+                cr_doc.setdefault("metadata", {}).setdefault("annotations", {})[
+                    "pgv2.percona.com/backup-in-progress"] = bip
+            if "-o" in rest and "yaml" in rest:
+                # cheap YAML render (only used for snapshots — kept raw anyway)
+                out(json.dumps(cr_doc, indent=2))
+                return 0
+            if named:
+                if named[0] != st["cluster"]:
+                    sys.stderr.write(f'Error from server (NotFound): {named[0]} not found\n')
+                    return 1
+                out(json.dumps(cr_doc))
+                return 0
+            out(json.dumps({"items": [cr_doc]}))
+            return 0
+        if kind in ("perconapgbackup", "perconapgbackups", "pg-backup",
+                    "pg-backups"):
+            # FAKE_KUBE_BACKUP_BLOCK="Running:2" -> one active backup + 2 failed,
+            # to exercise the rollout blocker probe / WAL-archiving hint.
+            spec = os.environ.get("FAKE_KUBE_BACKUP_BLOCK", "")
+            items = []
+            if spec:
+                state, _, nf = spec.partition(":")
+                cl = st["cluster"]
+                items.append({"metadata": {"name": f"{cl}-repo1-incr-bdvd5"},
+                              "spec": {"clusterName": cl},
+                              "status": {"state": state or "Running"}})
+                for i in range(int(nf or 0)):
+                    items.append({"metadata": {"name": f"{cl}-repo1-incr-f{i}"},
+                                  "spec": {"clusterName": cl},
+                                  "status": {"state": "Failed"}})
+            out(json.dumps({"items": items}))
+            return 0
+        if kind in ("pvc", "persistentvolumeclaim", "persistentvolumeclaims"):
+            name = args[2]
+            out(json.dumps({
+                "metadata": {"name": name,
+                             "annotations": {"volume.kubernetes.io/storage-provisioner":
+                                             "dobs.csi.digitalocean.com"}},
+                "spec": {"storageClassName": os.environ.get("FAKE_KUBE_SC",
+                                                            "do-block-storage"),
+                         "volumeName": f"pv-{name}"},
+                "status": {"capacity": {"storage": "500Gi"}}}))
+            return 0
+        if kind in ("pv", "persistentvolume", "persistentvolumes"):
+            name = args[2]
+            out(json.dumps({
+                "metadata": {"name": name},
+                "spec": {"capacity": {"storage": "500Gi"},
+                         "csi": {"driver": "dobs.csi.digitalocean.com",
+                                 "volumeHandle": "e2fa2c55-fake-volume-id",
+                                 "volumeAttributes": (
+                                     {"iopsPerGB": os.environ["FAKE_KUBE_SC_IOPS"]}
+                                     if os.environ.get("FAKE_KUBE_SC_IOPS")
+                                     else {})}}}))
+            return 0
+        if kind in ("storageclass", "storageclasses", "sc"):
+            name = args[2]
+            params = {"fsType": "ext4"}
+            if os.environ.get("FAKE_KUBE_SC_IOPS"):
+                params["iopsPerGB"] = os.environ["FAKE_KUBE_SC_IOPS"]
+            out(json.dumps({
+                "metadata": {"name": name, "annotations": {}},
+                "provisioner": "dobs.csi.digitalocean.com",
+                "parameters": params}))
+            return 0
+        if kind == "secret":
+            name = args[2] if len(args) > 2 else ""
+            if name and name == st.get("pmm_secret"):
+                # never echo the token back — real kubectl would, the shim
+                # must not (the leak gate greps everything the harness writes)
+                out(json.dumps({"apiVersion": "v1", "kind": "Secret",
+                                "metadata": {"name": name},
+                                "data": {"PMM_SERVER_TOKEN": "PHJlZGFjdGVkPg=="}}))
+                return 0
+            if "pguser" not in name:
+                sys.stderr.write(f'Error from server (NotFound): secrets "{name}" not found\n')
+                return 1
+            if o_name:
+                out(f"secret/{name}")
+                return 0
+            out(json.dumps({"data": {"password":
+                base64.b64encode(PGPASS.encode()).decode(),
+                "user": base64.b64encode(b"doadmin").decode()}}))
+            return 0
+        if kind == "sts":
+            out(json.dumps({"items": [{
+                "metadata": {"name": f"{st['cluster']}-instance1-abcd"},
+                "spec": {"replicas": 1}, "status": {"readyReplicas": 1}}]}))
+            return 0
+        if kind == "svc":
+            out(json.dumps({"items": [
+                {"metadata": {"name": f"{st['cluster']}-ha"},
+                 "spec": {"type": "ClusterIP", "clusterIP": "10.245.0.10"}},
+                {"metadata": {"name": f"{st['cluster']}-pgbouncer"},
+                 "spec": {"type": "ClusterIP", "clusterIP": "10.245.0.11"}}]}))
+            return 0
+        if kind == "jobs":
+            settle_manual(st)
+            st = load()
+            items = []
+            if st.get("manual_started", 0):
+                items.append({"metadata": {"name": f"{st['cluster']}-backup-abcd",
+                                           "labels": {"postgres-operator.crunchydata.com/"
+                                                      "pgbackrest-backup": "manual"}},
+                              "status": {"active": 1}})
+            elif st.get("manual_done_job"):
+                items.append({"metadata": {"name": st["manual_done_job"],
+                                           "labels": {"postgres-operator.crunchydata.com/"
+                                                      "pgbackrest-backup": "manual"}},
+                              "status": {"succeeded": 1}})
+            out(json.dumps({"items": items}))
+            return 0
+        if kind in ("cm", "configmap", "configmaps"):
+            gl = (st["cr"]["spec"].get("proxy", {}).get("pgBouncer", {})
+                  .get("config", {}).get("global", {}))
+            ini = "[pgbouncer]\n" + "".join(f"{k} = {v}\n"
+                                            for k, v in sorted(gl.items()))
+            out(json.dumps({"items": [{
+                "metadata": {"name": f"{st['cluster']}-pgbouncer"},
+                "data": {"pgbouncer.ini": ini}}]}))
+            return 0
+        if kind == "events":
+            if "-w" in rest or "--watch" in rest:
+                out("0s Normal Pulled pod/x image already present")
+                deadline = now() + float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30"))
+                while now() < deadline:
+                    time.sleep(1)
+            elif "--no-headers" in rest:
+                if any("type=Warning" in a for a in rest):
+                    out("32m Warning Unhealthy pod/cluster1-instance1-abcd-0 "
+                        "Readiness probe failed (historic)")
+            else:
+                out("LAST SEEN TYPE REASON OBJECT MESSAGE")
+            return 0
+    if cmd == "apply":
+        # kubectl apply -f - : stdin carries a Secret (PMM token — the shim
+        # stores only the NAME, never the stringData) or a CR restore.
+        try:
+            doc = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            sys.stderr.write("fake kubectl apply: stdin is not JSON\n")
+            return 1
+        akind = str(doc.get("kind", ""))
+        aname = str((doc.get("metadata") or {}).get("name", ""))
+        if akind == "Pod":
+            st.setdefault("extra_pods", {})[aname] = {
+                "node": (doc.get("spec") or {}).get("nodeName", ""),
+                "image": ((doc.get("spec") or {}).get("containers")
+                          or [{}])[0].get("image", ""),
+                "created": now()}
+            save(st)
+            out(f"pod/{aname} created")
+            return 0
+        if akind == "Secret":
+            st["pmm_secret"] = aname
+            save(st)
+            out(f"secret/{aname} configured")
+            return 0
+        if akind.lower().endswith("cluster"):
+            doc.setdefault("metadata", {})["generation"] = \
+                st["cr"]["metadata"].get("generation", 1) + 1
+            st["cr"] = doc
+            if not ((doc.get("spec") or {}).get("pmm") or {}).get("enabled"):
+                st["pmm_roll"] = {}
+            sync_instances(st)
+            save(st)
+            out(f"{CR_KIND}.pgv2.percona.com/{aname} configured")
+            return 0
+        sys.stderr.write(f"fake kubectl apply: unhandled kind {akind}\n")
+        return 1
+    if cmd == "patch":
+        # kubectl patch <kind> <name> --type merge -p '<json>'
+        try:
+            pi = args.index("-p")
+        except ValueError:
+            try:
+                pi = args.index("--patch")
+            except ValueError:
+                return 2
+        patch = json.loads(args[pi + 1])
+
+        if isinstance(patch, list):
+            # kubectl patch --type json: replace/add on a /-separated path.
+            for op in patch:
+                path = [seg for seg in op.get("path", "").split("/") if seg]
+                cur = st["cr"]
+                for seg in path[:-1]:
+                    cur = cur[int(seg)] if isinstance(cur, list) else \
+                        cur.setdefault(seg, {})
+                leaf = path[-1]
+                if isinstance(cur, list):
+                    cur[int(leaf)] = op.get("value")
+                else:
+                    cur[leaf] = op.get("value")
+            sync_instances(st)
+            st["cr"]["metadata"]["generation"] += 1
+            save(st)
+            (STATE_DIR / "patches.log").open("a").write(json.dumps(patch) + "\n")
+            out(f"{CR_KIND}.pgv2.percona.com/{st['cluster']} patched")
+            return 0
+
+        # Operator CRD validation: reject an unsupported spec.pmm.querySource,
+        # exactly like the real PerconaPGCluster admission webhook (this is the
+        # check that caught writing the agent value 'pgstatements' — which the
+        # operator does not accept — into the CR field).
+        qsv = ((patch.get("spec") or {}).get("pmm") or {}).get("querySource")
+        if qsv is not None and qsv not in PMM_CR_QUERY_SOURCES:
+            sys.stderr.write(
+                f'The PerconaPGCluster "{st["cluster"]}" is invalid: '
+                f'* spec.pmm.querySource: Unsupported value: "{qsv}": '
+                f'supported values: "pgstatmonitor", "pgstatstatements"\n')
+            return 1
+
+        def deep_merge(dst, src):
+            for k, v in src.items():
+                if v is None:
+                    dst.pop(k, None)
+                elif isinstance(v, dict) and isinstance(dst.get(k), dict):
+                    deep_merge(dst[k], v)
+                else:
+                    dst[k] = v
+
+        # Operator Validate(): pg_stat_monitor and pg_stat_statements are
+        # mutually exclusive (perconapgcluster_types.go). A module counts as
+        # "enabled" through EITHER path — presence in shared_preload_libraries OR
+        # the built-in extensions toggle spec.extensions.builtin.<key> — so
+        # clearing only the SPL is not enough while the toggle stays true. This
+        # runs against the POST-merge CR and rejects if both end up enabled.
+        merged_cr = json.loads(json.dumps(st["cr"]))
+        deep_merge(merged_cr, patch)
+        spl_v = str(((((((merged_cr.get("spec") or {}).get("patroni") or {})
+                      .get("dynamicConfiguration") or {}).get("postgresql")
+                      or {}).get("parameters") or {})
+                     .get("shared_preload_libraries", "")))
+        spl_toks = {p.strip().strip("'\"").strip() for p in spl_v.split(",")}
+        builtin = ((((merged_cr.get("spec") or {}).get("extensions") or {})
+                    .get("builtin")) or {})
+        pgsm_on = "pg_stat_monitor" in spl_toks or bool(builtin.get("pgStatMonitor"))
+        pgss_on = ("pg_stat_statements" in spl_toks
+                   or bool(builtin.get("pgStatStatements")))
+        if pgsm_on and pgss_on:
+            sys.stderr.write(
+                "admission webhook denied the request: "
+                "validate PerconaPGCluster: pg_stat_monitor and "
+                "pg_stat_statements cannot both be enabled\n")
+            return 1
+
+        deep_merge(st["cr"], patch)
+        if ((patch.get("spec") or {}).get("pmm") or {}).get("enabled"):
+            # the operator rolls the instance pods one at a time
+            st["pmm_roll"] = {i["name"]: now() + ROLL_S * (k + 1)
+                              for k, i in enumerate(st["instances"])}
+        pend = os.environ.get("FAKE_KUBE_PENDING_PARAMS", "")
+        touched = (patch.get("spec", {}).get("patroni", {})
+                   .get("dynamicConfiguration", {}).get("postgresql", {})
+                   .get("parameters", {}) or {})
+        st["pending_restart"] = [p for p in touched if p in pend.split(",")]
+        # FAKE_KUBE_ROLL_OUTAGE_S: a restart-required patch makes the operator
+        # roll every pod — the cluster is leaderless (members restarting) for
+        # N seconds, then recovers with the pending flags cleared. This is the
+        # huge_pages-incident timeline in miniature.
+        roll_s = float(os.environ.get("FAKE_KUBE_ROLL_OUTAGE_S", "0"))
+        if touched and roll_s:
+            st["roll_until"] = now() + roll_s
+            st["pending_restart"] = sorted(touched)
+        st["cr"]["metadata"]["generation"] += 1
+        save(st)
+        (STATE_DIR / "patches.log").open("a").write(json.dumps(patch) + "\n")
+        out(f"{CR_KIND}.pgv2.percona.com/{st['cluster']} patched")
+        return 0
+    if cmd == "annotate":
+        if any("pgbackrest-backup" in a for a in args):
+            st["manual_started"] = now()
+            st["manual_type"] = (st["cr"]["spec"]["backups"]["pgbackrest"]
+                                 .get("manual", {}) or {})
+            opts = st["manual_type"].get("options", []) if isinstance(
+                st["manual_type"], dict) else []
+            st["manual_type"] = next((o.split("=", 1)[1] for o in opts
+                                      if o.startswith("--type=")), "incr")
+            st["manual_done_job"] = f"{st['cluster']}-backup-abcd"
+            save(st)
+        out("annotated")
+        return 0
+    if cmd == "delete":
+        if args[1] in ("secret", "secrets"):
+            name = args[2]
+            if st.get("pmm_secret") == name:
+                st["pmm_secret"] = ""
+                save(st)
+                out(f'secret "{name}" deleted')
+                return 0
+            sys.stderr.write(f'Error from server (NotFound): secrets "{name}" not found\n')
+            return 1
+        if args[1] in ("pod", "pods"):
+            name = args[2]
+            if name in st.get("extra_pods", {}):
+                del st["extra_pods"][name]
+                save(st)
+                out(f'pod "{name}" deleted')
+                return 0
+            st["deleted"][name] = now()
+            if name == st["leader"]:
+                if os.environ.get("FAKE_KUBE_C1_ELECT") == "1":
+                    st["elect_at"] = now() + ELECT_S
+                else:
+                    st["killed_at"] = now()   # restart-in-place write outage
+            save(st)
+            out(f'pod "{name}" force deleted')
+            return 0
+        if args[1] in ("node", "nodes"):
+            node = args[2]
+            st["lost_nodes"].append(node)
+            leader_inst = next((i for i in st["instances"]
+                                if i["name"] == st["leader"]), None)
+            if leader_inst and leader_inst["node"] == node:
+                st["elect_at"] = now() + ELECT_S
+            save(st)
+            out(f'node "{node}" deleted')
+            return 0
+    if cmd == "run":
+        # A privileged crash pod pinned to a node (the sysrq node-loss fire).
+        # Parse --overrides for the target nodeName and simulate node loss:
+        # every pod on that node vanishes and an election starts.
+        node = ""
+        for a in args:
+            if a.startswith("--overrides="):
+                try:
+                    ov = json.loads(a.split("=", 1)[1])
+                    node = ((ov.get("spec") or {}).get("nodeName") or "")
+                except ValueError:
+                    node = ""
+        if node:
+            st["lost_nodes"].append(node)
+            leader_inst = next((i for i in st["instances"]
+                                if i["name"] == st["leader"]), None)
+            if leader_inst and leader_inst["node"] == node:
+                st["elect_at"] = now() + ELECT_S
+            save(st)
+        out(f"pod/{args[1]} created")
+        return 0
+    if cmd in ("cordon", "drain"):
+        out(f"node/{args[1]} cordoned")
+        return 0
+    if cmd == "logs":
+        follow = "-f" in args or "--follow" in args
+        pod = next(a for a in args[1:] if not a.startswith("-")
+                   and a not in ("database", "pgbouncer", "pgbackrest",
+                                 "pmm-client"))
+        if "pmm-client" in args:
+            return handle_pmm_logs(st, pod)
+        return handle_logs(st, pod, follow)
+    if cmd == "exec":
+        try:
+            dash = args.index("--")
+        except ValueError:
+            return 2
+        pod = next(a for a in args[1:dash] if not a.startswith("-")
+                   and a not in ("database", "pgbouncer", "pgbackrest"))
+        if not pod_alive(st, pod):
+            sys.stderr.write(f'Error from server (NotFound): pods "{pod}" not found\n')
+            return 1
+        return handle_exec(st, pod, args[dash + 1:])
+    if cmd == "top":
+        mem = os.environ.get("FAKE_KUBE_TOP_MEM", "2048Mi")
+        if "--containers" in args:
+            # POD CONTAINER CPU MEM (per-container view)
+            if "--no-headers" not in args:
+                out("POD NAME CPU(cores) MEMORY(bytes)")
+            for i in st["instances"]:
+                cpu = "890m" if i["name"] == st["leader"] else "120m"
+                out(f"{i['name']} database {cpu} {mem}")
+                out(f"{i['name']} pgbackrest 5m 64Mi")
+            return 0
+        if "--no-headers" not in args:
+            out("NAME CPU(cores) MEMORY(bytes)")
+        for i in st["instances"]:
+            out(f"{i['name']} {'890m' if i['name'] == st['leader'] else '120m'} {mem}")
+        return 0
+    sys.stderr.write(f"fake kubectl: unhandled: {' '.join(args[:4])}\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

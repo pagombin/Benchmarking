@@ -4,10 +4,16 @@
 Knobs (env vars):
   FAKE_SYSBENCH_FAIL_THREADS  comma-separated thread counts whose `run` fails
                               with the worker-init FATAL and exit code 1.
+  FAKE_SYSBENCH_RUN_FAIL_THREADS  thread counts whose `run` prints a PostgreSQL
+                              FATAL and exits 2 with ZERO interval lines (mirrors
+                              the field soak: tpcc dies in init before reporting).
+  FAKE_SYSBENCH_HANG_THREADS  thread counts whose `run` starts then hangs forever
+                              (no output, no exit) — exercises the segment watchdog.
   FAKE_SYSBENCH_COUNT_FILE    file to append one line per `run` invocation.
 """
 import os
 import sys
+import time
 
 args = sys.argv[1:]
 
@@ -35,7 +41,9 @@ if count_file and action == "run":
 if action == "prepare":
     print("Creating tables and loading data...")
     state = os.environ.get("FAKE_PSQL_STATE")
-    if state:
+    # FAKE_SYSBENCH_NO_MARKER simulates a prepare that exits 0 but creates
+    # nothing (e.g. silently wrote to the wrong place).
+    if state and not os.environ.get("FAKE_SYSBENCH_NO_MARKER"):
         with open(os.path.join(state, "prepared"), "w") as fh:
             fh.write("1\n")  # makes the fake psql report a fully loaded dataset
     sys.exit(0)
@@ -49,23 +57,73 @@ print(f"Number of threads: {threads}")
 print("Report intermediate results every 1 second(s)\n")
 print("Initializing worker threads...\n")
 
-fail_threads = {
-    int(x) for x in os.environ.get("FAKE_SYSBENCH_FAIL_THREADS", "").split(",") if x
-}
+def _threadset(name):
+    return {int(x) for x in os.environ.get(name, "").split(",") if x}
+
+
+fail_threads = _threadset("FAKE_SYSBENCH_FAIL_THREADS")
 if threads in fail_threads:
     print("FATAL: PQsetdbLogin() failed: ERROR:  no more connections allowed (max_client_conn)")
     print("FATAL: Worker threads failed to initialize within 30 seconds!")
     sys.exit(1)
 
+# Mimic the field soak: tpcc dies during per-thread init with a PostgreSQL FATAL
+# and exit code 2, emitting ZERO interval lines.
+if threads in _threadset("FAKE_SYSBENCH_RUN_FAIL_THREADS"):
+    print("FATAL: PQexec() failed: ERROR:  deadlock detected")
+    print("FATAL: `thread_init' function failed: tpcc.lua:...: SQL error")
+    sys.exit(2)
+
+# Succeed for the first N `run`s, then fail with 0 samples — simulates an OUTAGE
+# that begins AFTER the soak has already produced samples (must NOT trip fast-fail).
+_fail_after = os.environ.get("FAKE_SYSBENCH_FAIL_AFTER")
+if _fail_after and count_file:
+    try:
+        _n_runs = sum(1 for _ in open(count_file))
+    except OSError:
+        _n_runs = 0
+    if _n_runs > int(_fail_after):
+        print("FATAL: connection to server lost (simulated outage)")
+        sys.exit(2)
+
+# Connect then hang: no output, never exits — the supervisor watchdog must kill it.
+if threads in _threadset("FAKE_SYSBENCH_HANG_THREADS"):
+    print("Threads started!\n", flush=True)
+    time.sleep(3600)
+    sys.exit(0)
+
 print("Threads started!\n")
 base_tps = 100.0 * threads
+# --rate throttles offered load; FAKE_SYSBENCH_REALTIME paces 1s/interval so
+# supervisors (rate-stepped soak) see real wall-clock segments.
+_rate = next((float(a.split("=", 1)[1]) for a in args
+              if a.startswith("--rate=")), 0.0)
+_realtime = os.environ.get("FAKE_SYSBENCH_REALTIME") == "1"
+# Offered rate beyond worker capacity: sysbench aborts with the queue-full
+# FATAL (deterministic, immediate-ish) — the knee-finder skip-ahead trigger.
+_qf = float(os.environ.get("FAKE_SYSBENCH_QUEUE_FULL_RATE", "0") or 0)
+if _qf and _rate >= _qf:
+    for t in range(1, 3):
+        if _realtime:
+            time.sleep(1)
+        print(f"[ {t}s ] thds: {threads} tps: 100.00 qps: 2000.00 "
+              f"(r/w/o: 1400.00/400.00/200.00) lat (ms,99%): 48662.51 "
+              f"err/s 0.00 reconn/s: 0.00")
+    print("FATAL: The event queue is full. This means the worker threads "
+          "are unable to keep up with the specified event generation rate")
+    sys.exit(1)
 for t in range(1, duration + 1):
+    if _realtime:
+        time.sleep(1)
     tps = base_tps * (0.8 if t == 1 else 1.0) + t * 0.5
+    if _rate:
+        tps = min(tps, _rate)
     qps = tps * 20
     r, w, o = qps * 0.5, qps * 0.33, qps * 0.17
+    # Mimic real sysbench-tpcc: "err/s" has NO colon (regression guard).
     print(f"[ {t}s ] thds: {threads} tps: {tps:.2f} qps: {qps:.2f} "
           f"(r/w/o: {r:.2f}/{w:.2f}/{o:.2f}) lat (ms,99%): {45.79 + t:.2f} "
-          f"err/s: 0.00 reconn/s: 0.00")
+          f"err/s 0.00 reconn/s: 0.00")
 
 if "--histogram" in args:
     print("Latency histogram (values are in milliseconds)")

@@ -21,11 +21,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pf = sub.add_parser("preflight", help="connectivity, version and limits checks")
     pf.add_argument("--spec", required=True, type=Path, help="run spec YAML")
+    pf.add_argument("--json", action="store_true",
+                    help="emit one JSON event per check on stdout (for the web console)")
 
     pr = sub.add_parser("prepare", help="load the dataset (idempotent)")
     pr.add_argument("--spec", required=True, type=Path)
     pr.add_argument("--results-dir", type=Path, default=Path("results"),
                     help="where prepare logs/load-metrics are stored (default: results/)")
+    pr.add_argument("--create-db", action="store_true",
+                    help="create the target database first if it does not exist")
+    pr.add_argument("--recreate", choices=["database", "tables"], default="",
+                    help="DESTRUCTIVE: drop the database or just the benchmark tables, then load")
+    pr.add_argument("--confirm", default="",
+                    help="must equal the target database name to allow --recreate")
+
+    va = sub.add_parser("validate", help="validate a spec without connecting (CI-friendly)")
+    va.add_argument("--spec", required=True, type=Path)
+
+    dr = sub.add_parser("doctor", help="show version, git SHA/remote and tool availability")
 
     rn = sub.add_parser("run", help="execute the full sweep(s) and generate the report")
     rn.add_argument("--spec", required=True, type=Path)
@@ -34,8 +47,53 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="resume the latest run for this label, skipping completed levels")
     rn.add_argument("--run-dir", type=Path, default=None,
                     help="explicit run directory to resume (with --resume)")
+    rn.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing (prepare-then-run in one command)")
     rn.add_argument("--dry-run", action="store_true",
                     help="print the sysbench command per level and the wall-clock budget, then exit")
+
+    st = sub.add_parser("suite", help="full evidentiary matrix (4 sysbench + 2 "
+                                      "pgbench workloads x thread ladder) -> one "
+                                      "evidence bundle")
+    st.add_argument("--spec", required=True, type=Path)
+    st.add_argument("--results-dir", type=Path, default=Path("results"))
+    st.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing")
+    st.add_argument("--dry-run", action="store_true",
+                    help="print every cell's command and the budget, then exit")
+
+    dp = sub.add_parser("device-probe",
+                        help="sysbench fileio on the pgdata volume from a "
+                             "node-pinned pod (guardrailed; TEST CLUSTERS ONLY)")
+    dp.add_argument("--spec", required=True, type=Path)
+    dp.add_argument("--results-dir", type=Path, default=Path("results"))
+    dp.add_argument("--dry-run", action="store_true",
+                    help="print the pod plan + fileio commands, then exit")
+
+    ep = sub.add_parser("evidence-pack",
+                        help="the core four device probes (rndrd 16K/8K, "
+                             "rndwr 16K x2, all O_DIRECT) as one job + a "
+                             "consolidated narrative (TEST CLUSTERS ONLY)")
+    ep.add_argument("--spec", required=True, type=Path)
+    ep.add_argument("--results-dir", type=Path, default=Path("results"))
+    ep.add_argument("--dry-run", action="store_true",
+                    help="print the four probe plans, then exit")
+
+    sk = sub.add_parser("soak", help="fixed-concurrency resilience run (failover/scale) + report")
+    sk.add_argument("--spec", required=True, type=Path)
+    sk.add_argument("--results-dir", type=Path, default=Path("results"))
+    sk.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing (prepare-then-soak in one command)")
+    sk.add_argument("--dry-run", action="store_true",
+                    help="print the soak sysbench command and planned events, then exit")
+
+    mk = sub.add_parser("mark", help="stamp a timeline event into a (running) soak run")
+    mk.add_argument("--run-dir", required=True, type=Path)
+    mk.add_argument("--type", required=True,
+                    choices=["failover", "scale_up", "scale_down", "note"],
+                    help="event type")
+    mk.add_argument("--label", default="", help="short label shown on the chart/table")
+    mk.add_argument("--note", default="", help="free-text note")
 
     rp = sub.add_parser("report", help="(re)generate the HTML report for a run")
     rp.add_argument("--run-dir", required=True, type=Path)
@@ -48,6 +106,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ls = sub.add_parser("list", help="tabulate all stored runs")
     ls.add_argument("--results-dir", type=Path, default=Path("results"))
+
+    from pgbench_harness.ops.cli import add_ops_parser
+    add_ops_parser(sub)
     return p
 
 
@@ -66,10 +127,10 @@ def _resolve_run_dir(token: str, results_dir: Path) -> Path:
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    from pgbench_harness.compare import generate_compare
+    from pgbench_harness.compare import compare_runs
 
     dirs = [_resolve_run_dir(t, args.results_dir) for t in args.runs]
-    out = generate_compare(dirs, args.out)
+    out = compare_runs(dirs, args.out)   # dispatches sweep vs soak; refuses mixed types
     print(f"comparison report written: {out}")
     return 0
 
@@ -81,7 +142,7 @@ def _peak_qps(run_dir: Path) -> str:
     path = run_dir / "parsed" / "summary.json"
     try:
         levels = json.loads(path.read_text(encoding="utf-8"))["levels"]
-        vals = [l["qps_avg"] for l in levels if l.get("qps_avg")]
+        vals = [l["qps_avg"] for l in levels if l.get("qps_avg") is not None]
         return f"{max(vals):,.0f}" if vals else "—"
     except (OSError, ValueError, KeyError):
         return "—"
@@ -117,14 +178,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.command == "preflight":
             from pgbench_harness.runner import cmd_preflight
-            return cmd_preflight(args.spec)
+            return cmd_preflight(args.spec, json_output=args.json)
         if args.command == "prepare":
             from pgbench_harness.runner import cmd_prepare
-            return cmd_prepare(args.spec, args.results_dir)
+            return cmd_prepare(args.spec, args.results_dir, recreate=args.recreate,
+                               create_db=args.create_db, confirm=args.confirm)
+        if args.command == "validate":
+            from pgbench_harness.runner import cmd_validate
+            return cmd_validate(args.spec)
+        if args.command == "doctor":
+            from pgbench_harness.runner import cmd_doctor
+            return cmd_doctor()
         if args.command == "run":
             from pgbench_harness.runner import cmd_run
             return cmd_run(args.spec, args.results_dir, resume=args.resume,
-                           run_dir_opt=args.run_dir, dry_run=args.dry_run)
+                           run_dir_opt=args.run_dir, dry_run=args.dry_run,
+                           prepare=args.prepare)
+        if args.command == "suite":
+            from pgbench_harness.runner import cmd_suite
+            return cmd_suite(args.spec, args.results_dir,
+                             dry_run=args.dry_run, prepare=args.prepare)
+        if args.command == "device-probe":
+            from pgbench_harness.runner import cmd_device_probe
+            return cmd_device_probe(args.spec, args.results_dir,
+                                    dry_run=args.dry_run)
+        if args.command == "evidence-pack":
+            from pgbench_harness.runner import cmd_evidence_pack
+            return cmd_evidence_pack(args.spec, args.results_dir,
+                                     dry_run=args.dry_run)
+        if args.command == "soak":
+            from pgbench_harness.runner import cmd_soak
+            return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run,
+                            prepare=args.prepare)
+        if args.command == "mark":
+            from pgbench_harness.runner import cmd_mark
+            return cmd_mark(args.run_dir, args.type, args.label, args.note)
         if args.command == "report":
             from pgbench_harness.runner import cmd_report
             return cmd_report(args.run_dir)
@@ -132,6 +220,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_compare(args)
         if args.command == "list":
             return _cmd_list(args)
+        if args.command == "ops":
+            from pgbench_harness.ops.cli import cmd_ops
+            return cmd_ops(args)
         raise AssertionError(f"unhandled command {args.command}")
     except HarnessError as exc:
         print(f"\nerror: {exc}", file=sys.stderr)

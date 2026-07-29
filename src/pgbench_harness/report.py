@@ -21,7 +21,7 @@ from pgbench_harness.errors import ReportError  # noqa: E402
 from pgbench_harness.manifest import STATUS_OK, Manifest  # noqa: E402
 from pgbench_harness.spec import Spec, load_spec  # noqa: E402
 from pgbench_harness.summarize import write_parsed  # noqa: E402
-from pgbench_harness.util import fmt_duration  # noqa: E402
+from pgbench_harness.util import atomic_write_text, fmt_duration  # noqa: E402
 
 REP_COLORS = ["#7fb2f0", "#f0a37f", "#8fd6a5", "#c79fe0"]
 MEAN_COLOR = "#0061eb"
@@ -100,14 +100,15 @@ def chart_metric_vs_threads(summary: dict[str, Any], metric: str, title: str, yl
     ax.plot(*zip(*mean_pts), marker="o", linewidth=2.6, color=MEAN_COLOR,
             label="mean" if len(reps) > 1 else None, zorder=5)
     peak_t, peak_v = max(mean_pts, key=lambda p: p[1])
-    ax.annotate(f"peak {peak_v:,.0f}", xy=(peak_t, peak_v), xytext=(0, 12),
-                textcoords="offset points", ha="center", fontsize=12,
-                fontweight="bold", color=MEAN_COLOR)
+    if peak_v > 0:  # a level that ran but did zero work would give peak_v == 0
+        ax.annotate(f"peak {peak_v:,.0f}", xy=(peak_t, peak_v), xytext=(0, 12),
+                    textcoords="offset points", ha="center", fontsize=12,
+                    fontweight="bold", color=MEAN_COLOR)
     _style_ax(ax, title, "client threads (log scale)", ylabel)
     _log_x(ax, sorted(by_threads))
     if len(reps) > 1:
         ax.legend(fontsize=12)
-    ax.set_ylim(bottom=0, top=peak_v * 1.18)
+    ax.set_ylim(bottom=0, top=peak_v * 1.18 if peak_v > 0 else None)
     return fig_to_base64(fig)
 
 
@@ -146,6 +147,7 @@ def chart_timeseries(
     samples: list[dict[str, Any]], threads: int, spec: Spec
 ) -> Optional[str]:
     """QPS over time for one thread level: warm-up greyed, steady window shaded."""
+    assert spec.sweep is not None
     rows = [s for s in samples if s["threads"] == threads]
     if not rows:
         return None
@@ -214,6 +216,10 @@ def build_headline_rows(summary: dict[str, Any], spec: Spec) -> list[dict[str, A
             row["variance_warn"] = (
                 row["variance_pct"] is not None
                 and row["variance_pct"] > spec.report.variance_warn_pct)
+        elif not failed:
+            # Level(s) finished cleanly (status ok) but produced no parseable
+            # per-second samples — distinct from a real failure.
+            row["no_samples"] = True
         rows.append(row)
     return rows
 
@@ -229,6 +235,59 @@ def build_error_sections(summary: dict[str, Any], samples: list[dict[str, Any]])
         "bad_interval_count": len(bad_intervals),
         "failed_levels": failed,
     }
+
+
+IO_COLUMNS = [
+    ("read_ops_s", "read ops/s"), ("write_ops_s", "write ops/s"),
+    ("fsync_s", "fsync/s"), ("read_mb", "MB read"), ("write_mb", "MB written"),
+    ("wal_mb", "WAL MB"), ("cache_hit_pct", "cache hit %"),
+]
+
+
+def _ok_io_levels(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    return [l for l in summary["levels"] if l["status"] == STATUS_OK and l.get("io")]
+
+
+def has_io(summary: dict[str, Any]) -> bool:
+    """True when any successful level captured engine-side I/O stats."""
+    return bool(_ok_io_levels(summary))
+
+
+def build_io_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-thread-level engine-side I/O metrics, averaged across repetitions."""
+    levels = _ok_io_levels(summary)
+    rows = []
+    for t in sorted({l["threads"] for l in levels}):
+        here = [l["io"] for l in levels if l["threads"] == t]
+        row: dict[str, Any] = {"threads": t}
+        for key, _ in IO_COLUMNS:
+            vals = [io[key] for io in here if io.get(key) is not None]
+            row[key] = statistics.fmean(vals) if vals else None
+        rows.append(row)
+    return rows
+
+
+def chart_io(summary: dict[str, Any]) -> Optional[str]:
+    """Read vs write operations/second against client threads (log-x)."""
+    rows = build_io_rows(summary)
+    series = [("read_ops_s", "read ops/s", "#2eb67d"), ("write_ops_s", "write ops/s", "#d6453d")]
+    plotted = [(label, color, [(r["threads"], r[key]) for r in rows if r.get(key) is not None])
+               for key, label, color in series]
+    plotted = [(lab, col, pts) for lab, col, pts in plotted if pts]
+    if not plotted:
+        return None
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    threads_all: set[int] = set()
+    for label, color, pts in plotted:
+        ax.plot([t for t, _ in pts], [v for _, v in pts], marker="o",
+                linewidth=2.2, color=color, label=label)
+        threads_all.update(t for t, _ in pts)
+    _style_ax(ax, "Engine-side I/O operations vs client threads",
+              "client threads (log scale)", "operations / second")
+    _log_x(ax, sorted(threads_all))
+    ax.legend(fontsize=12)
+    ax.set_ylim(bottom=0)
+    return fig_to_base64(fig)
 
 
 def build_kpis(headline: list[dict[str, Any]], summary: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -277,6 +336,36 @@ def _read_env(env_dir: Path, name: str) -> str:
     return p.read_text(encoding="utf-8").strip() if p.exists() else "n/a"
 
 
+def build_pmm_links(spec: Spec, start_iso: str, end_iso: str):
+    """PMM UI deep links scoped to the run's window. Grafana (PMM3's UI) takes
+    epoch-milliseconds ``from``/``to`` query params on /graph/d/... URLs."""
+    if spec.pmm is None:
+        return None
+    import time as _time
+    from datetime import datetime, timezone
+
+    def ms(iso: str, fallback: int) -> int:
+        try:
+            return int(datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+                       .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except (ValueError, TypeError):
+            return fallback
+    now_ms = int(_time.time() * 1000)
+    frm = ms(start_iso, now_ms - 3_600_000)
+    to = ms(end_iso, now_ms)
+    host = spec.pmm.server_host
+    base = host if "://" in host else f"https://{host}"
+    qan = f"{base}/graph/d/pmm-qan/pmm-query-analytics?from={frm}&to={to}"
+    if spec.pmm.service_name:
+        qan += f"&var-service_name={spec.pmm.service_name}"
+    return {
+        "server": host, "from_ms": frm, "to_ms": to,
+        "instances": f"{base}/graph/d/postgresql-instance-overview/"
+                     f"postgresql-instances-overview?from={frm}&to={to}",
+        "qan": qan,
+    }
+
+
 def generate_report(run_dir: Path) -> Path:
     """(Re)generate report.html for a run directory; returns the output path."""
     run_dir = run_dir.resolve()
@@ -285,6 +374,12 @@ def generate_report(run_dir: Path) -> Path:
         raise ReportError(f"no spec.yaml in {run_dir}",
                           hint="is this a pgbench-harness run directory?")
     spec = load_spec(spec_path)
+    if spec.sweep is None:
+        # a real error, not an assert: asserts vanish under -O and the wrong
+        # renderer must fail loudly, not crash later on spec.sweep.warmup_s
+        raise ReportError(
+            "generate_report renders sweep runs only — use report_soak for "
+            "soaks and report_evidence for suite/device-probe runs")
     manifest = Manifest.load(run_dir)
     summary = write_parsed(run_dir, spec, manifest)  # raw logs are the source of truth
     samples = load_samples_csv(run_dir / "parsed" / "samples.csv")
@@ -295,6 +390,7 @@ def generate_report(run_dir: Path) -> Path:
         "qps": chart_metric_vs_threads(summary, "qps_avg", "QPS vs client threads", "QPS"),
         "tps": chart_metric_vs_threads(summary, "tps_avg", "TPS vs client threads", "TPS"),
         "latency": chart_latency_vs_threads(summary),
+        "io": chart_io(summary),
         "timeseries": [
             {"threads": t, "img": chart_timeseries(samples, t, spec)}
             for t in spec.report.timeseries_levels
@@ -309,9 +405,14 @@ def generate_report(run_dir: Path) -> Path:
         headline=headline,
         kpis=build_kpis(headline, summary),
         prepare_stats=load_prepare_stats(env_dir),
+        preflight=manifest.preflight,
+        dataset=manifest.preflight.get("dataset") or {},
         warnings=manifest.preflight.get("warnings", []),
         errors=build_error_sections(summary, samples),
         charts=charts,
+        io_rows=build_io_rows(summary),
+        io_columns=IO_COLUMNS,
+        has_io=has_io(summary),
         key_settings=[settings_map.get(k, {"name": k, "setting": "n/a", "unit": "", "source": ""})
                       for k in KEY_SETTINGS],
         all_settings=settings,
@@ -322,9 +423,10 @@ def generate_report(run_dir: Path) -> Path:
             "harness_version": _read_env(env_dir, "harness_git_sha.txt"),
             "host_info": _read_env(env_dir, "host_info.txt"),
         },
+        pmm_links=build_pmm_links(spec, manifest.created_utc, manifest.finished_utc),
         wall_time=fmt_duration(manifest.wall_time_s) if manifest.wall_time_s else "n/a",
         steady_window=f"{spec.sweep.warmup_s}s – {spec.sweep.duration_s}s",
     )
     out = run_dir / "report.html"
-    out.write_text(html, encoding="utf-8")
+    atomic_write_text(out, html)  # redacts the registered secret as a final safety net
     return out

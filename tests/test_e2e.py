@@ -40,6 +40,61 @@ def results_dir(tmp_path: Path) -> Path:
     return tmp_path / "results"
 
 
+def test_sweep_live_samples_written_during_run(fake_env, spec_file, results_dir) -> None:
+    """The cockpit's samples.csv is fed per-second DURING the sweep, not only at
+    finalize: after a level runs, the live file already holds parsed interval rows
+    (write_parsed later rebuilds the same file canonically)."""
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    run_dir = find_run_dir(results_dir)
+    samples = (run_dir / "parsed" / "samples.csv").read_text().splitlines()
+    assert samples[0].split(",")[:4] == ["run_id", "rep", "threads", "t_offset"]
+    assert len(samples) > 1                       # real per-second rows, not just '--'
+
+
+def test_sweep_samples_carry_run_relative_t_wall(fake_env, spec_file, results_dir,
+                                                 monkeypatch) -> None:
+    """Field bug: t_offset restarts at 0 for every level, so the cockpit
+    stacked a whole multi-level sweep into one duration-wide window of
+    spaghetti while pg_timeseries spanned the full run. t_wall (seconds
+    since RUN start) must be present and non-decreasing across levels."""
+    import csv as _csv
+    # real pacing: wall-clock must actually advance between levels for the
+    # monotonicity assertion to mean anything
+    monkeypatch.setenv("FAKE_SYSBENCH_REALTIME", "1")
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    run_dir = find_run_dir(results_dir)
+    with open(run_dir / "parsed" / "samples.csv", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows and "t_wall" in rows[0]
+    walls = [float(r["t_wall"]) for r in rows if r["t_wall"] != ""]
+    assert len(walls) == len(rows)                # every row is anchored
+    assert walls == sorted(walls)                 # one continuous timeline
+    offs = [float(r["t_offset"]) for r in rows]
+    # multiple levels -> offsets reset while the wall clock keeps advancing
+    resets = sum(1 for a, b in zip(offs, offs[1:]) if b < a)
+    assert resets >= 1
+    assert max(walls) > max(offs)                 # levels laid out sequentially
+
+
+def test_run_streaming_on_line_fires_per_line(fake_env, spec_file) -> None:
+    """run_streaming delivers each line to the on_line tap as the child runs (the
+    hook that drives live per-second charts), before the process exits."""
+    import logging
+
+    from pgbench_harness import sysbench
+    from pgbench_harness.parser import parse_interval_line
+    from pgbench_harness.spec import load_spec
+
+    spec = load_spec(spec_file)
+    seen: list[str] = []
+    cmd = sysbench.build_run_command(spec, 1)
+    rc = sysbench.run_streaming(cmd, sysbench.child_env(spec, "pw"),
+                                spec_file.parent / "raw.log", logging.getLogger("t"),
+                                on_line=seen.append)
+    assert rc == 0
+    assert sum(1 for ln in seen if parse_interval_line(ln) is not None) >= 1
+
+
 def test_preflight_ok(fake_env: Path, spec_file: Path, capsys) -> None:
     assert run_cli("preflight", "--spec", str(spec_file)) == 0
 
@@ -60,9 +115,48 @@ def test_preflight_connection_ceiling(fake_env, spec_file, monkeypatch, capsys) 
     assert "connection #3" in err
 
 
-def test_prepare_idempotent(fake_env, spec_file, monkeypatch, tmp_path) -> None:
+def test_prepare_already_present_errors_clearly(fake_env, spec_file, monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
-    assert run_cli("prepare", "--spec", str(spec_file)) == 0  # dataset already present
+    rc = run_cli("prepare", "--spec", str(spec_file))   # dataset already present
+    assert rc != 0                                        # no longer a silent no-op
+    assert "already present" in capsys.readouterr().err.lower()
+
+
+def test_prepare_recreate_requires_matching_confirm(fake_env, spec_file, monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert run_cli("prepare", "--spec", str(spec_file), "--recreate", "tables", "--confirm", "wrong") != 0
+    assert "confirmation" in capsys.readouterr().err.lower()
+
+
+def test_prepare_recreate_tables_reloads(fake_env, spec_file, monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    # correct confirmation -> drops benchmark tables and reloads (sysbench prepare runs)
+    assert run_cli("prepare", "--spec", str(spec_file), "--recreate", "tables", "--confirm", "sbtest") == 0
+
+
+def test_prepare_create_db_unreachable_after_create_fails(fake_env, spec_file, results_dir, monkeypatch) -> None:
+    """CREATE DATABASE succeeds but the new DB never accepts a connection: prepare
+    must fail loudly (it used to discard wait_for_db and load against a dead cluster)."""
+    from pgbench_harness import capture, runner
+    from pgbench_harness.errors import RunError
+    monkeypatch.setattr(capture, "maintenance_db", lambda spec, pw: "defaultdb")
+    monkeypatch.setattr(capture, "database_exists", lambda spec, pw, maint: False)
+    monkeypatch.setattr(capture, "create_database", lambda spec, pw, maint: (True, ""))
+    monkeypatch.setattr(capture, "wait_for_db", lambda spec, pw, **k: False)
+    with pytest.raises(RunError, match="not reachable"):
+        runner.cmd_prepare(spec_file, results_dir, create_db=True)
+
+
+def test_prepare_no_maintenance_db_and_target_unreachable_is_explicit(
+        fake_env, spec_file, results_dir, monkeypatch) -> None:
+    """No maintenance DB reachable AND the target itself doesn't answer -> an
+    explicit error naming the cause, not a generic downstream connectivity failure."""
+    from pgbench_harness import capture, runner
+    from pgbench_harness.errors import RunError
+    monkeypatch.setattr(capture, "maintenance_db", lambda spec, pw: None)
+    monkeypatch.setattr(capture, "wait_for_db", lambda spec, pw, **k: False)
+    with pytest.raises(RunError, match="maintenance database"):
+        runner.cmd_prepare(spec_file, results_dir, create_db=True)
 
 
 def test_dry_run_prints_commands_and_budget(fake_env, spec_file, capsys) -> None:
@@ -100,12 +194,21 @@ def test_full_run_produces_report(fake_env, spec_file, results_dir) -> None:
     assert "http://" not in html and "https://" not in html  # no CDN/network refs
     assert "rep Δ QPS %" in html                   # variance column (2 reps)
     assert "shared_buffers" in html                # key settings table
+    assert "overflow: hidden" not in html          # scroll-bug regression guard
+    assert "table-wrap" in html                    # tables scroll horizontally
+    assert "<tbody>" in html                        # proper zebra striping structure
+    assert "Storage I/O (engine-side)" in html     # IOPS-proxy section
+    assert "read ops/s" in html and "write ops/s" in html
+    assert (run_dir / "raw" / "rep1_t001_iostats.json").exists()  # raw snapshots
 
     summary = json.loads((run_dir / "parsed" / "summary.json").read_text())
     assert {(l["rep"], l["threads"]) for l in summary["levels"]} == \
         {(1, 1), (1, 4), (2, 1), (2, 4)}
     assert all(l["qps_avg"] > 0 for l in summary["levels"])
     assert all(l["steady_state_window"] == [1, 5] for l in summary["levels"])
+    # engine-side I/O deltas landed in the summary contract
+    for lvl in summary["levels"]:
+        assert "io" in lvl and lvl["io"]["read_ops_s"] is not None
 
 
 def test_no_password_anywhere_in_results(fake_env, spec_file, results_dir) -> None:
@@ -187,8 +290,44 @@ def test_compare_two_runs(fake_env, spec_file, results_dir, monkeypatch, tmp_pat
     html = out.read_text()
     assert "work_mem" in html            # settings diff caught the difference
     assert "65536" in html and "4096" in html
-    assert html.count("data:image/png;base64,") >= 2  # overlaid QPS + p99 charts
+    # QPS, TPS, p99, efficiency, relative-to-baseline
+    assert html.count("data:image/png;base64,") >= 4
     assert "Settings diff" in html
+    assert "Per-run summary" in html         # new KPI band
+    assert "Efficiency (latency vs throughput)" in html
+    assert "Storage I/O (engine-side)" in html  # I/O overlay section
+    assert "peak QPS" in html
+    assert "highest peak throughput" in html  # winner callout
+    assert "overflow: hidden" not in html     # scroll-bug regression guard
+    assert "table-wrap" in html               # tables are horizontally scrollable
+    # cross-provider context: identity cards, fairness verdict, full capture
+    assert "Environment &amp; identity" in html
+    assert "Comparability check" in html
+    assert "Fair comparison" in html          # same spec both runs -> fair
+    assert "Key database settings" in html
+    assert "Full pg_settings capture" in html
+    assert "shared_buffers" in html           # key settings shown even if equal
+
+
+def test_compare_flags_unfair_comparison(fake_env, spec_file, results_dir,
+                                         monkeypatch, tmp_path) -> None:
+    """A DO-vs-Aiven number with different workload geometry is an accident,
+    not a comparison — the report must say so loudly."""
+    import yaml as _yaml
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    doc = _yaml.safe_load(spec_file.read_text())
+    doc["sweep"]["duration_s"] = doc["sweep"]["duration_s"] + 1
+    doc["sweep"]["threads"] = list(doc["sweep"]["threads"]) + [3]
+    spec2 = spec_file.parent / "spec2.yaml"
+    spec2.write_text(_yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("run", "--spec", str(spec2), "--results-dir", str(results_dir)) == 0
+    runs = sorted(d.name for d in results_dir.iterdir() if (d / "manifest.json").exists())
+    out = tmp_path / "compare.html"
+    assert run_cli("compare", "--runs", *runs, "--results-dir", str(results_dir),
+                   "--out", str(out)) == 0
+    html = out.read_text()
+    assert "Not an apples-to-apples comparison" in html
+    assert "duration_s" in html and "threads / ladder" in html
 
 
 def test_list_runs(fake_env, spec_file, results_dir, capsys) -> None:
@@ -199,6 +338,32 @@ def test_list_runs(fake_env, spec_file, results_dir, capsys) -> None:
     assert "test-tiny" in out
     assert "complete" in out
     assert "4/4" in out
+
+
+def test_validate_ok(spec_file, capsys) -> None:
+    assert run_cli("validate", "--spec", str(spec_file)) == 0
+    out = capsys.readouterr().out
+    assert "OK:" in out and "mode     : sweep" in out
+
+
+def test_validate_bad_spec(tmp_path, capsys) -> None:
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("run: {label: x}\n", encoding="utf-8")  # missing required sections
+    assert run_cli("validate", "--spec", str(bad)) == 2
+
+
+def test_doctor(capsys) -> None:
+    assert run_cli("doctor") == 0
+    assert "pgbench-harness" in capsys.readouterr().out
+
+
+def test_run_prepare_chains(fake_env, spec_file, results_dir, monkeypatch) -> None:
+    """`run --prepare` loads a missing dataset first, then runs to completion."""
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")  # dataset absent until prepared
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir),
+                   "--prepare") == 0
+    run_dir = find_run_dir(results_dir)
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "complete"
 
 
 def test_run_refuses_missing_dataset(fake_env, spec_file, results_dir, monkeypatch, capsys) -> None:
@@ -221,6 +386,29 @@ def test_dataset_size_mismatch_aborts(fake_env, spec_file, results_dir, monkeypa
     assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 2
     assert run_cli("prepare", "--spec", str(spec_file),
                    "--results-dir", str(results_dir)) == 2
+
+
+def test_wrong_schema_detected(fake_env, spec_file, monkeypatch, capsys) -> None:
+    """Tables exist but off the search_path -> diagnosed as wrong_schema, not missing."""
+    monkeypatch.setenv("FAKE_PSQL_WRONG_SCHEMA", "benchmark")
+    assert run_cli("preflight", "--spec", str(spec_file)) == 2
+    err = capsys.readouterr().err
+    assert "wrong_schema" in err
+    assert "search_path" in err
+    assert "benchmark.sbtest1" in err  # tells the user exactly where they are
+
+
+def test_prepare_succeeds_but_creates_nothing(
+    fake_env, spec_file, results_dir, monkeypatch, capsys
+) -> None:
+    """sysbench prepare exits 0 but no tables appear -> error shows the log tail."""
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")
+    monkeypatch.setenv("FAKE_SYSBENCH_NO_MARKER", "1")
+    rc = run_cli("prepare", "--spec", str(spec_file), "--results-dir", str(results_dir))
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "reported success but no benchmark tables exist" in err
+    assert "Creating tables and loading data" in err  # prepare-log tail included
 
 
 def test_incomplete_dataset_aborts(fake_env, spec_file, monkeypatch, capsys) -> None:
@@ -287,3 +475,101 @@ def test_report_kpi_cards(fake_env, spec_file, results_dir) -> None:
     assert "Peak QPS" in html
     assert "p99 latency at peak" in html
     assert "Failed levels / SQL errors" in html
+
+
+# ── live PostgreSQL metrics sampler (Phase 5) ───────────────────────────
+
+def test_pg_delta_row_rates() -> None:
+    from pgbench_harness.capture import pg_delta_row
+    prev = {"_mono": 100.0, "blks_hit": 1000, "blks_read": 100, "xacts": 500,
+            "wal_bytes": 1_000_000, "active": 2, "total_conn": 5,
+            "xact_commit": 480, "xact_rollback": 20, "tup_inserted": 100}
+    cur = {"_mono": 102.0, "blks_hit": 1900, "blks_read": 110, "xacts": 700,
+           "wal_bytes": 3_000_000, "active": 8, "total_conn": 12,
+           "xact_commit": 660, "xact_rollback": 40, "tup_inserted": 400}
+    row = pg_delta_row(prev, cur, 2.0)              # dt = 2s
+    assert row["t"] == 2
+    assert row["active"] == 8 and row["total_conn"] == 12
+    assert row["xacts_s"] == 100.0                  # 200 xacts / 2s
+    assert row["commits_s"] == 90.0 and row["rollbacks_s"] == 10.0
+    assert row["tup_inserted_s"] == 150.0          # 300 / 2s
+    assert abs(float(row["cache_hit_pct"]) - 98.9) < 0.2   # 900 / 910
+    assert abs(row["wal_mb_s"] - (2_000_000 / 1024 / 1024 / 2)) < 0.01  # MiB/s
+
+
+def test_pg_delta_row_uses_server_clock_and_lock_metrics() -> None:
+    """Rates use the server clock delta (db_epoch), not the harness round-trip
+    timing, and lock-contention gauges (blocked queries / max wait) are recorded."""
+    from pgbench_harness.capture import _sample_dt, pg_delta_row
+    base = {"blks_hit": 0, "blks_read": 0, "xacts": 0, "xact_commit": 0,
+            "xact_rollback": 0, "wal_bytes": 0, "tup_returned": 0, "tup_fetched": 0,
+            "tup_inserted": 0, "tup_updated": 0, "tup_deleted": 0, "deadlocks": 0,
+            "conflicts": 0, "temp_bytes": 0, "temp_files": 0, "ckpt_timed": 0,
+            "ckpt_req": 0, "ckpt_write_ms": 0, "ckpt_sync_ms": 0, "bgw_clean": 0,
+            "bgw_alloc": 0, "active": 4, "total_conn": 9}
+    prev = {**base, "db_epoch": 2000.0, "_mono": 50.0, "tup_inserted": 100}
+    # the sample's psql round-trip was slow (mono advanced 9s) but the server clock
+    # only advanced 3s between the two counter reads — the rate must use 3s.
+    cur = {**base, "db_epoch": 2003.0, "_mono": 59.0, "tup_inserted": 400,
+           "blocked": 5, "lock_wait_max_s": 2.5}
+    assert _sample_dt(prev, cur) == 3.0
+    row = pg_delta_row(prev, cur, 3)
+    assert row["tup_inserted_s"] == 100.0          # 300 / 3s (server clock), not /9
+    assert row["blocked_queries"] == 5 and row["lock_wait_max_s"] == 2.5
+
+
+def test_pg_delta_row_reset_is_a_gap_not_a_spike() -> None:
+    """A counter that went backwards (server restart/failover/reset) yields a
+    blank gap — never a misleading 0 or a huge first-delta spike (the WAL
+    15,000 MB/s artifact)."""
+    from pgbench_harness.capture import pg_delta_row
+    prev = {"_mono": 100.0, "wal_bytes": 9_000_000_000, "xacts": 1_000_000,
+            "blks_hit": 500, "blks_read": 50}
+    cur = {"_mono": 102.0, "wal_bytes": 1_000, "xacts": 10,     # reset to tiny values
+           "blks_hit": 5, "blks_read": 1}
+    row = pg_delta_row(prev, cur, 2.0)
+    assert row["wal_mb_s"] == "" and row["xacts_s"] == ""       # gap, not spike/0
+    assert row["cache_hit_pct"] == ""                            # negative access delta
+
+
+def test_live_pg_sampler_writes_timeseries(fake_env, spec_file, tmp_path) -> None:
+    import time
+    from pgbench_harness import capture
+    from pgbench_harness.spec import load_spec
+    spec = load_spec(spec_file)
+    run_dir = tmp_path / "run"
+    (run_dir / "parsed").mkdir(parents=True)
+    sampler = capture.LivePgSampler(spec, "any-nonempty-pw", run_dir, interval_s=1)
+    sampler.start()
+    time.sleep(2.4)
+    sampler.stop()
+    lines = (run_dir / "parsed" / "pg_timeseries.csv").read_text().splitlines()
+    assert lines[0] == ",".join(capture.LIVE_PG_COLUMNS)
+    assert len(lines) >= 2                          # at least one delta row
+    cols = dict(zip(capture.LIVE_PG_COLUMNS, lines[1].split(",")))
+    assert 0 <= float(cols["cache_hit_pct"]) <= 100
+    assert float(cols["wal_mb_s"]) >= 0
+    # B4: the richer engine-side set reaches the CSV
+    assert float(cols["commits_s"]) > 0 and float(cols["tup_inserted_s"]) > 0
+    assert float(cols["blks_read_s"]) >= 0 and float(cols["ckpt_write_ms_s"]) >= 0
+    assert cols["repl_replay_lag_s"] == ""           # no replica -> blank, not 0
+
+
+def test_report_links_to_pmm_when_spec_has_pmm_section(
+        fake_env, results_dir, tmp_path) -> None:
+    """A run spec with a pmm: section gets PMM deep links in report.html,
+    scoped to the run's window (epoch-ms from/to on Grafana dashboard URLs)."""
+    import yaml
+
+    from conftest import make_spec_doc
+    doc = make_spec_doc()
+    doc["pmm"] = {"server_host": "pmm.example.com", "service_name": "cluster1-db"}
+    spec_path = tmp_path / "run-pmm.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("run", "--spec", str(spec_path),
+                   "--results-dir", str(results_dir)) == 0
+    html = (find_run_dir(results_dir) / "report.html").read_text()
+    assert "PMM — observation layer" in html
+    assert "https://pmm.example.com/graph/d/postgresql-instance-overview/" in html
+    assert "https://pmm.example.com/graph/d/pmm-qan/pmm-query-analytics?from=" in html
+    assert "var-service_name=cluster1-db" in html

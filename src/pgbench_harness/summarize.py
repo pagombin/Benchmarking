@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import statistics
 from pathlib import Path
 from typing import Any, Optional
@@ -20,8 +21,49 @@ from pgbench_harness.util import atomic_write_json, atomic_write_text
 
 SAMPLE_COLUMNS = [
     "run_id", "rep", "threads", "t_offset", "tps", "qps", "r", "w", "o",
-    "lat_p99", "err_s", "reconn_s",
+    "lat_p99", "err_s", "reconn_s", "seg", "t_wall",
 ]
+# t_offset restarts at 0 for EVERY level — plotting a multi-level sweep
+# against it stacks all levels into one duration_s-wide window (the field
+# bug: a 12,000s sweep charted as 1,200s of spaghetti). t_wall is seconds
+# since RUN start, the same clock basis as pg_timeseries.csv, so the
+# cockpit lays levels out as one continuous timeline. Appended LAST so
+# header-name consumers and positional readers of the old prefix both keep
+# working.
+
+
+class IncrementalCsvWriter:
+    """Append-and-flush writer for the LIVE per-second series the SSE cockpit
+    tails (parsed/samples.csv, parsed/soak_timeseries.csv).
+
+    Deliberately NOT atomic_write_text: the SSE reader tails the whole file and
+    consumes only complete, newline-terminated rows, so per-row append+flush is
+    safe and gives the cockpit data from second one. The canonical file is still
+    rebuilt atomically at finalize (write_parsed / soak.analyze), which replaces
+    whatever the live writer produced — so finalize/resume/regenerate-from-raw
+    guarantees are untouched. Opens in append mode (header only when the file is
+    new/empty) so a --resume keeps prior rows visible until finalize.
+    """
+
+    def __init__(self, path: Path, columns: list[str]) -> None:
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = (not path.exists()) or path.stat().st_size == 0
+        self._fh = open(path, "a", encoding="utf-8", newline="")
+        self._w = csv.writer(self._fh)
+        if fresh:
+            self._w.writerow(columns)
+            self._fh.flush()
+
+    def append(self, row: list[Any]) -> None:
+        self._w.writerow(row)
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
 
 def summarize_level(
@@ -33,14 +75,15 @@ def summarize_level(
     from the histogram (interpolated) when available; otherwise only the
     declared 99th percentile from the summary block is reported.
     """
-    steady = trim_warmup(parsed.samples, spec.sweep.warmup_s)
+    warmup_s, duration_s = _level_window(spec)
+    steady = trim_warmup(parsed.samples, warmup_s)
     out: dict[str, Any] = {
         "qps_avg": round(statistics.fmean(s.qps for s in steady), 2) if steady else None,
         "tps_avg": round(statistics.fmean(s.tps for s in steady), 2) if steady else None,
         "errors": round(sum(s.err_s for s in steady), 2) if steady else None,
         "reconnects": round(sum(s.reconn_s for s in steady), 2) if steady else None,
-        "duration_s": spec.sweep.duration_s,
-        "steady_state_window": [spec.sweep.warmup_s, spec.sweep.duration_s],
+        "duration_s": duration_s,
+        "steady_state_window": [warmup_s, duration_s],
         "samples_total": len(parsed.samples),
         "samples_steady": len(steady),
     }
@@ -61,12 +104,104 @@ def summarize_level(
     return out
 
 
-def _samples_rows(run_id: str, rep: int, threads: int, parsed: ParsedLog) -> list[list[Any]]:
+def _level_window(spec: Spec) -> tuple[int, int]:
+    """(warmup_s, duration_s) for a level — sweep or suite segment."""
+    if spec.sweep is not None:
+        return spec.sweep.warmup_s, spec.sweep.duration_s
+    assert spec.suite is not None
+    return spec.suite.warmup_s, spec.suite.duration_s
+
+
+def _parse_level_log(log_path, seg: str) -> ParsedLog:
+    """Driver-aware raw-log parse: pgbench segments use the pgbench parser."""
+    if seg.startswith("pgbench"):
+        from pgbench_harness.pgbench_cmd import parse_pgbench_progress
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        samples = [s for s in (parse_pgbench_progress(ln)
+                               for ln in text.splitlines()) if s is not None]
+        errors = [ln for ln in text.splitlines()
+                  if "error" in ln.lower() or "FATAL" in ln]
+        return ParsedLog(samples=samples, summary=None, histogram=[],
+                         error_lines=errors)
+    return parse_log_file(log_path)
+
+
+def _samples_rows(run_id: str, rep: int, threads: int, parsed: ParsedLog,
+                  seg: str = "", wall_base: Optional[float] = None,
+                  ) -> list[list[Any]]:
     return [
         [run_id, rep, threads, s.t_offset, s.tps, s.qps, s.r, s.w, s.o,
-         s.lat_ms, s.err_s, s.reconn_s]
+         s.lat_ms, s.err_s, s.reconn_s, seg,
+         round(wall_base + s.t_offset, 1) if wall_base is not None else ""]
         for s in parsed.samples
     ]
+
+
+def _wall_base(created_utc: str, level_started_utc: str) -> Optional[float]:
+    """Seconds from run start to a level's start (both harness UTC stamps)."""
+    from datetime import datetime, timezone
+    try:
+        t0 = datetime.strptime(created_utc, "%Y-%m-%dT%H:%M:%SZ")
+        t1 = datetime.strptime(level_started_utc, "%Y-%m-%dT%H:%M:%SZ")
+        return max(0.0, (t1.replace(tzinfo=timezone.utc)
+                         - t0.replace(tzinfo=timezone.utc)).total_seconds())
+    except (ValueError, TypeError):
+        return None
+
+
+BLOCK_BYTES = 8192      # PostgreSQL default block size; pg_stat_io counts 8 KB ops
+MB = 1024 * 1024
+
+
+def io_delta(path: Path, duration_s: int) -> Optional[dict[str, Any]]:
+    """Derive engine-side I/O rates from a level's pre/post I/O snapshots.
+
+    Reads ``raw/<level>_iostats.json`` ({pre, post} of pg_stat_io /
+    pg_stat_database / pg_stat_wal), subtracts, and converts to per-second
+    rates over the **whole level** (the snapshots bracket the entire run,
+    including warm-up). 8 KB blocks are assumed for byte conversions. Returns
+    ``None`` when nothing usable was captured.
+    """
+    if duration_s <= 0 or not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pre, post = doc.get("pre") or {}, doc.get("post") or {}
+
+    def delta(section: str, key: str) -> Optional[float]:
+        a, b = pre.get(section) or {}, post.get(section) or {}
+        if a.get(key) is not None and b.get(key) is not None:
+            return max(0.0, float(b[key]) - float(a[key]))
+        return None
+
+    out: dict[str, Any] = {}
+    reads, writes = delta("io", "reads"), delta("io", "writes")
+    if reads is not None:
+        out["read_ops_s"] = round(reads / duration_s, 1)
+        out["read_mb"] = round(reads * BLOCK_BYTES / MB, 1)
+    if writes is not None:
+        out["write_ops_s"] = round(writes / duration_s, 1)
+        out["write_mb"] = round(writes * BLOCK_BYTES / MB, 1)
+    for src, name in (("extends", "extend_ops_s"), ("fsyncs", "fsync_s")):
+        v = delta("io", src)
+        if v is not None:
+            out[name] = round(v / duration_s, 1)
+    blks_read, blks_hit = delta("db", "blks_read"), delta("db", "blks_hit")
+    if blks_read is not None and blks_hit is not None and (blks_read + blks_hit) > 0:
+        out["cache_hit_pct"] = round(blks_hit / (blks_hit + blks_read) * 100, 2)
+    elif reads is not None:
+        hits = delta("io", "hits")
+        if hits is not None and (hits + reads) > 0:
+            out["cache_hit_pct"] = round(hits / (hits + reads) * 100, 2)
+    wal_bytes, wal_records = delta("wal", "wal_bytes"), delta("wal", "wal_records")
+    if wal_bytes is not None:
+        out["wal_mb"] = round(wal_bytes / MB, 1)
+        out["wal_mb_s"] = round(wal_bytes / MB / duration_s, 2)
+    if wal_records is not None:
+        out["wal_records_s"] = round(wal_records / duration_s, 1)
+    return out or None
 
 
 def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any]:
@@ -75,6 +210,7 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
     Re-parsing from raw is the source of truth, so reports can be regenerated
     after parser improvements without re-running benchmarks.
     """
+    assert spec.sweep is not None or spec.suite is not None
     parsed_dir = run_dir / "parsed"
     parsed_dir.mkdir(parents=True, exist_ok=True)
     pcts = spec.report.percentiles
@@ -85,12 +221,31 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
             "rep": lvl.rep, "threads": lvl.threads, "status": lvl.status,
             "error_excerpt": lvl.error_excerpt or None,
         }
+        if lvl.seg:
+            entry["seg"] = lvl.seg
+            entry["driver"] = "pgbench" if lvl.seg.startswith("pgbench")                 else "sysbench"
         log_path = run_dir / lvl.raw_log if lvl.raw_log else None
         if log_path is not None and log_path.exists():
-            parsed = parse_log_file(log_path)
-            rows.extend(_samples_rows(manifest.run_id, lvl.rep, lvl.threads, parsed))
+            parsed = _parse_level_log(log_path, lvl.seg)
+            rows.extend(_samples_rows(
+                manifest.run_id, lvl.rep, lvl.threads, parsed, lvl.seg,
+                wall_base=_wall_base(manifest.created_utc,
+                                     lvl.started_utc or "")))
             if lvl.status == STATUS_OK:
                 entry.update(summarize_level(parsed, spec, pcts))
+                if lvl.seg.startswith("pgbench"):
+                    from pgbench_harness.pgbench_cmd import parse_pgbench_summary
+                    pgs = parse_pgbench_summary(
+                        log_path.read_text(encoding="utf-8", errors="replace"))
+                    entry["lat_avg"] = pgs.get("lat_avg_ms")
+                    entry["transactions"] = pgs.get("transactions")
+                    if pgs.get("tps"):
+                        entry["tps_avg"] = entry["tps_avg"] or round(pgs["tps"], 2)
+                iostats = io_delta(
+                    run_dir / "raw" / f"{lvl.key}_iostats.json",
+                    _level_window(spec)[1])
+                if iostats is not None:
+                    entry["io"] = iostats
             elif parsed.error_lines and not entry["error_excerpt"]:
                 entry["error_excerpt"] = "\n".join(parsed.error_lines[:3])
         levels_out.append(entry)
@@ -106,7 +261,8 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
         "tshirt_size": manifest.tshirt_size,
         "status": manifest.status,
         "workload": dict(spec.raw.get("workload", {})),
-        "sweep": dict(spec.raw.get("sweep", {})),
+        "sweep": dict(spec.raw.get("sweep", {}) or spec.raw.get("suite", {})),
+        "suite": dict(spec.raw.get("suite", {})) or None,
         "percentiles": list(pcts),
         "levels": levels_out,
     }

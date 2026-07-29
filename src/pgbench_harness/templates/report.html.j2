@@ -24,8 +24,8 @@
 <div class="toc">
   <a href="#overview">Overview</a><a href="#headline">Headline results</a>
   <a href="#throughput">Throughput</a><a href="#latency">Latency</a>
-  <a href="#stability">Stability</a><a href="#errors">Errors &amp; limits</a>
-  <a href="#config">Configuration</a>
+  <a href="#stability">Stability</a><a href="#io">Storage I/O</a>
+  <a href="#errors">Errors &amp; limits</a><a href="#config">Configuration</a>
 </div>
 
 {% if kpis %}
@@ -50,6 +50,9 @@
     <div><b>Finished (UTC):</b> {{ manifest.finished_utc or "n/a" }}</div>
     <div><b>Total wall time:</b> {{ wall_time }}</div>
     <div><b>Target:</b> {{ spec.target.host }}:{{ spec.target.port }}/{{ spec.target.database }}</div>
+    {% if preflight.max_connections %}<div><b>Server max_connections:</b> {{ preflight.max_connections }}</div>{% endif %}
+    {% if dataset.actual_size is not none %}<div><b>Dataset:</b> {{ dataset.actual_size }} {{ dataset.size_unit }}</div>{% endif %}
+    {% if dataset.search_path %}<div><b>search_path:</b> <code>{{ dataset.search_path }}</code></div>{% endif %}
     <div><b>PostgreSQL:</b> {{ env.server_version }}</div>
     <div><b>sysbench:</b> {{ env.sysbench_version }}</div>
     <div><b>tpcc SHA:</b> {{ env.tpcc_git_sha }}</div>
@@ -91,12 +94,16 @@
 
 {# ── 2. Headline table ──────────────────────────────────────────── #}
 <h2 id="headline"><span class="secno">2</span>Headline results</h2>
+<div class="table-wrap">
 <table>
+  <thead>
   <tr>
     <th>Threads</th><th>QPS (mean)</th><th>TPS (mean)</th>
     {% for p in percentiles %}<th>lat p{{ p }} (ms)</th>{% endfor %}
     <th>lat max (ms)</th><th>err/s</th><th>reconn/s</th><th>rep Δ QPS %</th>
   </tr>
+  </thead>
+  <tbody>
   {% for row in headline %}
   {% if row.qps is defined %}
   <tr>
@@ -110,6 +117,11 @@
     <td {% if row.variance_warn %}class="warn"{% endif %}>
       {{ "%.1f" | format(row.variance_pct) if row.variance_pct is not none else "—" }}</td>
   </tr>
+  {% elif row.no_samples %}
+  <tr>
+    <td>{{ row.threads }}</td>
+    <td class="warn" colspan="{{ 6 + percentiles | length }}">ran (exit 0) but no per-second samples were parsed — see raw log</td>
+  </tr>
   {% else %}
   <tr class="fail">
     <td>{{ row.threads }}</td>
@@ -117,7 +129,9 @@
   </tr>
   {% endif %}
   {% endfor %}
+  </tbody>
 </table>
+</div>
 <p class="subtle">rep Δ QPS % = (max − min) / mean across repetitions; highlighted when above
 {{ spec.report.variance_warn_pct }}% (report.variance_warn_pct).</p>
 
@@ -141,50 +155,96 @@
 <p class="subtle">No timeseries levels configured (report.timeseries_levels).</p>
 {% endif %}
 
-{# ── 6. Errors & limits ─────────────────────────────────────────── #}
-<h2 id="errors"><span class="secno">6</span>Errors &amp; limits</h2>
+{# ── 6. Storage I/O ─────────────────────────────────────────────── #}
+<h2 id="io"><span class="secno">6</span>Storage I/O (engine-side)</h2>
+{% if has_io %}
+<div class="note">
+  Logical I/O as PostgreSQL issued it (from <code>pg_stat_io</code> /
+  <code>pg_stat_database</code> / <code>pg_stat_wal</code>), in 8&nbsp;KB blocks, over the
+  full level (snapshots bracket the whole run incl. warm-up). This is an IOPS
+  <em>proxy</em>, not device IOPS — the OS page cache absorbs some reads and writes are
+  batched; cross-reference your provider's device metrics for the same UTC window.
+</div>
+{% if charts.io %}<div class="chart"><img alt="Engine-side I/O ops vs threads" src="{{ charts.io }}"></div>{% endif %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Threads</th>{% for key, label in io_columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for row in io_rows %}
+  <tr><td>{{ row.threads }}</td>
+    {% for key, label in io_columns %}
+    <td>{{ "{:,.1f}".format(row[key]) if row[key] is not none else "—" }}</td>
+    {% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="subtle">No engine-side I/O captured (capture.io_stats disabled, or the server
+predates <code>pg_stat_io</code> / the views were unavailable).</p>
+{% endif %}
+
+{# ── 7. Errors & limits ─────────────────────────────────────────── #}
+<h2 id="errors"><span class="secno">7</span>Errors &amp; limits</h2>
 {% if errors.failed_levels %}
 <h3>Failed levels</h3>
+<div class="table-wrap">
 <table>
-  <tr><th>Rep</th><th>Threads</th><th>First error lines (verbatim)</th></tr>
+  <thead><tr><th>Rep</th><th>Threads</th><th>First error lines (verbatim)</th></tr></thead>
+  <tbody>
   {% for l in errors.failed_levels %}
   <tr class="fail"><td>{{ l.rep }}</td><td>{{ l.threads }}</td>
     <td style="text-align:left"><pre style="margin:0">{{ l.error_excerpt or "no error captured" }}</pre></td></tr>
   {% endfor %}
+  </tbody>
 </table>
+</div>
 {% endif %}
 {% if errors.bad_interval_count %}
 <h3>Intervals with errors / reconnects ({{ errors.bad_interval_count }} total{% if errors.bad_interval_count > 200 %}, first 200 shown{% endif %})</h3>
+<div class="table-wrap">
 <table>
-  <tr><th>Rep</th><th>Threads</th><th>t (s)</th><th>err/s</th><th>reconn/s</th><th>QPS</th></tr>
+  <thead><tr><th>Rep</th><th>Threads</th><th>t (s)</th><th>err/s</th><th>reconn/s</th><th>QPS</th></tr></thead>
+  <tbody>
   {% for s in errors.bad_intervals %}
   <tr><td>{{ s.rep }}</td><td>{{ s.threads }}</td><td>{{ s.t_offset }}</td>
       <td>{{ s.err_s }}</td><td>{{ s.reconn_s }}</td><td>{{ "{:,.0f}".format(s.qps) }}</td></tr>
   {% endfor %}
+  </tbody>
 </table>
+</div>
 {% endif %}
 {% if not errors.failed_levels and not errors.bad_interval_count %}
 <p>No failed levels, no nonzero err/s or reconn/s intervals.</p>
 {% endif %}
 
-{# ── 7. Configuration appendix ──────────────────────────────────── #}
-<h2 id="config"><span class="secno">7</span>Configuration appendix</h2>
+{# ── 8. Configuration appendix ──────────────────────────────────── #}
+<h2 id="config"><span class="secno">8</span>Configuration appendix</h2>
 <h3>Key settings</h3>
-<table>
-  <tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr>
+<div class="table-wrap">
+<table class="settings cfg">
+  <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+  <tbody>
   {% for s in key_settings %}
   <tr><td>{{ s.name }}</td><td>{{ s.setting }}</td><td>{{ s.unit or "" }}</td><td>{{ s.source or "" }}</td></tr>
   {% endfor %}
+  </tbody>
 </table>
+</div>
 {% if all_settings %}
 <details>
   <summary>Full pg_settings dump ({{ all_settings | length }} rows)</summary>
-  <table>
-    <tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr>
+  <div class="table-wrap">
+  <table class="settings cfg">
+    <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+    <tbody>
     {% for s in all_settings %}
     <tr><td>{{ s.name }}</td><td>{{ s.setting }}</td><td>{{ s.unit or "" }}</td><td>{{ s.source or "" }}</td></tr>
     {% endfor %}
+    </tbody>
   </table>
+  </div>
 </details>
 {% else %}
 <p class="subtle">pg_settings capture disabled or unavailable for this run.</p>
@@ -195,6 +255,14 @@
 </details>
 </main>
 
+{% if pmm_links %}
+<section>
+  <h2>PMM — observation layer</h2>
+  <p>Server <code>{{ pmm_links.server }}</code>, scoped to this run's window:
+     <a href="{{ pmm_links.instances }}">PostgreSQL instances overview</a> ·
+     <a href="{{ pmm_links.qan }}">Query Analytics (QAN)</a></p>
+</section>
+{% endif %}
 <footer>Generated by {{ env.harness_version }} — run {{ manifest.run_id }}.</footer>
 </body>
 </html>

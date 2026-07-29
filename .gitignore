@@ -7,3 +7,16 @@ __pycache__/
 results/
 build/
 dist/
+
+# frontend build tooling (the *built* SPA under src/pgbench_webapp/static/spa is
+# committed so the package ships ready-to-serve assets — only node_modules is ignored)
+frontend/node_modules/
+frontend/.vite/
+
+# web app local data
+*.db
+*.db-*
+secrets.enc
+secret.key
+certs/
+frontend/*.tsbuildinfo

@@ -2,8 +2,10 @@
 """Fake psql for end-to-end tests.
 
 Knobs (env vars):
-  FAKE_PSQL_TABLES     expected-table count reported (default: all expected;
-                       also forced to "all" once the prepared marker exists)
+  FAKE_PSQL_TABLES     count of expected tables resolving on search_path
+                       (default: all; forced to all once the prepared marker exists)
+  FAKE_PSQL_WRONG_SCHEMA  schema name: simulate tables created off the search_path
+                       (resolvable count = 0, but found in this schema)
   FAKE_PSQL_FOREIGN    count of non-benchmark tables (default 0)
   FAKE_PSQL_ROWS       warehouse1 row count for tpcc scale checks (default 30)
   FAKE_PSQL_MAX_ID     max(id) of sbtest1 for oltp size checks (default 1000)
@@ -39,6 +41,45 @@ if not os.environ.get("PGPASSWORD"):
 
 low = sql.lower()
 
+if "pg_is_in_recovery" in low:
+    # Cluster Ops write probe: answer from the fake kube cluster's state so
+    # outages (pgkill/pod-delete/switchover/node-loss) are client-visible.
+    import json as _json
+    from datetime import datetime, timezone
+    st_dir = os.environ.get("FAKE_KUBE_STATE", "")
+    restart_s = float(os.environ.get("FAKE_KUBE_RESTART_S", "3"))
+    recreate_s = float(os.environ.get("FAKE_KUBE_RECREATE_S", "4"))
+    ip, down = "10.244.0.20", False
+    try:
+        st = _json.load(open(os.path.join(st_dir, "state.json")))
+        nowt = time.time()
+        leader = st.get("leader", "")
+
+        def _alive(name):
+            del_at = st.get("deleted", {}).get(name, 0)
+            if del_at and nowt < del_at + recreate_s:
+                return False
+            inst = next((i for i in st.get("instances", []) if i["name"] == name), None)
+            return not (inst and inst.get("node") in st.get("lost_nodes", []))
+
+        if st.get("killed_at") and nowt < st["killed_at"] + restart_s:
+            down = True
+        if not _alive(leader):
+            down = True
+        if st.get("elect_at") and nowt < st["elect_at"]:
+            down = True
+        inst = next((i for i in st.get("instances", []) if i["name"] == leader), None)
+        if inst:
+            ip = inst["ip"]
+    except Exception:
+        pass
+    if down:
+        print("psql: error: connection to server failed: Connection refused",
+              file=sys.stderr)
+        sys.exit(2)
+    print(datetime.now(timezone.utc).isoformat() + "|f|" + ip)
+    sys.exit(0)
+
 if "pg_sleep" in low:
     max_conn = os.environ.get("FAKE_PSQL_MAX_CONN")
     if max_conn:
@@ -66,36 +107,126 @@ def names_in_list(sql_text):
     return len(re.findall(r"'[^']*'", m.group(1))) if m else 0
 
 
+TABLE_RE = re.compile(
+    r"^(sbtest|warehouse|district|customer|history|orders|new_orders|"
+    r"order_line|stock|item)\d+$")
+
+
+def table_names(sql_text):
+    """All quoted table-like names referenced in the statement."""
+    return [s for s in re.findall(r"'([^']*)'", sql_text) if TABLE_RE.match(s)]
+
+
 state_dir = os.environ.get("FAKE_PSQL_STATE", "")
 prepared = state_dir and os.path.exists(os.path.join(state_dir, "prepared"))
+wrong_schema = os.environ.get("FAKE_PSQL_WRONG_SCHEMA")
 
-if "select version()" in low:
+if low == "select 1":
+    print("1")
+elif "select version()" in low:
     print("PostgreSQL 16.4 on x86_64-pc-linux-gnu, compiled by gcc 13.2.0, 64-bit")
 elif "show server_version" in low:
     print("16.4")
 elif "show max_connections" in low:
     print("500")
+elif "show shared_preload_libraries" in low:
+    print(os.environ.get("FAKE_PSQL_SPL", "pg_stat_statements"))
+elif "show search_path" in low:
+    print('"$user", public')
 elif "show pool_mode" in low:
     print('ERROR:  unrecognized configuration parameter "pool_mode"', file=sys.stderr)
     sys.exit(1)
 elif "pg_extension" in low:
     print("0")
-elif "information_schema.tables" in low and "not in" in low:
-    print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
-elif "information_schema.tables" in low:
-    if prepared:
-        print(names_in_list(low))
+elif "to_regclass" in low and "values" in low:
+    # count of expected tables resolving on the search_path
+    names = table_names(sql)
+    if wrong_schema:
+        print("0")
+    elif prepared:
+        print(len(names))
     else:
-        print(os.environ.get("FAKE_PSQL_TABLES", str(names_in_list(low))))
-elif "information_schema.columns" in low:
+        print(os.environ.get("FAKE_PSQL_TABLES", str(len(names))))
+elif "pg_tables" in low and "not in" in low:
+    print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
+elif "pg_tables" in low:
+    # find expected tables in ANY schema
+    if wrong_schema:
+        for n in table_names(sql):
+            print(f"{wrong_schema}.{n}")
+elif "pg_attribute" in low or "information_schema.columns" in low:
     print(os.environ.get("FAKE_PSQL_CANARY_COLS", str(names_in_list(low))))
 elif "max(id) from sbtest1" in low:
     print(os.environ.get("FAKE_PSQL_MAX_ID", "1000"))
+elif "pg_stat_activity" in low:
+    # live PG sampler: cumulative counters grow with wall-clock so deltas > 0.
+    import json as _json
+    n = int(time.time())
+    print(_json.dumps({
+        "db_epoch": time.time(),
+        "active": 8, "total_conn": 20,
+        "blocked": int(os.environ.get("FAKE_PSQL_BLOCKED", "2")),
+        "lock_wait_max_s": float(os.environ.get("FAKE_PSQL_LOCK_WAIT", "0.4")),
+        "xact_commit": n * 90, "xact_rollback": n * 10, "xacts": n * 100,
+        "blks_hit": n * 9000, "blks_read": n * 100, "wal_bytes": n * 500000,
+        "tup_returned": n * 5000, "tup_fetched": n * 4000, "tup_inserted": n * 300,
+        "tup_updated": n * 200, "tup_deleted": n * 50,
+        "deadlocks": 0, "conflicts": 0, "temp_bytes": n * 1000, "temp_files": n * 1,
+        "ckpt_timed": n // 10, "ckpt_req": 0, "ckpt_write_ms": n * 5, "ckpt_sync_ms": n * 1,
+        "bgw_clean": n * 20, "bgw_alloc": n * 100, "repl_replay_lag": None}))
+elif "from pg_database where datname" in low:
+    # database existence check for prepare create/recreate
+    print(os.environ.get("FAKE_PSQL_DB_EXISTS", "1"))
+elif low.startswith("create database") or low.startswith("drop database") or "pg_terminate_backend" in low:
+    pass  # admin op succeeds silently
+elif low.startswith("create extension"):
+    pass  # pg_stat_monitor enable succeeds
+elif low.startswith("drop table"):
+    pass  # table drop succeeds
 elif "pg_database_size" in low:
     print("1073741824")
 elif "pg_stat_bgwriter" in low:
     print('{"checkpoints_timed":12,"checkpoints_req":3,"buffers_clean":4567}')
-elif "pg_stat_statements" in low:
+elif "pg_stat_io" in low:
+    # monotonic-ish counters driven by a per-state call counter
+    state = os.environ.get("FAKE_PSQL_STATE", "")
+    n = 0
+    if state:
+        cf = os.path.join(state, "io_counter")
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + 1))
+    base = n * 1000
+    print('{"reads": %d, "writes": %d, "extends": %d, "fsyncs": %d, "hits": %d}'
+          % (base, base // 2, base // 10, base // 20, base * 9))
+elif "pg_stat_database" in low:
+    state = os.environ.get("FAKE_PSQL_STATE", "")
+    n = 0
+    if state:
+        cf = os.path.join(state, "db_counter")
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + 1))
+    print('{"blks_read": %d, "blks_hit": %d}' % (n * 500, n * 4500))
+elif "pg_stat_wal" in low:
+    state = os.environ.get("FAKE_PSQL_STATE", "")
+    n = 0
+    if state:
+        cf = os.path.join(state, "wal_counter")
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + 1))
+    print('{"wal_records": %d, "wal_bytes": %d, "wal_fpi": %d}' % (n * 2000, n * 8000000, n * 50))
+elif "pg_stat_monitor" in low:
     print("[]")
 elif "copy (select name, setting, unit, source from pg_settings" in low:
     print("name,setting,unit,source")

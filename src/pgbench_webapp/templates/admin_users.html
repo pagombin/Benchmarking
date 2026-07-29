@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Users — pgbench-harness{% endblock %}
+{% block content %}
+<h1>Users &amp; roles</h1>
+<div class="card">
+  <table>
+    <thead><tr><th>User</th><th>Role</th><th>Disabled</th><th>Created (UTC)</th></tr></thead>
+    <tbody>
+    {% for u in users %}
+    <tr><td>{{ u.username }}</td><td><span class="role role-{{ u.role }}">{{ u.role }}</span></td>
+      <td>{{ 'yes' if u.disabled else 'no' }}</td><td>{{ u.created_utc }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="card">
+  <h2>Add user</h2>
+  <form method="post" action="/admin/users" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label>Username <input name="username" required></label>
+    <label>Password <input name="password" type="password" required></label>
+    <label>Role <select name="role">
+      <option value="viewer">viewer</option><option value="operator">operator</option>
+      <option value="admin">admin</option></select></label>
+    <button class="primary">Create</button>
+  </form>
+  <p class="muted">viewer = read-only · operator = start/stop/configure · admin = everything.</p>
+</div>
+{% endblock %}

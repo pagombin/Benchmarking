@@ -19,7 +19,7 @@ def test_valid_spec_parses() -> None:
     assert spec.run.edition == "advanced"
     assert spec.sweep.threads == (1, 4)
     assert spec.sweep.repetitions == 2
-    assert spec.capture.pg_stat_statements == "auto"
+    assert spec.capture.pg_stat_monitor == "auto"
     assert spec.report.percentiles == (50, 95, 99)
 
 
@@ -50,7 +50,7 @@ def test_defaults_applied() -> None:
     (lambda d: d["sweep"].__setitem__("repetitions", 0), "repetitions"),
     (lambda d: d["workload"].__setitem__("type", "ycsb"), "workload.type"),
     (lambda d: d["report"].__setitem__("timeseries_levels", [3]), "timeseries_levels"),
-    (lambda d: d["capture"].__setitem__("pg_stat_statements", "maybe"), "pg_stat_statements"),
+    (lambda d: d["capture"].__setitem__("pg_stat_monitor", "maybe"), "pg_stat_monitor"),
 ], ids=["unknown-section", "unknown-key", "missing-label", "bad-edition",
         "missing-password-env", "inline-password", "empty-threads", "non-int-threads",
         "warmup-ge-duration", "zero-reps", "bad-workload", "ts-level-not-in-ladder",
@@ -106,3 +106,26 @@ def test_load_spec_roundtrip(tmp_path: Path) -> None:
     p.write_text(yaml.safe_dump(make_spec_doc()), encoding="utf-8")
     spec = load_spec(p)
     assert spec.target.host == "db.example.invalid"
+
+
+def test_pmm_section_parses_with_defaults() -> None:
+    doc = make_spec_doc()
+    doc["pmm"] = {"server_host": "pmm.example.com"}
+    spec = parse_spec(doc)
+    assert spec.pmm is not None
+    assert spec.pmm.server_host == "pmm.example.com"
+    assert spec.pmm.service_name == ""
+    # specs without a pmm section behave exactly as before
+    assert parse_spec(make_spec_doc()).pmm is None
+
+
+@pytest.mark.parametrize("pmm_doc", [
+    {"server_host": "x", "token": "oops"},        # no secrets in specs, ever
+    {"server_host": "   "},                       # empty host
+    {"service_name": "svc"},                      # host is required
+], ids=["unknown-key", "blank-host", "missing-host"])
+def test_pmm_section_invalid(pmm_doc) -> None:
+    doc = make_spec_doc()
+    doc["pmm"] = pmm_doc
+    with pytest.raises(SpecError):
+        parse_spec(doc)

@@ -1,0 +1,53 @@
+[Unit]
+Description=pgbench-harness queue worker (runs sysbench / psql jobs)
+Documentation=file:///opt/pgbench-harness/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgbench
+Group=pgbench
+WorkingDirectory=/opt/pgbench-harness
+EnvironmentFile=/etc/pgbench-harness.env
+# Operator-managed secrets (e.g. PGB_PMM_TOKEN for ops pmm-enable). Created
+# 0600 root:root by deploy.sh, never overwritten on update; systemd reads it
+# as root before dropping to the pgbench user. '-' = optional, so a missing
+# file never blocks the worker from starting.
+EnvironmentFile=-/etc/pgbench-harness.secrets.env
+ExecStart=/opt/pgbench-harness/venv/bin/pgbench-worker
+Restart=on-failure
+RestartSec=3
+# Benchmark runs can be long; give the worker time to finish/cleanup a job
+# on stop before it is killed.
+TimeoutStopSec=120
+KillSignal=SIGTERM
+# Only the worker process itself is killed on stop/restart (deploys!): the
+# benchmark children are their own process groups and keep running through a
+# worker restart — the worker re-attaches to them at startup (see
+# worker.reconcile_startup). A deliberate Stop from the UI still kills the
+# whole group via killpg.
+KillMode=process
+
+# --- Hardening ---
+# The worker spawns external processes (sysbench, psql, the pgbench-harness
+# CLI) and reads the sysbench-tpcc checkout, so it is deliberately less
+# locked-down than the web unit: PrivateTmp is OFF (some tools write to a
+# shared /tmp), and ReadWritePaths includes the data dir + log dir. We keep
+# the rest of the filesystem read-only via ProtectSystem=strict.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=false
+UMask=0077
+ReadWritePaths=/var/lib/pgbench-harness /var/log/pgbench-harness
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target

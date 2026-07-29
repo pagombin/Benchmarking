@@ -1,0 +1,202 @@
+"""Thin adapter onto the harness library — the web tier calls these instead of
+duplicating any parsing/validation/report logic. Pure functions, no I/O state.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
+
+import yaml
+
+from pgbench_harness import report as _report
+from pgbench_harness import report_soak as _report_soak
+from pgbench_harness import runner, sysbench
+from pgbench_harness.compare import compare_runs
+from pgbench_harness.errors import HarnessError, SpecError
+from pgbench_harness.spec import Spec, parse_spec
+
+
+def validate_yaml(spec_yaml: str) -> dict[str, Any]:
+    """Validate a spec string via the harness validator (the single source of rules)."""
+    try:
+        doc = yaml.safe_load(spec_yaml)
+    except yaml.YAMLError as exc:
+        return {"ok": False, "error": f"invalid YAML: {exc}"}
+    try:
+        spec = parse_spec(doc)
+    except SpecError as exc:
+        return {"ok": False, "error": str(exc), "hint": getattr(exc, "hint", "")}
+    if spec.is_soak:
+        mode = "soak"
+    elif spec.is_suite:
+        mode = "suite"
+    elif spec.sweep is not None:
+        mode = "sweep"
+    elif spec.device_probe is not None and spec.device_probe.pack:
+        mode = "evidence-pack"
+    else:
+        mode = "device-probe"
+    return {"ok": True, "mode": mode, "label": spec.run.label,
+            "workload": spec.workload.type,
+            "cluster_aware": spec.cluster is not None,
+            "probe_armed": bool(spec.device_probe
+                                and spec.device_probe.allow_device_probe)}
+
+
+def _spec_from_yaml(spec_yaml: str) -> Spec:
+    return parse_spec(yaml.safe_load(spec_yaml))
+
+
+def _hms(seconds: float) -> str:
+    """Compact m:ss / h:mm:ss for a budget breakdown."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def dry_run(spec_yaml: str) -> dict[str, Any]:
+    """Exact planned sysbench commands + wall-clock budget (mirrors `--dry-run`).
+
+    Every mode returns ``budget_breakdown``: a one-line explanation of HOW the
+    wall-clock budget is built from the configured settings. For a sweep the
+    per-level ``duration_s`` is multiplied by the number of thread levels — so a
+    "5 minute" duration over four levels is a ~21 minute run — and the UI shows
+    this so the configured duration never reads as ignored."""
+    spec = _spec_from_yaml(spec_yaml)
+    if spec.is_suite:
+        from pgbench_harness.runner import print_suite_dry_run
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_suite_dry_run(spec)
+        lines = buf.getvalue().splitlines()
+        n = sum(1 for ln in lines if ln.startswith("["))
+        assert spec.suite is not None
+        cd = spec.suite.cooldown_s
+        return {"mode": "suite",
+                "budget_s": n * spec.suite.duration_s
+                            + max(0, n - 1) * cd,
+                "budget_breakdown":
+                    f"{n} segment{'s' if n != 1 else ''} × {_hms(spec.suite.duration_s)} each"
+                    + (f" + {n - 1}×{_hms(cd)} stabilization" if n > 1 and cd else ""),
+                "commands": lines}
+    if spec.device_probe is not None and spec.sweep is None and spec.soak is None:
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        if spec.device_probe.pack:
+            from pgbench_harness.evidencepack import PACK_VARIANTS, run_evidence_pack
+            with contextlib.redirect_stdout(buf):
+                run_evidence_pack(spec, Path("."), dry_run=True)
+            nvar = len(PACK_VARIANTS)
+            return {"mode": "evidence-pack",
+                    "budget_s": nvar * spec.device_probe.duration_s,
+                    "budget_breakdown":
+                        f"{nvar} probe variants × {_hms(spec.device_probe.duration_s)} each",
+                    "commands": buf.getvalue().splitlines()}
+        from pgbench_harness.deviceprobe import run_device_probe
+        with contextlib.redirect_stdout(buf):
+            run_device_probe(spec, Path("."), dry_run=True)
+        return {"mode": "device-probe",
+                "budget_s": spec.device_probe.duration_s,
+                "budget_breakdown": f"single {_hms(spec.device_probe.duration_s)} probe",
+                "commands": buf.getvalue().splitlines()}
+    if spec.is_soak:
+        assert spec.soak is not None
+        cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
+        return {"mode": "soak", "budget_s": spec.soak.duration_s,
+                "budget_breakdown":
+                    f"single {_hms(spec.soak.duration_s)} window at "
+                    f"{spec.soak.threads} threads",
+                "commands": [cmd.display()]}
+    assert spec.sweep is not None
+    sw = spec.sweep
+    nlev = len(sw.threads)
+    n = nlev * sw.repetitions
+    cmds = []
+    for rep in range(1, sw.repetitions + 1):
+        for threads in sw.threads:
+            cmds.append(f"[rep {rep}, {threads} threads] "
+                        + sysbench.build_run_command(spec, threads).display())
+    breakdown = (f"{nlev} thread level{'s' if nlev != 1 else ''}"
+                 + (f" × {sw.repetitions} reps" if sw.repetitions > 1 else "")
+                 + f" × {_hms(sw.duration_s)} each"
+                 + (f" + {n - 1}×{_hms(sw.cooldown_s)} cooldown"
+                    if n > 1 and sw.cooldown_s else ""))
+    return {"mode": "sweep", "budget_s": int(runner.planned_budget_s(spec)),
+            "budget_breakdown": breakdown, "commands": cmds}
+
+
+def generate_report(run_dir: Path) -> Path:
+    """(Re)generate the report for a run dir (mode-aware), returning the file path."""
+    mode = _run_mode(run_dir)
+    if mode == "soak" or (run_dir / "parsed" / "soak_summary.json").exists():
+        return _report_soak.generate_soak_report(run_dir)
+    if mode in ("suite", "probe"):
+        # same dispatch as the CLI's cmd_report — the sweep renderer asserts
+        # spec.sweep and 500'd on suite/device-probe runs
+        from pgbench_harness import report_evidence
+        return report_evidence.generate_evidence_report(run_dir)
+    if mode == "pack":
+        # the pack narrative is written by the orchestrator; nothing to regen
+        p = run_dir / "report.html"
+        if p.exists():
+            return p
+        from pgbench_harness.errors import ReportError
+        raise ReportError("evidence pack has no report.html — the pack run "
+                          "may have died before finalize")
+    return _report.generate_report(run_dir)
+
+
+def _run_mode(run_dir: Path) -> str:
+    import json
+    try:
+        return str(json.loads((run_dir / "manifest.json").read_text())
+                   .get("mode", ""))
+    except (OSError, ValueError):
+        return ""
+
+
+def report_filename(run_dir: Path) -> str:
+    return "soak_report.html" if _run_mode(run_dir) == "soak" else "report.html"
+
+
+def compare(run_dirs: list[Path], out_path: Path) -> Path:
+    """Dispatch to the sweep or soak comparison; refuses mixed run types."""
+    return compare_runs(run_dirs, out_path)
+
+
+def mark_event(run_dir: Path, etype: str, label: str, note: str,
+               at_s: Optional[float] = None) -> None:
+    """Stamp a timeline event. ``at_s`` (offset seconds from the soak start) lets an
+    operator annotate a specific point on the chart; without it the event is stamped
+    at 'now' (the live-cockpit behaviour)."""
+    runner.cmd_mark(run_dir, etype, label, note, at_s=at_s)
+
+
+def interactive_timeseries(run_dir: Path) -> Optional[dict[str, Any]]:
+    """uPlot-ready decimated soak series + markers for the in-app report (live or
+    finished). None when the run has no soak timeline to plot."""
+    return _report_soak.interactive_payload(run_dir)
+
+
+def prepare_stats(spec_yaml: str, results_dir: Path) -> Optional[dict[str, Any]]:
+    """Load-metrics a prepare job recorded (wall time, DB size, MB/s), or None.
+
+    prepare writes one ``prepare_<host>-<db>.json`` per (host, database) under
+    results/; resolve it from the job's spec. Best-effort.
+    """
+    import json
+    try:
+        spec = _spec_from_yaml(spec_yaml)
+        p = runner.prepare_stats_path(spec, results_dir)
+        if p.exists():
+            return dict(json.loads(p.read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+__all__ = ["validate_yaml", "dry_run", "generate_report", "report_filename", "compare",
+           "mark_event", "HarnessError"]
