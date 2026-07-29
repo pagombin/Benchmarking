@@ -669,7 +669,7 @@ def test_evidence_pack_e2e(iops_env, monkeypatch):
     del doc["sweep"]
     doc["cluster"] = {"cr_name": "cluster1"}
     doc["device_probe"] = {"allow_device_probe": True, "pack": True,
-                           "duration_s": 2, "file_total_size_gb": 1,
+                           "duration_s": 3, "file_total_size_gb": 1,
                            "file_num": 8, "threads": 4}
     spec_path = iops_env / "pack.yaml"
     spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
@@ -714,7 +714,7 @@ def test_evidence_pack_continues_past_a_failed_child(iops_env, monkeypatch):
     del doc["sweep"]
     doc["cluster"] = {"cr_name": "cluster1"}
     doc["device_probe"] = {"allow_device_probe": True, "pack": True,
-                           "duration_s": 2, "file_total_size_gb": 1,
+                           "duration_s": 3, "file_total_size_gb": 1,
                            "file_num": 8, "threads": 4}
     spec_path = iops_env / "pack.yaml"
     spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
