@@ -3,37 +3,80 @@
 `pgbench-harness` is a repeatable PostgreSQL benchmarking harness for
 DigitalOcean's managed PostgreSQL editions (Standard and Advanced). A single
 YAML spec fully defines a run; the harness drives **sysbench** (including
-[sysbench-tpcc](https://github.com/Percona-Lab/sysbench-tpcc)), captures the
-database/server environment, and produces a **self-contained HTML report**
-per run plus cross-run comparison reports.
+[sysbench-tpcc](https://github.com/Percona-Lab/sysbench-tpcc)) and
+**pgbench**, captures the database/server environment, and produces a
+**self-contained HTML report** per run plus cross-run comparison reports.
+Around the CLI engine sit a self-hosted **web console** (live run cockpit,
+history, compare, RBAC — see [Web application](#web-application-self-hosted-ui)),
+an **IOPS ceiling verification framework** with device-level evidence
+bundles, and a **Cluster Ops** module for operating Kubernetes-hosted
+Percona PG clusters (config, backups, failover drills, diagnostics, health).
 
 ```
-pgbench-harness validate    --spec run.yaml        # lint a spec without connecting (CI-friendly)
-pgbench-harness doctor                             # version, git SHA/remote, sysbench/psql availability
-pgbench-harness preflight   --spec run.yaml        # connectivity, version, limits checks
-pgbench-harness prepare     --spec run.yaml        # load the dataset (idempotent, records load metrics)
-pgbench-harness run         --spec run.yaml [--prepare]   # steady-state thread sweep + report
-pgbench-harness soak        --spec soak.yaml [--prepare]  # resilience: fixed load through a failover/scale event
-pgbench-harness mark        --run-dir results/<run_id> --type failover --label "..."  # stamp an event on a soak
-pgbench-harness report      --run-dir results/<run_id>/   # regenerate the HTML report (sweep or soak)
-pgbench-harness compare     --runs <run_id> <run_id> --out compare.html
-pgbench-harness list        [--results-dir results/]
+pgbench-harness validate      --spec run.yaml        # lint a spec without connecting (CI-friendly)
+pgbench-harness doctor                               # version, git SHA/remote, sysbench/psql availability
+pgbench-harness preflight     --spec run.yaml        # connectivity, version, limits checks
+pgbench-harness prepare       --spec run.yaml        # load the dataset (idempotent, records load metrics)
+pgbench-harness run           --spec run.yaml [--prepare]   # steady-state thread sweep + report
+pgbench-harness soak          --spec soak.yaml [--prepare]  # resilience: fixed load through a failover/scale
+                                                            # event; or knee finder via soak.rate_steps
+pgbench-harness suite         --spec suite.yaml [--prepare] # IOPS evidentiary matrix: 4 OLTP workloads
+                                                            # + pgbench, one consolidated bundle
+pgbench-harness device-probe  --spec probe.yaml      # sysbench fileio against the pgdata volume (TEST
+                                                     # CLUSTERS ONLY; requires allow_device_probe: true)
+pgbench-harness evidence-pack --spec pack.yaml       # one-click core-four probe pack + narrative
+pgbench-harness mark          --run-dir results/<run_id> --type failover --label "..."  # stamp an event
+pgbench-harness report        --run-dir results/<run_id>/   # regenerate the HTML report (any mode)
+pgbench-harness compare       --runs <run_id> <run_id> --out compare.html   # sweep-vs-sweep or soak-vs-soak
+pgbench-harness list          [--results-dir results/]
 ```
 
-`--prepare` on `run`/`soak` loads the dataset first if it's missing (prepare-then-run in
-one command). A long `soak` can be stopped with Ctrl-C (or `kill`/SIGTERM) and still
-finalizes a partial resilience report.
+`--prepare` on `run`/`soak`/`suite` loads the dataset first if it's missing
+(prepare-then-run in one command). A long `soak` can be stopped with Ctrl-C (or
+`kill`/SIGTERM) and still finalizes a partial resilience report.
 
-There are two run modes, chosen by the spec: a **`sweep`** section → steady-state
-thread sweep (`run`); a **`soak`** section → fixed-concurrency resilience run
-(`soak`). They are mutually exclusive. `run` re-runs preflight automatically and
-`report` exists separately so reports can be regenerated after template or
-parser improvements **without re-running benchmarks** (raw sysbench logs are
-the source of truth; `parsed/` is rebuilt from them every time).
+The run mode is chosen by the spec — exactly one of these sections:
+
+| spec section    | command        | what it measures |
+|-----------------|----------------|------------------|
+| `sweep:`        | `run`          | steady-state thread-ladder sweep |
+| `soak:`         | `soak`         | fixed concurrency through a failover/scale event; with `rate_steps` it becomes the IOPS **knee finder** |
+| `suite:`        | `suite`        | the storage-team evidentiary matrix (4 sysbench OLTP workloads + pgbench TPC-B / SELECT-only × thread ladder) in one bundle |
+| `device_probe:` | `device-probe` | sysbench **fileio** on the pgdata volume from a pod on the primary's node — the definitive device-ceiling test |
+| `device_probe:` + `pack: true` | `evidence-pack` | the core four probes (rndrd 16K/8K, rndwr 16K, rndwr under replication, all O_DIRECT) as one job + consolidated narrative |
+
+`run` re-runs preflight automatically and `report` exists separately so reports
+can be regenerated after template or parser improvements **without re-running
+benchmarks** (raw sysbench logs are the source of truth; `parsed/` is rebuilt
+from them every time — regenerating also upgrades older runs to the current
+artifact schema, e.g. the `t_wall` sample column).
 
 ---
 
-## Install on a fresh Ubuntu 24.04 Droplet
+## Install
+
+There are two ways to install, and they compose:
+
+1. **Full stack (recommended)** — web console + worker + CLI as systemd
+   services with TLS, on a fresh Ubuntu droplet:
+
+   ```bash
+   git clone <this-repo> pg-bench-harness && cd pg-bench-harness
+   sudo ./deploy.sh            # fresh install; later: sudo ./deploy.sh --update
+   ```
+
+   `deploy.sh` installs system packages (sysbench, psql, kubectl), creates the
+   venv, sets up the `pgbench-web` and `pgbench-worker` systemd services, mints
+   a self-signed cert, creates the initial admin user, and prints the console
+   URL (`https://<public-ip>:8443/ui`), the installed git SHA, the cert
+   fingerprint, and the firewall rule to open. Data lives under
+   `/var/lib/pgbench-harness`; updates never touch it. Full operational docs
+   (cert trust, firewall, backup, RBAC, troubleshooting, kubeconfig
+   registration) are in **[OPERATIONS.md](OPERATIONS.md)**.
+
+2. **CLI only** — the harness engine standalone, below.
+
+### CLI-only install on a fresh Ubuntu 24.04 Droplet
 
 ```bash
 # 1. System packages: psql client, sysbench (Ubuntu's sysbench includes the
@@ -123,12 +166,19 @@ target:
 
 workload:
   type: tpcc                              # required; tpcc | oltp_read_only |
-                                          #           oltp_read_write | oltp_write_only
+                                          #           oltp_read_write | oltp_write_only | io_stress
   tpcc_path: /opt/sysbench-tpcc           # required when type=tpcc
   tables: 10                              # required
   scale: 30                               # required for tpcc
   # table_size: 10000                     # required for oltp_* types
   extra_args: ["--use_fk=0", "--trx_level=RC"]   # optional; passed through verbatim
+  # io_stress only (cache-defeating storage pressure):
+  # dataset_gb: 64                        # primary size control (table_size derived from it);
+  #                                       # use >= 2x instance RAM so reads miss the caches
+  # mix: read_heavy                       # picks the stock lua mix
+  # rand_type: uniform                    # key distribution (uniform defeats hot-set caching)
+
+# ---- pick EXACTLY ONE mode section: sweep / soak / suite / device_probe ----
 
 sweep:
   threads: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]  # required
@@ -138,6 +188,66 @@ sweep:
                                           # aggregate — no separate warmup process runs
   cooldown_s: 120                         # optional (default 0); sleep between levels
   repetitions: 2                          # optional (default 1); full ladder repeated N times
+
+soak:                                     # fixed-concurrency resilience run (see soak section below)
+  threads: 64                             # required; held constant for the whole window
+  duration_s: 14400                       # required; total window
+  tolerate_errors: true                   # default true; supervisor relaunches sysbench through
+                                          # outages so an event can't truncate the test
+  report_interval_s: 1                    # default 1
+  max_relaunches: 50                      # default 50; supervisor safety cap
+  # Knee-finder variant: offered load climbs through rate steps (sysbench
+  # --rate, txn/s; 0 = unthrottled) while the device series shows what the
+  # volume actually serves. Each step start is stamped as an event.
+  # rate_steps: [1000, 2000, 4000, 8000, 0]
+  # step_duration_s: 300
+
+suite:                                    # IOPS evidentiary matrix (storage-team parity)
+  duration_s: 300                         # required; per cell
+  threads: [1, 2, 4, 8, 16, 32]           # default shown; ladder applied to every workload
+  warmup_s: 10                            # default 10
+  cooldown_s: 30                          # default 30
+  pgbench: true                           # default true; adds pgbench TPC-B + SELECT-only cells
+  pgbench_scale: 1000                     # default 1000
+
+device_probe:                             # sysbench fileio on the pgdata volume — TEST CLUSTERS ONLY
+  allow_device_probe: true                # required true; the probe refuses to run without it
+  file_num: 128                           # default 128
+  file_total_size_gb: 100                 # default 100
+  io_mode: async                          # default async; async | sync
+  async_backlog: 128                      # default 128; sysbench --file-async-backlog
+  test_mode: rndrw                        # default rndrw; rndrw | rndrd | rndwr
+  fsync_freq: 0                           # default 0 = fsync only at end (device truth)
+  threads: 16                             # default 16
+  duration_s: 300                         # default 300
+  block_size_kb: 16                       # default 16 (Postgres-ish random IO)
+  keep_files: false                       # true = reuse prepared test files across probe runs
+                                          # (skips the multi-minute prepare when iterating)
+  direct_io: false                        # true = O_DIRECT, bypass the node page cache so
+                                          # sysbench's own numbers agree with the device series
+  pack: false                             # true = evidence pack: core four probes + narrative
+                                          # (run with `evidence-pack` instead of `device-probe`)
+  image: perconalab/sysbench:latest       # default shown
+
+# ---- optional sections usable with any mode ----
+
+cluster:                                  # makes the run CLUSTER-AWARE (needs $KUBECONFIG exported):
+  cr_name: my-cluster                     # required; storage identity (PVC -> PV -> StorageClass)
+  namespace: percona                      # default percona;   is captured and the pgdata block
+  cr_kind: perconapgcluster               # default shown;     device is sampled at 1s during load
+  context: ""                             # optional kube context
+  # NEVER a kubeconfig path or token here — those keys are rejected; the
+  # kubeconfig reaches the process as $KUBECONFIG only.
+
+limits:                                   # reference IOPS limits the verdict is judged against
+  standard_iops: 10000                    # defaults shown; recorded with the evidence,
+  burst_iops: 15000                       # never hardcoded in analysis
+  target_iops: 40000
+  tolerance_pct: 10
+
+pmm:                                      # PMM observation-layer linkage (address only, no token)
+  server_host: pmm.example.com            # report deep-links into PMM scoped to the run window
+  service_name: ""                        # optional: pre-scope QAN to one service
 
 capture:                                  # whole section optional
   pg_settings: true                       # default true; full pg_settings CSV dump
@@ -149,12 +259,20 @@ capture:                                  # whole section optional
                                           # pg_stat_wal snapshots -> per-level engine-side
                                           # I/O rates (IOPS proxy) in the report & summary
   histogram: true                         # default true; pass --histogram to sysbench
+  live_pg: true                           # default true; background engine-side sampler during
+  live_pg_interval_s: 5                   # the run -> parsed/pg_timeseries.csv
 
 report:                                   # whole section optional
   percentiles: [50, 95, 99]               # default [50, 95, 99]
   timeseries_levels: [8, 64, 256]         # default []; thread levels that get
                                           # QPS-over-time charts (must be in sweep.threads)
   variance_warn_pct: 10                   # default 10; highlight rep-to-rep QPS delta above this
+  # soak-mode analysis knobs:
+  # baseline_window_s: [300, 600]         # default: auto pre-event baseline
+  # recovery_threshold_pct: 95            # TTR threshold (% of baseline, sustained)
+  # full_recovery_pct: 100                # cache re-warm target
+  # recovery_hold_s: 10                   # how long recovery must hold to latch
+  # latency_spike_mult: 2.0               # p99 spike flagging multiplier
 ```
 
 ### Secrets policy
@@ -257,19 +375,37 @@ results/<run_id>/
   manifest.json          # status, timings, per-level outcomes, failure details
   harness.log            # full harness log for the run
   spec.yaml              # verbatim copy of the input spec (password_env NAME only)
+  events.jsonl           # timestamped event marks (failover marks, suite cells,
+                         # rate steps, fileio windows) — one JSON object per line
   env/
     pg_settings.csv      # full dump: name,setting,unit,source
     server_version.txt   sysbench_version.txt   tpcc_git_sha.txt
     harness_git_sha.txt  host_info.txt          spec.yaml
+    storage_identity.json    # cluster-aware runs: PVC -> PV -> StorageClass ->
+                             # placement, incl. the backend volume handle
+    prepare_stats.json       # data-load metrics attached from the last prepare
   raw/rep<r>_t<NNN>.log              # live-streamed sysbench output
   raw/rep<r>_t<NNN>_bgwriter.json    # pre/post pg_stat_bgwriter snapshots
   raw/rep<r>_t<NNN>_iostats.json     # pre/post pg_stat_io/database/wal snapshots
   parsed/samples.csv     # tidy per-second samples: run_id, rep, threads, t_offset,
-                         # tps, qps, r, w, o, lat_p99, err_s, reconn_s
+                         # tps, qps, r, w, o, lat_p99, err_s, reconn_s, seg,
+                         # t_wall (seconds since RUN start — one continuous
+                         # timeline across all ladder levels)
   parsed/summary.json    # per (rep, threads) steady-state aggregates — the
                          # contract `compare` consumes
+  parsed/pg_timeseries.csv   # live engine-side sampler (capture.live_pg)
+  parsed/device_io.csv       # cluster-aware runs: 1s device IOPS/MB/s/queue-depth
+                             # series from /proc/diskstats in the primary pod
+  parsed/fileio_summary.json # device-probe runs: parsed sysbench fileio results
+  parsed/soak_timeseries.csv parsed/soak_summary.json   # soak runs
+  evidence.json          # IOPS runs: machine-readable everything (verdict,
+                         # identity, series stats, limits)
   report.html            # self-contained report (charts embedded as base64 PNG)
+  pack_report.md         # evidence-pack runs: consolidated storage-team narrative
 ```
+
+Regenerating a report (`pgbench-harness report --run-dir …`) rebuilds all of
+`parsed/` from the raw logs, upgrading older runs to the current schema.
 
 ## Storage I/O metrics (IOPS proxy)
 
@@ -304,8 +440,17 @@ pgbench-harness compare \
   --out standard-vs-advanced-8c32g.html
 ```
 
-The comparison report contains:
+The comparison report is built for cross-provider comparisons (e.g. DO
+Advanced vs Aiven) where "are these numbers even comparable?" matters as much
+as the numbers. It contains:
 
+- **Environment & identity cards** per run: target host, server version,
+  edition/size, workload geometry, mode config, run window, sysbench version —
+  the numbers sit next to what produced them;
+- a **comparability (fairness) check**: workload geometry, thread ladder,
+  durations, sysbench version, and PostgreSQL major version are compared
+  field-by-field — matching runs get a "Fair comparison ✓" badge, mismatches
+  get a loud warning banner naming exactly which knobs differ;
 - a **per-run KPI band** and a "winner" callout (highest peak QPS and its margin
   over the runner-up);
 - overlaid **QPS**, **TPS** and **p99-latency** vs-threads charts (one colour per
@@ -316,11 +461,21 @@ The comparison report contains:
   for "tuned vs default");
 - a side-by-side headline table over the **union** of thread ladders (gaps render
   as "—"; a coloured Δ column for two-run compares);
-- a **settings-diff** table showing only `pg_settings` rows that differ, with the
-  curated key settings listed first.
+- a **key-settings table** (always shown, curated list) plus a collapsible
+  **full `pg_settings` appendix** — the union of every setting across all runs,
+  with differing rows highlighted, so nothing about the configurations is
+  hidden from the report.
+
+**Soak-vs-soak comparison**: pointing `compare` at two or more soak runs
+produces a resilience comparison instead — TPS, p99, and error-rate overlay
+timelines, per-event disruption metrics side by side, and (for two-run
+compares) explicit deltas — with the same environment cards, fairness check,
+and settings sections.
 
 `--runs` accepts run ids under `--results-dir` or direct paths to run
 directories, and runs with duplicate labels are disambiguated automatically.
+In the web console, Compare is available from the nav and the resulting report
+is downloadable as a single self-contained file.
 
 ## Resilience / soak mode (failover & scaling)
 
@@ -353,7 +508,13 @@ when storage reattaches to a new node), peak p99, sysbench failures, and
 verdict. The whole-run chart is decimated (with per-bucket minimums preserved)
 so even an 8-hour run stays legible, with a full-resolution zoom per event.
 Artifacts (`parsed/soak_timeseries.csv`, `parsed/soak_summary.json`,
-`events.jsonl`) are shaped for later single-node-vs-multi-node overlay.
+`events.jsonl`) feed the soak-vs-soak comparison report directly (see
+[Comparing runs](#comparing-runs)).
+
+With `soak.rate_steps` the same mode becomes the IOPS **knee finder**: offered
+load climbs through throttled rate steps (sysbench `--rate`) while the device
+series records what the volume actually serves; each step start is stamped as
+an event.
 
 ## Web application (self-hosted UI)
 
@@ -387,8 +548,10 @@ actually landed.
 - **Secrets:** the DB password is captured in the UI and stored Fernet-encrypted
   (`secrets.enc`, 0600) — never in the spec, DB, logs, reports, or audit; it's
   injected into the child env at run time exactly as the CLI does.
-- **Live view:** per-second TPS chart + log tail over SSE that catches up on
-  reconnect; soak event markers land the instant you click "Mark failover".
+- **Live view:** per-second TPS/QPS/p99 cockpit charts + log tail over SSE that
+  catches up on reconnect; sweep charts plot on one continuous run-relative
+  timeline (`t_wall`) so a 10-level ladder reads like the database's own
+  graphs; soak event markers land the instant you click "Mark failover".
 - **Notifications, scheduling, templates:** opt-in SMTP/Slack alerts on run
   completion/failure (secrets encrypted, configured on the admin **Settings**
   page, with a "send test" button); queue a run for a future UTC time; save the
@@ -397,6 +560,11 @@ actually landed.
   and cluster id, the app fetches device-side metrics for a run's UTC window at
   `/runs/<id>/provider-metrics`, complementing the engine-side IOPS proxy;
   degrades cleanly to engine-side only when unconfigured.
+- **Cluster Ops:** the console's Kubernetes section (see
+  [Cluster Ops](#cluster-ops-kubernetes--percona-pg-operator)) — register
+  kubeconfigs, operate Percona PG clusters, run diagnostics/health checks,
+  follow live pod logs, and quick-launch the IOPS evidence workflows (suite,
+  knee finder, device probe, evidence pack) from a cluster's page.
 
 Install, update, cert-trust, firewall, backup, RBAC, and troubleshooting are
 documented in **[OPERATIONS.md](OPERATIONS.md)**. Data lives under
@@ -449,10 +617,12 @@ resume logic, spec validation, and the password-leak test.
 
 ## Non-goals
 
-No Prometheus/Grafana integration or OS-metric scraping (workload-side
-metrics only), no provisioning/scheduling/CI, no results web server, no
-engines other than PostgreSQL, no load engines other than sysbench, and no
-tuning logic — the harness measures, humans tune.
+No Prometheus/Grafana scraping of its own (the harness captures engine-side
+and — for cluster-aware runs — device-side metrics itself, and *links out* to
+PMM/provider graphs for cross-referencing rather than ingesting them), no
+cluster provisioning or CI orchestration, no engines other than PostgreSQL,
+no load engines other than sysbench/pgbench, and no automatic tuning logic —
+the harness measures and verifies, humans tune.
 
 ## IOPS ceiling verification (evidence framework)
 
@@ -532,14 +702,23 @@ kubeconfig — porting a field-tested bash methodology into first-class
 `pgbench-harness ops` subcommands driven by the same job queue and worker:
 
 - **Kube Targets** — kubeconfig registration (path on host or encrypted
-  import), live validation checklist, read-only topology discovery
-  (Patroni leader/members/TL/lag via `patronictl list -f json`, pods,
-  services, backup schedules, pgBackRest repo info).
+  import) with a grouped, inline-validated registration form; live
+  validation checklist; read-only topology discovery (Patroni
+  leader/members/TL/lag via `patronictl list -f json`, pods, services,
+  backup schedules, pgBackRest repo info); auto-health on by default with
+  a freshness-stamped health badge per target.
 - **CR configuration** — dry-run first (exact merge patch + value diff),
-  apply with a verify loop against `pg_settings` on the leader; loud
-  `pending_restart` warnings ("the operator will roll pods — expect a
-  failover"); pgBackRest globals verified against the rendered config in the
-  pod; CR snapshots with rollback-as-a-new-patch; prep actions.
+  apply with a verify loop against `pg_settings` on the leader (leader
+  re-resolved with retry/backoff after restart-required changes, values
+  unit-normalized so "1GB" == "1024MB"); server-side validation against the
+  LIVE catalog plus hazard guardrails for dangerous parameters (the
+  `huge_pages` class of outage is refused up front); loud `pending_restart`
+  warnings with a rollout watch until the operator's roll converges;
+  pgBackRest globals verified against the rendered config in the pod;
+  a **CR snapshot browser** (every config op snapshots first; manual
+  "snapshot now"; diffs vs the freshest capture) with guarded **one-click
+  revert** that rebuilds a targeted patch over managed sections only — and
+  snapshots first, so the revert is itself undoable; prep actions.
 - **Backups** — full/diff/incr via direct exec or the operator's `manual:`
   Job path, from the leader or a replica (`--backup-standby`); lock
   preflight aborts instead of the rc=50 false success; 5 s samplers
@@ -547,13 +726,19 @@ kubeconfig — porting a field-tested bash methodology into first-class
   schedule pause/restore with a persistent nag; reports can overlay a live
   benchmark run's TPS with the backup window shaded.
 - **Failover scenarios** — Cases A (switchover), B (pgkill), C1 (pod
-  delete), C2 (node loss, experimental): capture → baseline → FIRE →
-  settle → stitch → report. 5 Hz write probe through pgBouncer, per-pod log
-  streams with auto-reattach, and a stitcher that classifies election vs
-  restart-in-place by the authoritative Patroni leader name (never the
-  probe IP), latches full-HA recovery only after an observed ready-count
-  dip, and reports the pgBouncer `server_login_retry` backoff tail
-  separately from DB downtime. Cross-scenario comparison table included.
+  delete), C2 (node loss — a real sysrq kernel panic fired from a
+  privileged node-pinned pod, because ACPI power-off and cordon+drain both
+  let PostgreSQL checkpoint cleanly and invalidate the test): capture →
+  baseline → FIRE → settle → stitch → report. 5 Hz write probe through
+  pgBouncer, per-pod log streams with auto-reattach, and a stitcher that
+  auto-detects the effective kill instant (T0′) so delivery delay is never
+  charged to downtime, classifies election vs in-place re-promotion vs
+  plain restart by the authoritative Patroni leader name (never the probe
+  IP), stamps a run INVALID-AS-CRASH if a graceful-shutdown marker appears
+  in the kill window, latches full-HA recovery only after an observed
+  ready-count dip, and reports the pgBouncer `server_login_retry` backoff
+  tail separately from DB downtime. Cross-scenario comparison table
+  included.
 - **Telemetry monitor** — continuous per-target sampler (WAL rate,
   checkpoints, archive queue, replication lag, per-member disk) that
   re-detects the leader every cycle and never blanks a whole row when one
@@ -575,9 +760,23 @@ kubeconfig — porting a field-tested bash methodology into first-class
   field-standard heuristics (connection saturation, idle-in-transaction,
   inactive slots retaining WAL, wraparound distance, cache hit,
   pending_restart drift, Patroni states/lag, pod restart loops, PVC fill,
-  backup staleness) into findings with severities, one-line remediations,
-  and deep-links to the diagnostic that investigates each one; the worst
-  severity badges the targets list.
+  backup staleness, **OOMKilled containers / in-log allocation failures /
+  sustained working-set growth** flagged as a memory-leak suspect) into
+  findings with severities, one-line remediations, and deep-links to the
+  diagnostic that investigates each one; the worst severity badges the
+  targets list, with auto-health on by default and a staleness stamp.
+- **Live log viewer** — a Logs tab per target: a worker op follows selected
+  pod/containers (`kubectl logs -f` captured into the run dir — the web
+  tier still never runs kubectl), streamed to the browser over SSE with
+  per-component severity parsing (Postgres vs Patroni split within the
+  database container), severity/component/text filters, tail/since
+  history, and follow/pause/clear/download.
+- **PMM enablement** — one-click enable/status/disable of PMM client
+  sidecars on a target (preserving existing `shared_preload_libraries`),
+  with run reports deep-linking into PMM scoped to the run's UTC window.
+  The default query-stats extension is **pg_stat_statements**
+  (pg_stat_monitor stays selectable with a warning — it showed sustained
+  memory growth on long runs, and health checks flag it when preloaded).
 
 Security invariants: kubeconfig contents and k8s-derived passwords never
 touch the DB, specs, logs, SSE streams, reports, or artifacts (enforced by
