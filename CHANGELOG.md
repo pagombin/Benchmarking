@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — pmm-enable refuses up front when the rollout is pinned
+
+- **Field failure (2026-08-04)**: pmm-enable patched the CR while a
+  pgBackRest backup held the operator's `backup-in-progress` annotation —
+  the operator serializes instance rollouts behind backups, so the pods
+  never rolled, verification failed ten minutes later, and the cluster was
+  left half-configured (new CR, old pods). The rollout-blocker probe
+  (annotation + in-flight/failed PerconaPGBackups) now runs in
+  **preflight**: the run aborts with the blocker and its remediation
+  BEFORE the secret or CR patch, and `params.ignore_blockers` remains as
+  an explicit escape hatch (patch anyway, rollout starts whenever the
+  operator unblocks).
+
+## Unreleased — Patroni tab shows the live DCS document, not CR/defaults
+
+- **Field bug**: the parameter map's Patroni DCS tab showed `retry_timeout`
+  as 10 while `patronictl show-config` on the cluster said 7. Two layers:
+  the tab's "Current / default" column never rendered a current value for
+  Patroni options (always the research-curated default), and the snapshot
+  itself only derived Patroni values from the CR — a value set outside the
+  CR (`patronictl edit-config`, or left behind by an earlier config; the
+  operator merges into DCS, it never prunes) was invisible to any refresh.
+  `ops pg-params` now captures the live DCS document from the leader and
+  overlays it on the CR view (`patroni_dcs` = live truth, `patroni_dcs_cr`
+  kept for provenance), with a snapshot check line that calls out CR-vs-DCS
+  disagreements. The tab now shows live values with badges: `CR` (managed
+  via the CR), `DCS` (live value not backed by the CR), `drift` (CR and
+  live DCS disagree).
+- **Invariant check on live values**: `patroni_dcs` apply validated
+  `loop_wait + 2*retry_timeout <= ttl` using CR values/defaults for the
+  unstaged trio members — with live `retry_timeout=7` it would wrongly
+  refuse a valid `ttl=25`. Unstaged members now resolve from the live DCS
+  document first (CR, then Patroni defaults, as fallbacks).
+- **Drift is never "nothing to do"**: applying values the CR already holds
+  used to finalize as a silent success even when the live DCS disagreed.
+  That path now compares against the live document and finalizes as a
+  warning naming the drifted values and how to fix them.
+
 ## Unreleased — sweep cockpit charts on one continuous timeline
 
 - **Field bug**: sweep samples were stamped only with `t_offset`, which

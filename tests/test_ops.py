@@ -696,6 +696,76 @@ def test_patroni_dcs_apply_and_verify(opsweb):
     assert cat["patroni_dcs"]["postgresql.use_slots"] == "True"
 
 
+def test_pg_params_snapshot_captures_live_dcs_not_just_cr(opsweb, monkeypatch):
+    """Field bug: retry_timeout was 7 in the live DCS (patronictl edit-config)
+    but the CR knew nothing about it, so the parameter map showed the catalog
+    default 10. The snapshot must capture patronictl show-config — the
+    document Patroni actually runs on — and keep the CR view for drift."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("FAKE_KUBE_DCS_OVERRIDE", '{"retry_timeout": 7}')
+    client.post(f"/api/kube-targets/{tid}/pg-params", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    cat = client.get(f"/api/kube-targets/{tid}/pg-params",
+                     auth=("viewer", "vpw")).json()["catalog"]
+    # live DCS wins — the value set outside the CR is what the map shows
+    assert cat["patroni_dcs"]["retry_timeout"] == "7"
+    # values the CR never set still surface from the live document
+    assert cat["patroni_dcs"]["ttl"] == "30"
+    assert cat["patroni_dcs"]["loop_wait"] == "10"
+    # and the CR-only view carries none of them — that's the drift signal
+    assert "retry_timeout" not in cat["patroni_dcs_cr"]
+
+
+def test_patroni_dcs_invariant_judged_against_live_dcs(opsweb, monkeypatch):
+    """The loop_wait + 2*retry_timeout <= ttl check must use the LIVE DCS
+    value for unstaged trio members. With live retry_timeout=7, ttl=25 is
+    valid (10 + 14 = 24) — the CR-default assumption (retry=10 -> 30 > 25)
+    would wrongly refuse it."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("FAKE_KUBE_DCS_OVERRIDE", '{"retry_timeout": 7}')
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "patroni_dcs",
+                                     "settings": {"ttl": "25"}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True
+
+
+def test_patroni_dcs_apply_flags_drift_when_cr_already_matches(opsweb, monkeypatch):
+    """CR already holding the staged value is not success when the live DCS
+    disagrees — 'nothing to do' must become a drift warning, never a silent
+    complete."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # put retry_timeout=10 into the CR (DCS follows — no drift yet)
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "patroni_dcs",
+                                     "settings": {"retry_timeout": "10"}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    assert _last_ops_run(client, "cr-apply")["status"] == "complete"
+    # now the DCS drifts underneath (patronictl edit-config sets 7)
+    monkeypatch.setenv("FAKE_KUBE_DCS_OVERRIDE", '{"retry_timeout": 7}')
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1",
+                          "params": {"action": "patroni_dcs",
+                                     "settings": {"retry_timeout": "10"}}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "warning", run
+    assert run["headline"]["dcs_drift"] == {"retry_timeout": "7"}
+
+
 def test_operate_bugbash_guardrails(opsweb):
     """Bug-bash regressions: scale-to-0 crashed mid-verify; an empty resize
     resources dict would have REPLACED the pods' resources with {}."""
@@ -2546,7 +2616,8 @@ def test_pmm_rollout_timeout_surfaces_operator_blocker(pmmops, monkeypatch):
     """When the operator won't roll the pods because a pgBackRest backup is
     serializing the rollout, the wait must NAME that blocker (the real cause of
     a PMM change never rolling) instead of a blind timeout — both an early
-    'BLOCKED' event and the blocker detail on the timeout line."""
+    'BLOCKED' event and the blocker detail on the timeout line. (Reached via
+    ignore_blockers — without it the preflight guard refuses up front.)"""
     from pgbench_harness.ops.pmm import run_pmm_enable
     monkeypatch.setenv("FAKE_KUBE_ROLL_S", "600")          # pods never roll
     monkeypatch.setenv("FAKE_KUBE_BACKUP_IN_PROGRESS",
@@ -2554,14 +2625,41 @@ def test_pmm_rollout_timeout_surfaces_operator_blocker(pmmops, monkeypatch):
     monkeypatch.setenv("FAKE_KUBE_BACKUP_BLOCK", "Running:3")  # 1 active + 3 failed
     rc = run_pmm_enable(
         _pmm_ops_spec("pmm-enable", rollout_timeout_s=1.5, poll_s=0.3,
-                      qan_timeout_s=0.5, discover_timeout_s=5), pmmops)
+                      qan_timeout_s=0.5, discover_timeout_s=5,
+                      ignore_blockers=True), pmmops)
     assert rc == 1
     events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "proceeding on ignore_blockers" in events        # explicit override
     assert "BLOCKED by the operator" in events              # early diagnosis
     assert "backup-in-progress" in events                   # the annotation cause
     assert "backup still in flight" in events               # the active backup
     assert "WAL archiving" in events                        # the failed-loop hint
     assert "TIMEOUT waiting for rollout" in events
+
+
+def test_pmm_enable_refuses_before_mutating_when_rollout_blocked(pmmops, monkeypatch):
+    """Field failure 2026-08-04: pmm-enable patched the CR while a pgBackRest
+    backup pinned the rollout, leaving the cluster half-configured (new CR,
+    old pods) and the run failed 10 minutes later. The blocker probe must run
+    in PREFLIGHT and abort before the secret/patch — nothing mutated."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_IN_PROGRESS",
+                       "cluster1-repo1-incr-2ht6b")
+    monkeypatch.setenv("FAKE_KUBE_BACKUP_BLOCK", "Starting:0")
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops)
+    assert rc == 3                                # EXIT_FAILED, like other aborts
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["status"] == "aborted"
+    assert meta["headline"]["reason"] == "rollout-blocked"
+    assert any("backup-in-progress" in b for b in meta["headline"]["blockers"])
+    events = (run_dir / "events.jsonl").read_text()
+    assert "nothing was changed" in events
+    # the CR was NOT patched and no PMM secret was created
+    st = _fake_state()
+    assert "pmm" not in st["cr"]["spec"]
+    patches = Path(os.environ["FAKE_KUBE_STATE"]) / "patches.log"
+    assert not patches.exists() or "pmm" not in patches.read_text()
 
 
 def test_rollout_blockers_probe_reads_backup_state(pmmops, monkeypatch):

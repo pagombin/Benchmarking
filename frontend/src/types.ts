@@ -122,7 +122,10 @@ export interface PgParamsCatalog {
   cr_managed: Record<string, string>;
   pgbackrest_global: Record<string, string>;
   pgbouncer_global?: Record<string, string>;
+  /** live DCS document (patronictl show-config) overlaid on the CR view */
   patroni_dcs?: Record<string, string>;
+  /** CR-derived view only — for flagging CR-vs-DCS drift */
+  patroni_dcs_cr?: Record<string, string>;
 }
 
 // ── diagnostics workbench ──

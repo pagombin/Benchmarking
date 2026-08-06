@@ -91,6 +91,31 @@ def _check(name: str, status: str, detail: str = "") -> None:
     print(json.dumps({"name": name, "status": status, "detail": detail}), flush=True)
 
 
+def flatten_dcs(doc: dict[str, Any]) -> dict[str, str]:
+    """Flatten a Patroni configuration document (the CR's dynamicConfiguration
+    or the live ``patronictl show-config`` output) into dotted option names
+    matching the sidecar catalog (``ttl``, ``postgresql.use_slots``,
+    ``standby_cluster.host``, ...). The postgresql parameters/pg_hba/pg_ident
+    subtrees are excluded — those surface through the pg_settings catalog."""
+    flat: dict[str, str] = {}
+
+    def _walk(prefix: str, node: Any) -> None:
+        if not isinstance(node, dict):
+            flat[prefix] = str(node)
+            return
+        for k, v in node.items():
+            if prefix == "" and k == "postgresql" and isinstance(v, dict):
+                sub = {a: b for a, b in v.items()
+                       if a not in ("parameters", "pg_hba", "pg_ident")}
+                if sub:
+                    _walk("postgresql", sub)
+                continue
+            _walk(f"{prefix}.{k}" if prefix else str(k), v)
+
+    _walk("", doc)
+    return flat
+
+
 def sidecar_catalog() -> dict[str, Any]:
     """Static option catalogs for the sidecar systems (pgBackRest, Patroni DCS,
     pgBouncer) — research-curated with per-operator CR paths. Unlike the PG
@@ -151,7 +176,8 @@ def run_pg_params(spec: OpsSpec) -> int:
     payload: dict[str, Any] = {"collected_utc": utc_now_iso(), "leader": "",
                                "pg_version": "", "params": [],
                                "cr_managed": {}, "pgbackrest_global": {},
-                               "pgbouncer_global": {}, "patroni_dcs": {}}
+                               "pgbouncer_global": {}, "patroni_dcs": {},
+                               "patroni_dcs_cr": {}}
 
     try:
         from pgbench_harness.ops.crconfig import resolve_leader
@@ -164,6 +190,7 @@ def run_pg_params(spec: OpsSpec) -> int:
         return 3
 
     cr_params: dict[str, Any] = {}
+    dcs_cr: dict[str, str] = {}
     try:
         cr = kube.cluster_cr(t.cr_kind, t.cr_name)
         cr_params = _dig(cr, PATRONI_PARAMS_PATH)
@@ -173,30 +200,57 @@ def run_pg_params(spec: OpsSpec) -> int:
         payload["pgbouncer_global"] = {
             k: str(v) for k, v in _dig(cr, PGBOUNCER_GLOBAL_PATH).items()}
         pat = (cr.get("spec") or {}).get("patroni") or {}
-        dcs: dict[str, Any] = {}
         if pat.get("leaderLeaseDurationSeconds") is not None:
-            dcs["ttl"] = str(pat["leaderLeaseDurationSeconds"])
+            dcs_cr["ttl"] = str(pat["leaderLeaseDurationSeconds"])
         if pat.get("syncPeriodSeconds") is not None:
-            dcs["loop_wait"] = str(pat["syncPeriodSeconds"])
-
-        def _flatten(prefix: str, node: Any) -> None:
-            if not isinstance(node, dict):
-                dcs[prefix] = str(node)
-                return
-            for k2, v2 in node.items():
-                if prefix == "" and k2 == "postgresql" and isinstance(v2, dict):
-                    sub = {a: b for a, b in v2.items()
-                           if a not in ("parameters", "pg_hba", "pg_ident")}
-                    _flatten("postgresql", sub) if sub else None
-                    continue
-                _flatten(f"{prefix}.{k2}" if prefix else str(k2), v2)
-        _flatten("", pat.get("dynamicConfiguration") or {})
-        payload["patroni_dcs"] = dcs
+            dcs_cr["loop_wait"] = str(pat["syncPeriodSeconds"])
+        dcs_cr.update(flatten_dcs(pat.get("dynamicConfiguration") or {}))
         _check("cluster-cr", "ok",
                f"{len(cr_params)} parameter(s) managed via the CR")
     except KubeError as exc:
         # Catalog still valuable without the CR overlay — degrade, don't die.
         _check("cluster-cr", "warn", str(exc)[:300])
+    payload["patroni_dcs_cr"] = dcs_cr
+
+    # The CR is NOT the truth for Patroni settings: values set via
+    # `patronictl edit-config` (or left behind by an earlier CR — the operator
+    # merges into DCS, it never prunes) live only in the DCS document. Capture
+    # the document Patroni actually runs on and let it win; keep the CR view
+    # alongside so the console can flag drift.
+    dcs_live: dict[str, str] = {}
+    try:
+        import yaml
+        res = kube.exec(leader, "database", ["patronictl", "show-config"],
+                        timeout_s=20)
+        doc = yaml.safe_load(res.stdout) if res.ok else None
+        if isinstance(doc, dict):
+            dcs_live = flatten_dcs(doc)
+        if dcs_live:
+            drifted = sorted(
+                k for k in set(dcs_cr) | set(dcs_live)
+                if k in dcs_live and dcs_cr.get(k) is not None
+                and dcs_cr.get(k) != dcs_live[k])
+            outside_cr = sorted(k for k in dcs_live if k not in dcs_cr)
+            if drifted:
+                _check("patroni-dcs", "warn",
+                       f"{len(dcs_live)} live DCS setting(s); CR and live DCS "
+                       "disagree on: " + ", ".join(
+                           f"{k} (CR={dcs_cr[k]}, live={dcs_live[k]})"
+                           for k in drifted[:6]))
+            else:
+                _check("patroni-dcs", "ok",
+                       f"{len(dcs_live)} live DCS setting(s)"
+                       + (f"; set outside the CR: {', '.join(outside_cr[:6])}"
+                          if outside_cr else ""))
+        else:
+            _check("patroni-dcs", "warn",
+                   ((res.stderr or res.stdout).strip()[:200]
+                    if not res.ok else "show-config returned no document")
+                   + " — Patroni tab falls back to CR-derived values")
+    except Exception as exc:  # noqa: BLE001 — snapshot must survive this
+        _check("patroni-dcs", "warn",
+               f"{str(exc)[:200]} — Patroni tab falls back to CR-derived values")
+    payload["patroni_dcs"] = {**dcs_cr, **dcs_live}
 
     try:
         res = kube.psql(leader, _CATALOG_SQL, timeout_s=30)
