@@ -341,6 +341,9 @@ export function KubeParams({ me }: { me: Me }) {
                       live={tab === "pgbouncer" ? (cat?.pgbouncer_global ?? {})
                             : tab === "pgbackrest" ? (cat?.pgbackrest_global ?? {})
                             : (cat?.patroni_dcs ?? {})}
+                      crView={tab === "pgbouncer" ? (cat?.pgbouncer_global ?? {})
+                              : tab === "pgbackrest" ? (cat?.pgbackrest_global ?? {})
+                              : (cat?.patroni_dcs_cr ?? {})}
                       staged={stagedBk} setStaged={setStagedBk}
                       confirm={confirm} setConfirm={setConfirm}
                       confirmName={kt.cr_name || kt.name} onApply={applyBk} />
@@ -499,13 +502,14 @@ export function KubeParams({ me }: { me: Me }) {
   );
 }
 
-function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
+function SidecarPanel({ kind, options, crKind, isAdmin, live, crView, staged, setStaged,
                         confirm, setConfirm, confirmName, onApply }: {
   kind: string;
   options: SidecarOption[];
   crKind: string;
   isAdmin: boolean;
   live: Record<string, string>;
+  crView: Record<string, string>;
   staged: Record<string, string>;
   setStaged: (f: (s: Record<string, string>) => Record<string, string>) => void;
   confirm: string;
@@ -536,8 +540,13 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
     <>
       {(
         <p className="subtle" style={{ margin: "0 0 8px" }}>
-          Current values come from the last parameter snapshot — hit <em>Refresh
-          snapshot</em> after an apply to see them update.</p>
+          {kind === "patroni"
+            ? <>Current values come from the <strong>live DCS document</strong>{" "}
+                (<code>patronictl show-config</code>) captured at snapshot time — the
+                truth Patroni runs on, even when a value was set outside the CR. Hit{" "}
+                <em>Refresh snapshot</em> after an apply to see them update.</>
+            : <>Current values come from the last parameter snapshot — hit <em>Refresh
+                snapshot</em> after an apply to see them update.</>}</p>
       )}
       {kind === "pgbackrest" && isAdmin && (
         <div style={{ margin: "0 0 10px" }}>
@@ -603,13 +612,21 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
             <thead><tr><th>Option</th><th>Current / default</th><th>Type</th><th>Allowed</th><th>Applies via</th><th /></tr></thead>
             <tbody>
               {visible.map((o) => {
-                const cur = kind !== "patroni" ? live[o.name] : undefined;
+                const cur = live[o.name];
+                const crVal = crView[o.name];
+                const drifted = cur !== undefined && crVal !== undefined && crVal !== cur;
+                const dcsOnly = kind === "patroni" && cur !== undefined && crVal === undefined;
                 const draft = drafts[o.name] ?? staged[o.name] ?? cur ?? o.default ?? "";
                 return (
                   <tr key={o.name}>
                     <td className="wrap-any">
                       <span className="mono">{o.name}</span>
-                      {cur !== undefined && <span className="badge ok" style={{ marginLeft: 6 }}>CR</span>}
+                      {crVal !== undefined && <span className="badge ok" style={{ marginLeft: 6 }}
+                        title="managed via the CR">CR</span>}
+                      {dcsOnly && <span className="badge running" style={{ marginLeft: 6 }}
+                        title="live DCS value not backed by the CR — set directly (patronictl edit-config) or left behind by an earlier config">DCS</span>}
+                      {drifted && <span className="badge failed" style={{ marginLeft: 6 }}
+                        title={`CR says ${crVal} but the live DCS document says ${cur} — the operator has not reconciled, or DCS was edited directly`}>drift</span>}
                       <div className="cell-desc">{o.description}</div>
                     </td>
                     <td className="mono wrap-any">{cur ?? o.default ?? "—"}</td>

@@ -595,10 +595,27 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
     pat_pre = spec_doc_pre.get("patroni") or {}
     dyn_pre = pat_pre.get("dynamicConfiguration") or {}
 
+    # The live DCS document, not the CR, is what Patroni actually runs on —
+    # values set via `patronictl edit-config` (or left behind by an earlier
+    # CR) never appear in the CR. Best-effort fetch; the CR view stays the
+    # fallback when the exec fails.
+    import yaml as _yaml
+    dcs_pre: dict[str, Any] = {}
+    try:
+        _pre_instances, pre_leader, _pre_view = resolve_leader(kube, t.cr_name)
+        res = kube.exec(pre_leader, "database",
+                        ["patronictl", "show-config"], timeout_s=20)
+        doc = _yaml.safe_load(res.stdout) if res.ok else None
+        if isinstance(doc, dict):
+            dcs_pre = doc
+    except (KubeError, _yaml.YAMLError):
+        pass
+
     # Patroni's own invariant: loop_wait + 2*retry_timeout <= ttl. Violating
     # it makes Patroni clamp/complain and the effective behavior diverges from
     # the staged intent — exactly what a TTL-tuning study must not have.
-    # Pull current values for the unstaged members of the trio.
+    # Pull current values for the unstaged members of the trio: staged value
+    # first, then the live DCS document, then the CR, then Patroni's default.
     if any(k in settings for k in ("ttl", "loop_wait", "retry_timeout")):
         def _eff(name: str, cr_field: str, default: float) -> Optional[float]:
             if name in settings:
@@ -606,6 +623,11 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
                     return float(settings[name])
                 except (TypeError, ValueError):
                     return None
+            if dcs_pre.get(name) is not None:
+                try:
+                    return float(dcs_pre[name])
+                except (TypeError, ValueError):
+                    pass
             if percona and cr_field and pat_pre.get(cr_field) is not None:
                 try:
                     return float(pat_pre[cr_field])
@@ -664,6 +686,27 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
         run.finalize("complete", headline=headline)
         return EXIT_OK
     if not changes:
+        # The CR matching the staged values is NOT proof the cluster runs
+        # them: the DCS document can drift (patronictl edit-config, an
+        # operator that hasn't reconciled). Compare against the live DCS
+        # and refuse to call drift a success.
+        dcs_drift: dict[str, str] = {}
+        for name, value in settings.items():
+            node: Any = dcs_pre
+            for seg in name.split("."):
+                node = node.get(seg) if isinstance(node, dict) else None
+            if node is not None and str(node).lower() != str(coerce(value)).lower():
+                dcs_drift[name] = str(node)
+        if dcs_drift:
+            run.event("apply", "CR already holds these values but the live "
+                      "DCS document disagrees",
+                      ", ".join(f"{k}: DCS={v}" for k, v in dcs_drift.items())
+                      + " — the operator does not rewrite DCS for an "
+                      "unchanged CR; fix via patronictl edit-config, or "
+                      "change the CR value and set it back")
+            headline["dcs_drift"] = dcs_drift
+            run.finalize("warning", headline=headline)
+            return EXIT_WARNING
         run.event("apply", "nothing to do", "all values already live in the CR")
         run.finalize("complete", headline=headline)
         return EXIT_OK
@@ -673,7 +716,6 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
               ", ".join(f"{k}={v[1]}" for k, v in changes.items()))
     # verify against the live DCS document (operator reconciles it into
     # patronictl edit-config; propagation takes up to a reconcile + loop_wait)
-    import yaml as _yaml
     _instances, leader, _view = resolve_leader(kube, t.cr_name)
     deadline = time.monotonic() + float(params.get("verify_timeout_s", 120))
     live: dict[str, Any] = {}

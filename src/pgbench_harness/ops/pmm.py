@@ -774,6 +774,31 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         instances, leader, _view = _discover(kube, run, t.cr_name, cfg,
                                              "pre-change")
 
+        # 2b. rollout blockers are a PREFLIGHT refusal, not a post-patch
+        # surprise: the operator serializes instance rollouts behind
+        # pgBackRest backups, so patching the CR now would leave the cluster
+        # half-configured (new CR, old pods) until the backup clears — the
+        # 2026-08-04 field failure. Abort BEFORE any mutation; re-run once
+        # the backup finishes, or pass params.ignore_blockers to proceed
+        # anyway (the CR patch is safe, it just waits on the operator).
+        blockers = _rollout_blockers(kube, t.cr_kind, t.cr_name)
+        if blockers and not params.get("ignore_blockers"):
+            for b in blockers:
+                run.event("preflight", "ABORT: the instance rollout this "
+                          "change needs is blocked by the operator", b)
+            run.event("preflight", "nothing was changed",
+                      "re-run when the backup completes (or clear the "
+                      "annotation per the message above); pass "
+                      "ignore_blockers to patch anyway and let the rollout "
+                      "start whenever the operator unblocks")
+            run.finalize("aborted", headline={"op": "pmm-enable",
+                                              "reason": "rollout-blocked",
+                                              "blockers": blockers})
+            return EXIT_FAILED
+        if blockers:
+            run.event("preflight", "rollout blockers present — proceeding on "
+                      "ignore_blockers", "; ".join(b[:160] for b in blockers))
+
         # existing preload libraries: auto-detected (CR, then live runtime on
         # the leader) and PRESERVED — the patch appends, never replaces
         spl = _resolve_spl(kube, run, cfg, cr, leader)
