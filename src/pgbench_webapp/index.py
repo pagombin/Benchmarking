@@ -18,7 +18,9 @@ from pgbench_webapp.util import utc_now_iso
 # A run is in a terminal state once it has finished (or been stopped). These are
 # the only statuses the live cockpit treats as "done"; anything else streams as
 # "live", so a stuck non-terminal manifest must be converged (see below).
-TERMINAL_RUN = ("complete", "partial", "failed", "canceled")
+# 'stopped' is the continuous-mode terminal: a deliberately-halted always-on
+# workload (resumable — a resume appends new segments to the same run dir).
+TERMINAL_RUN = ("complete", "partial", "failed", "canceled", "stopped")
 
 
 def converge_run_status(results_dir: Path, run_id: str, job_state: str) -> bool:

@@ -658,7 +658,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(404, "run not found")
         out = run_dir / harness_api.report_filename(run_dir)
         if regen or not out.exists():
-            out = harness_api.generate_report(run_dir)
+            try:
+                out = harness_api.generate_report(run_dir)
+            except harness_api.HarnessError as exc:
+                # e.g. a continuous run (no static report) — a clean answer,
+                # not a 500
+                raise HTTPException(400, str(exc))
         return HTMLResponse(out.read_text(encoding="utf-8"))
 
     @app.get("/runs/{run_id}/report/download")
@@ -983,12 +988,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return JSONResponse({"ok": True})
 
     @app.post("/api/notify/test")
-    def notify_test(request: Request, conn: sqlite3.Connection = Depends(get_conn),
+    def notify_test(request: Request, payload: Optional[dict] = None,
+                    conn: sqlite3.Connection = Depends(get_conn),
                     user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
-        _check_csrf(request, request.headers.get("x-csrf-token"))
-        sent = notify.notify(conn, store, state="test", run_id=None,
-                             label="notification test", peak_qps=None)
-        return JSONResponse({"sent": sent})
+        """Test message on every configured channel; optional custom text; the
+        per-channel outcome is explicit so a broken webhook is diagnosable."""
+        _check_csrf(request, (payload or {}).get(CSRF_FIELD)
+                    or request.headers.get("x-csrf-token"))
+        text = str((payload or {}).get("text") or "")[:500]
+        channels = notify.notify_test(conn, store, text)
+        sent = [k for k, v in channels.items() if v.get("ok")]
+        return JSONResponse({"sent": sent, "channels": channels})
 
     # ── config templates (versioned) + spec diff ──
     @app.post("/api/templates")
@@ -1068,7 +1078,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         # an inverted [start, 0] window. Fall back to "now" so live runs still get a
         # valid window — and only cache once the run is terminal, since a mid-run
         # window is partial and must not be frozen as the final provider metrics.
-        terminal = m.get("status") in ("complete", "partial", "failed", "canceled")
+        terminal = m.get("status") in TERMINAL_STATES
         end_epoch = finished_epoch or int(time.time())
         data = provider.fetch_metrics(conn, store, queries.get_setting(conn, "do_cluster_id", ""),
                                       start_epoch, end_epoch)
@@ -1167,7 +1177,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
         yield from _emit_series()
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
-        if status in ("complete", "partial", "failed", "canceled"):
+        if status in TERMINAL_STATES:
             # Final drain before `done`: the harness writes its last log lines and
             # the terminal manifest status in the same instant, so bytes can land
             # AFTER this tick's reads above. Re-read log (incl. a trailing partial
@@ -1383,7 +1393,7 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
     m = _manifest(run_dir)
     status = str(m.get("status", ""))
     created = _epoch(m.get("created_utc"))
-    if status in ("complete", "partial", "failed", "canceled"):
+    if status in TERMINAL_STATES:
         elapsed = int(m.get("wall_time_s") or 0)
     else:
         now = int(datetime.now(timezone.utc).timestamp())

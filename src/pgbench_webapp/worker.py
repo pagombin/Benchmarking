@@ -28,7 +28,7 @@ from typing import Any, Optional
 import yaml
 
 from pgbench_harness.util import get_redactor
-from pgbench_webapp import index, ops_support, queries
+from pgbench_webapp import contworker, index, ops_support, queries
 from pgbench_webapp.config import Config, ensure_dirs, load_config
 from pgbench_webapp.db import connect
 from pgbench_webapp.secrets_store import SecretStore
@@ -156,6 +156,15 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     elif kind == "evidence_pack":
         argv = [cfg.harness_bin, "evidence-pack", "--spec", str(spec_file),
                 "--results-dir", str(cfg.results_dir)]
+    elif kind == "continuous":
+        argv = [cfg.harness_bin, "continuous", "--spec", str(spec_file),
+                "--results-dir", str(cfg.results_dir)]
+        # A relaunch (reboot/crash reconcile) resumes the SAME run directory:
+        # new segments append, the historical series stays one timeline. If
+        # the run dir vanished from disk, fall through to a fresh run — the
+        # early run-id link below rebinds job.run_id to the new directory.
+        if job["run_id"] and (cfg.results_dir / job["run_id"] / "manifest.json").exists():
+            argv += ["--run-dir", str(cfg.results_dir / job["run_id"])]
     else:                                       # run | soak | suite
         argv = [cfg.harness_bin, kind, "--spec", str(spec_file),
                 "--results-dir", str(cfg.results_dir)]
@@ -194,7 +203,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                         early_run_id = rid
                         queries.update_job(conn, job["id"], run_id=rid)
                         ops_support.index_ops_run(cfg, conn, rid, job)
-                if early_run_id is None and kind in ("run", "soak", "suite", "device_probe", "evidence_pack"):
+                if early_run_id is None and kind in ("run", "soak", "suite", "device_probe", "evidence_pack", "continuous"):
                     rid = _parse_run_id(red, cfg.results_dir)
                     if rid:
                         early_run_id = rid
@@ -217,7 +226,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         # to the new manifest-bearing dir, then to the resume dir.
         # preflight/prepare/doctor/ops_validate/ops_discover never set a run_id.
         run_id: Optional[str] = None
-        if kind in ("run", "soak", "suite", "device_probe", "evidence_pack"):
+        if kind in ("run", "soak", "suite", "device_probe", "evidence_pack", "continuous"):
             run_id = _parse_run_id("".join(head), cfg.results_dir)
             if run_id is None:
                 new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
@@ -351,7 +360,14 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
         pid_start = (job["pid_start"] if "pid_start" in job.keys() else "") or ""
         alive = bool(pid) and _pid_is_our_child(int(pid), pid_start)
         if not alive:
-            # Dead pid. Task jobs (no run dir) read their real outcome from the
+            # Dead pid. Continuous jobs converge toward their DESIRED state:
+            # desired_state='running' + a dead harness after a droplet reboot
+            # is exactly the case Continuous Mode exists for — relaunch into
+            # the same run dir (new segment), never mark it failed.
+            if job["kind"] == "continuous":
+                contworker.reconcile_dead_continuous(cfg, conn, job)
+                continue
+            # Task jobs (no run dir) read their real outcome from the
             # job log — a prepare that finished cleanly right as the worker
             # restarted must not be mislabeled 'failed'. 'canceling' -> canceled;
             # a 'running' benchmark orphan -> failed (resumable for sweeps).
@@ -463,7 +479,8 @@ def _reattach_orphan(cfg: Config, job_id: int, pid: int,
             except (OSError, ValueError):
                 status = ""
             state = ("done" if status in ("complete", "partial")
-                     else "canceled" if job["state"] == "canceling"
+                     else "canceled" if (job["state"] == "canceling"
+                                         or status == "stopped")
                      else "failed")
             err = ("" if state == "done" else
                    f"run ended with status '{status or 'unknown'}' "
@@ -517,6 +534,7 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
     ensure_dirs(cfg)
     conn = connect(cfg.db_path)
     reconcile_startup(cfg, conn)
+    contworker.start_background(cfg)   # continuous-mode ingest/probe/alert threads
     store = _store(cfg)
     # value = (thread, kind); the kind lets the monitor lane run WITHOUT
     # occupying a benchmark/ops concurrency slot. Gating the loop on
@@ -528,6 +546,7 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
     # threads even though each is admissible on its own lane.
     monitor_cap = 32
     last_auto_health = 0.0
+    last_housekeeping = 0.0
     while True:
         for jid in [j for j, (t, _k) in active.items() if not t.is_alive()]:
             active.pop(jid)[0].join()
@@ -539,13 +558,27 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
                 ops_support.maybe_enqueue_auto_health(cfg, conn)
             except Exception:  # noqa: BLE001 — scheduling must never kill the loop
                 pass
+        # Continuous Mode housekeeping: desired-state convergence (relaunch a
+        # crashed harness), metrics retention, dead-man heartbeat.
+        if time.monotonic() - last_housekeeping > 30:
+            last_housekeeping = time.monotonic()
+            try:
+                contworker.housekeeping(cfg, conn)
+            except Exception:  # noqa: BLE001 — housekeeping must never kill the loop
+                pass
         max_conc = max(1, int(queries.get_setting(conn, "max_concurrency", "1") or "1"))
-        slotted = sum(1 for _t, k in active.values() if k != "ops_monitor")
-        monitors = len(active) - slotted
-        if slotted >= max_conc or monitors >= monitor_cap:
+        cont_cap = contworker.continuous_cap(conn)
+        # Lane accounting mirrors claim_next_job's gating exactly: indefinite
+        # lanes (ops_monitor, continuous) never occupy a benchmark slot, and
+        # both sides must exclude them or the exclusion is a no-op.
+        slotted = sum(1 for _t, k in active.values()
+                      if k not in ("ops_monitor", "continuous"))
+        conts = sum(1 for _t, k in active.values() if k == "continuous")
+        monitors = len(active) - slotted - conts
+        if (slotted >= max_conc and conts >= cont_cap) or monitors >= monitor_cap:
             time.sleep(POLL_SECONDS)
             continue
-        job = queries.claim_next_job(conn, max_conc)
+        job = queries.claim_next_job(conn, max_conc, continuous_cap=cont_cap)
         if job is None:
             time.sleep(POLL_SECONDS)
             continue
@@ -599,6 +632,11 @@ def stop_job_process(cfg: Config, conn: sqlite3.Connection, job_id: int) -> bool
     job = queries.get_job(conn, job_id)
     if job is None or job["state"] not in ("running", "queued", "canceling"):
         return False
+    if job["kind"] == "continuous":
+        # Durable intent FIRST: even if every process dies mid-stop, no
+        # reconcile/housekeeping pass may ever resurrect an explicitly
+        # stopped continuous workload.
+        queries.update_job(conn, job_id, desired_state="stopped")
     if job["state"] == "queued":
         queries.update_job(conn, job_id, state="canceled", finished_utc=utc_now_iso())
         return True

@@ -31,6 +31,8 @@ def validate_yaml(spec_yaml: str) -> dict[str, Any]:
         mode = "soak"
     elif spec.is_suite:
         mode = "suite"
+    elif spec.is_continuous:
+        mode = "continuous"
     elif spec.sweep is not None:
         mode = "sweep"
     elif spec.device_probe is not None and spec.device_probe.pack:
@@ -102,6 +104,14 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
                 "budget_s": spec.device_probe.duration_s,
                 "budget_breakdown": f"single {_hms(spec.device_probe.duration_s)} probe",
                 "commands": buf.getvalue().splitlines()}
+    if spec.is_continuous:
+        assert spec.continuous is not None
+        c = spec.continuous
+        cmd = sysbench.build_continuous_command(spec, c.threads, c.segment_time_s)
+        return {"mode": "continuous", "budget_s": 0,
+                "budget_breakdown": f"runs until stopped at {c.threads} threads "
+                                    f"(segments rotate every {_hms(c.segment_time_s)})",
+                "commands": [cmd.display()]}
     if spec.is_soak:
         assert spec.soak is not None
         cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
@@ -131,6 +141,10 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
 def generate_report(run_dir: Path) -> Path:
     """(Re)generate the report for a run dir (mode-aware), returning the file path."""
     mode = _run_mode(run_dir)
+    if mode == "continuous":
+        from pgbench_harness.errors import ReportError
+        raise ReportError("continuous runs have no static HTML report — the "
+                          "console's Continuous view is the reporting surface")
     if mode == "soak" or (run_dir / "parsed" / "soak_summary.json").exists():
         return _report_soak.generate_soak_report(run_dir)
     if mode in ("suite", "probe"):
