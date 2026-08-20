@@ -65,8 +65,16 @@ docs/BUGBASH.md.
   per-job-only tabs.
 * **Alerts/Outages consoles reuse the existing global APIs** with client-side
   frequency summaries ("db_unreachable: N in 30d, MTTR …") computed from the
-  fetched window — no new backend endpoints needed beyond what shipped with
-  continuous mode.
+  fetched window. The one new backend endpoint is `/api/worker/status`
+  (small and tested, per the brief's escape hatch): it probes the B-016
+  worker flock non-blockingly, so the header chip can say "worker down"
+  instead of the console silently queueing jobs nothing will claim.
+* **Availability math on the Outages console charges unplanned read/write
+  outages only** (interval-union, clipped to the window) — the same
+  definition the backend summary uses, so the fleet view and the per-job
+  KPIs can never disagree; load gaps and planned maintenance are listed as
+  events but not charged. Uptime shows "—" for the unbounded "all history"
+  view rather than inventing a denominator.
 * **Report-window export = CSV bundle + a printable summary** built client-
   side from data already on the page (KPI band + outage table), rather than
   new server rendering machinery.
