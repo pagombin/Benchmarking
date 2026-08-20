@@ -690,3 +690,141 @@ this combination up front, and the console steers you right:
 4. Requirements: at least one healthy streaming replica (check the health
    panel), and both primary and standby reachable from the repo host. If the
    standby lags heavily, backups take longer; fix lag first.
+
+---
+
+## 15. Continuous mode runbook
+
+Continuous mode is the always-on 24/7 workload (see README → *Continuous
+mode*). Operationally it is a `kind='continuous'` job with a **durable user
+intent** (`jobs.desired_state` = `running` | `stopped`) that the worker
+converges toward — that intent, not the process state, decides what survives
+a reboot.
+
+### 15.1 Starting and stopping
+
+Start from the console: **Continuous → Start a continuous workload**. It
+requires a **saved target with a stored password** (Fernet store) — a per-job
+password is deleted when the job process ends, so a reboot relaunch could
+never authenticate; the API rejects it with exactly that message. One
+continuous workload per target.
+
+Stop from the console (Stop button) or
+`POST /api/continuous/<job_id>/stop`. Stop sets `desired_state='stopped'`
+BEFORE signalling, so the intent survives even if every process dies
+mid-stop; then the usual SIGTERM → SIGKILL escalation runs. The run's
+manifest finalizes to `status: stopped`; metrics/ledgers are retained.
+**Resume** re-queues the same job — new segments append to the same run
+directory, one unbroken timeline.
+
+Only a console/API stop is durable. `kill`-ing the harness by hand or a
+`systemctl stop pgbench-worker` leaves `desired_state='running'`, and the
+worker will relaunch the workload (that is the feature working as designed).
+
+### 15.2 What happens on reboot
+
+1. systemd starts `pgbench-worker` (`WantedBy=multi-user.target`).
+2. `reconcile_startup` finds the continuous job: pid dead,
+   `desired_state='running'` → the job is **re-queued**, a
+   `loadgen_restart` event lands in the run's `events.jsonl`, and an
+   informational `harness_relaunch` alert is stored (and Slacked, if
+   configured).
+3. The worker relaunches `pgbench-harness continuous --run-dir <same run>`;
+   the supervisor appends segment N+1. On a resume the preflight is
+   best-effort — if the database is also still coming up, the supervisor's
+   backoff ladder owns the retry (that outage shows in the ledger, honestly).
+
+A harness crash mid-life (no reboot) is caught by the worker's housekeeping
+tick with a ~30s holdoff (`cont_relaunch_holdoff_s`). Verify after any
+reboot: the Continuous page shows the workload `running` with a recent
+"last sample", and `results/<run_id>/raw/` has a new `cont_seg*.log`.
+
+### 15.3 Disk budget
+
+Per workload, defaults (72h raw / 35d rollups / 6h segments):
+
+| artifact | rate | at horizon |
+|----------|------|-----------|
+| raw segment logs (~150 B/s of interval lines) | ~13 MB/day | ~40 MB (pruned beyond 72h once ingested) |
+| `parsed/cont_timeseries.csv` (convenience view) | ~9 MB/day | grows with the run — prune manually if you must reclaim; the raw logs + SQLite are the operative stores |
+| `cont_samples` (1s, 72h) | ~86,400 rows/day | ~26 MB |
+| `cont_rollup_1m` (35d) | 1,440 rows/day | ~5 MB |
+| `cont_db_metrics` (15s snapshots, 35d) | ~5,760 rows/day | ~60 MB |
+
+Budget ~150–250 MB per workload at steady state, plus the WAL (checkpointed
+hourly). The `loadgen_disk` alert fires at 85% data-dir usage; the harness
+also stops the load cleanly if the results volume drops under 500 MB free.
+
+### 15.4 Slack + dead-man heartbeat pairing
+
+Slack tells you when the DATABASE has a problem; the heartbeat tells you when
+the LOADGEN DROPLET has one — a powered-off droplet cannot send its own
+alert. Pair them:
+
+1. Settings → Slack: enable + webhook; **Send test message** shows the
+   per-channel result inline.
+2. Settings → Continuous mode: set `heartbeat_url` to a healthchecks.io-style
+   check with a ~2–3 min grace. The worker GETs it every 60s while at least
+   one workload is desired-running; the external service alerts when pings
+   stop.
+
+### 15.5 Alert threshold tuning
+
+Settings → *Continuous mode — alert thresholds* edits the
+`cont_alerts_config` setting (units shown inline). Rules of thumb: leave
+probe settings (5s / 3 failures) alone unless the network is jittery; set
+`latency_p99_ms` to ~3× your healthy p99; `tps_drop_pct` at 50 catches a
+halved workload without firing on daily noise (it stays silent until 24h of
+history exists). Crit alerts re-notify every `renotify_min` (default 60m)
+while unresolved.
+
+### 15.6 Reading the outage ledger
+
+Continuous view → Outage ledger, or `GET /api/outages` fleet-wide.
+
+* `read` / `write` — the DB was unreachable after 3 consecutive probe
+  failures (per kind). `started` is the FIRST failed probe; the duration is
+  probe-observed. `error_class` (auth/network/other) comes from the first
+  error text.
+* `load` — the load generator stopped producing samples while both probes
+  stayed green: a loadgen-side problem (crash-looping sysbench, wedged
+  supervisor), NOT a database outage. Never count these against the platform.
+* `planned=1` — the outage overlapped a maintenance window (job-scoped or
+  global). Planned outages are excluded from the uptime % / MTBF / MTTR
+  math and their alerts are stored but not delivered.
+
+Uptime % over a window = window minus the union of UNPLANNED read/write
+outage seconds. MTBF = window / unplanned-db-outage count; MTTR = their mean
+duration.
+
+### 15.7 Rebuilding the metrics index (reindex)
+
+The SQLite series is an index over the run directory (the raw segment logs
+are canonical). If the DB is lost/corrupted or you suspect ingest drift:
+
+```bash
+sudo -u pgbench env PGBENCH_DATA_DIR=/var/lib/pgbench-harness \
+  /opt/pgbench-harness/venv/bin/pgbench-web reindex-continuous --job <job_id>
+```
+
+This wipes and rebuilds the job's 1s samples + 1m rollups from whatever raw
+segments remain on disk; rollup minutes older than the surviving raw
+coverage are preserved (their raw was legitimately pruned). Safe to run any
+time; the PRIMARY KEYs make replays idempotent.
+
+### 15.8 Verifying durability on a droplet (10 minutes)
+
+```bash
+# 1. simulate a sysbench crash — the supervisor relaunches with backoff:
+pkill -f 'sysbench.*--report-interval'    # watch state.json relaunches++
+
+# 2. simulate a deploy — the harness survives, the worker re-attaches:
+sudo systemctl restart pgbench-worker
+
+# 3. simulate a reboot (or actually: sudo systemctl reboot):
+sudo systemctl stop pgbench-worker
+sudo pkill -f 'pgbench-harness continuous'
+sudo systemctl start pgbench-worker
+# → the job re-queues, a harness_relaunch alert lands, a new cont_seg appears
+#   in the SAME results/<run_id>/raw/, and the console timeline is unbroken.
+```

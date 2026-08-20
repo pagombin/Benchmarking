@@ -12,6 +12,9 @@ interface Item {
 
 const PAGES: Item[] = [
   { label: "Runs", hint: "benchmark + cluster ops feed", to: "/", group: "Pages" },
+  { label: "Continuous", hint: "always-on workloads · availability", to: "/continuous", group: "Pages" },
+  { label: "Alerts", hint: "global alert history + frequency", to: "/alerts", group: "Pages" },
+  { label: "Outages", hint: "availability ledger per target", to: "/outages", group: "Pages" },
   { label: "New run", hint: "start a benchmark", to: "/new", group: "Pages" },
   { label: "Tasks", hint: "preflight / prepare / doctor", to: "/tasks", group: "Pages" },
   { label: "Targets", hint: "database targets", to: "/targets", group: "Pages" },

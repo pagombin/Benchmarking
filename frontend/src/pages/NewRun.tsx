@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { Me, Target } from "../types";
+import { usePageTitle } from "../lib/ui";
 
 // Minimal YAML emitter for flat/nested scalar+array specs (no dep; CSP-safe).
 function toYaml(o: Record<string, unknown>, indent = ""): string {
@@ -36,15 +37,17 @@ const WORKLOADS = ["tpcc", "oltp_read_only", "oltp_read_write", "oltp_write_only
 // the YAML text (no yaml dep, CSP-safe) so the Mode dropdown mirrors a pasted or
 // cloned spec instead of drifting from it — a soak spec must never launch as the
 // sweep the dropdown happened to be left on.
-function detectMode(y: string): "sweep" | "soak" | "suite" | "probe" | null {
+function detectMode(y: string): "sweep" | "soak" | "suite" | "probe" | "continuous" | null {
   if (/^soak:/m.test(y)) return "soak";
   if (/^suite:/m.test(y)) return "suite";
   if (/^device_probe:/m.test(y)) return "probe";
+  if (/^continuous:/m.test(y)) return "continuous";
   if (/^sweep:/m.test(y)) return "sweep";
   return null;
 }
 
 export function NewRun({ me }: { me: Me }) {
+  usePageTitle("New run");
   const canRun = me.role === "operator" || me.role === "admin";
   const navigate = useNavigate();
   const [params] = useSearchParams();
@@ -167,7 +170,7 @@ export function NewRun({ me }: { me: Me }) {
   useEffect(() => {
     if (autoSync) return;
     const m = detectMode(yaml);
-    if (m && m !== mode) setMode(m);
+    if (m && m !== "continuous" && m !== mode) setMode(m);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [yaml, autoSync]);
 
@@ -204,6 +207,14 @@ export function NewRun({ me }: { me: Me }) {
   // we're guarding against. Returns true when it's safe to proceed.
   function modeMatchesEditor(): boolean {
     const ym = detectMode(yaml);
+    if (ym === "continuous") {
+      // Continuous workloads have their own lifecycle (never-ending, saved
+      // target required) and their own launch page — this form can't start one.
+      setErr("This is a continuous workload spec. Continuous workloads run until "
+        + "explicitly stopped and are started from the Continuous page, which "
+        + "requires a saved target with a stored password.");
+      return false;
+    }
     if (ym && ym !== mode) {
       const block = mode === "probe" ? "device_probe" : mode;
       setErr(`The spec in the editor is a ${ym} run, but “${mode}” is selected. `

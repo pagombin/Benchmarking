@@ -50,6 +50,7 @@ PACK_VARIANTS = (
 
 def _child_spec(spec: Spec, name: str, test_mode: str, block_kb: int,
                 keep_files: bool) -> Spec:
+    assert spec.device_probe is not None
     dp = dataclasses.replace(
         spec.device_probe, test_mode=test_mode, block_size_kb=block_kb,
         direct_io=True, keep_files=keep_files, pack=False)
@@ -228,6 +229,7 @@ def _pack_verdict(spec: Spec, children: list[dict[str, Any]]) -> dict[str, Any]:
 def build_pack_narrative(spec: Spec, children: list[dict[str, Any]],
                          identity: dict[str, Any]) -> str:
     dp = spec.device_probe
+    assert dp is not None
     lim = spec.limits
     pvc = identity.get("pvc") or {}
     pv = identity.get("pv") or {}

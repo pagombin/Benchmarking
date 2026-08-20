@@ -156,6 +156,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     # Cluster Ops routes live in their own module (same closure-style pattern).
     from pgbench_webapp import ops_routes
     ops_routes.register(app, cfg, store)
+    # Continuous Mode routes (lifecycle, historical metrics, outages, alerts).
+    from pgbench_webapp import continuous_routes
+    continuous_routes.register(app, cfg, store)
 
     def page(request: Request, name: str, user: Optional[sqlite3.Row], **ctx: Any) -> HTMLResponse:
         ctx.update(version=__version__, csrf=request.cookies.get("pgbench_csrf", ""),
@@ -172,7 +175,34 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/api/me")
     def api_me(user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         return JSONResponse({"user": user["username"], "role": user["role"],
-                             "version": __version__})
+                             "version": __version__, "sha": _git_sha()})
+
+    # ── system status: is the WORKER alive? (the console's status chip) ──
+    # The worker holds an exclusive flock on <data_dir>/worker.lock for its
+    # whole life; if we can grab it, nothing is claiming the queue.
+    @app.get("/api/worker/status")
+    def api_worker_status(user: sqlite3.Row = Depends(require("viewer")),
+                          conn: sqlite3.Connection = Depends(get_conn)) -> JSONResponse:
+        alive = False
+        lock_path = cfg.data_dir / "worker.lock"
+        if lock_path.exists():
+            import fcntl
+            try:
+                with open(lock_path, "r") as fh:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fh, fcntl.LOCK_UN)   # we got it => worker gone
+                    except OSError:
+                        alive = True                      # held => worker alive
+            except OSError:
+                pass
+        active = int(conn.execute(
+            "SELECT count(*) FROM jobs WHERE state IN ('running', 'canceling')"
+        ).fetchone()[0])
+        queued = int(conn.execute(
+            "SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0])
+        return JSONResponse({"worker_alive": alive, "active_jobs": active,
+                             "queued_jobs": queued})
 
     # ── auth ──
     @app.get("/login", response_class=HTMLResponse)
@@ -201,6 +231,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         _LOGIN_ATTEMPTS.pop(ip, None)
         token = new_token()
         expires = (datetime.now(timezone.utc) + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # opportunistic hygiene: expired sessions otherwise accumulate forever
+        conn.execute("DELETE FROM sessions WHERE expires_utc < ?", (utc_now_iso(),))
         queries.create_session(conn, token, row["id"], expires)
         queries.audit(conn, username, "login", detail=f"ip={ip}")
         resp = RedirectResponse("/", status_code=303)
@@ -362,6 +394,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
+        if v["mode"] == "continuous":
+            # continuous has its own lifecycle contract (saved target required,
+            # desired_state, one per target) enforced by its own endpoint
+            raise HTTPException(400, "continuous specs are started via "
+                                     "POST /api/continuous (the Continuous page), "
+                                     "not /api/runs")
         if v["mode"] in ("device-probe", "evidence-pack"):
             # destructive-adjacent: saturates the pgdata volume. Admin + the
             # in-spec arming flag (the runner refuses without it anyway).
@@ -658,7 +696,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(404, "run not found")
         out = run_dir / harness_api.report_filename(run_dir)
         if regen or not out.exists():
-            out = harness_api.generate_report(run_dir)
+            try:
+                out = harness_api.generate_report(run_dir)
+            except harness_api.HarnessError as exc:
+                # e.g. a continuous run (no static report) — a clean answer,
+                # not a 500
+                raise HTTPException(400, str(exc))
         return HTMLResponse(out.read_text(encoding="utf-8"))
 
     @app.get("/runs/{run_id}/report/download")
@@ -705,6 +748,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     _CSV_FILES = {"samples": "parsed/samples.csv",
                   "timeseries": "parsed/soak_timeseries.csv",
+                  "continuous": "parsed/cont_timeseries.csv",
                   "pg": "parsed/pg_timeseries.csv",
                   "device": "parsed/device_io.csv"}
 
@@ -717,8 +761,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         p = _run_dir_safe(cfg, run_id) / rel
         if not p.exists():
             raise HTTPException(404, "no such data for this run")
-        return Response(p.read_text(encoding="utf-8"), media_type="text/csv",
-                        headers={"Content-Disposition": f'attachment; filename="{run_id}-{which}.csv"'})
+        # stream from disk: a month-long continuous series is hundreds of MB —
+        # read_text() would buffer the whole file (twice) in the web tier
+        return FileResponse(p, media_type="text/csv",
+                            filename=f"{run_id}-{which}.csv")
 
     @app.get("/runs/{run_id}/spec")
     def run_spec(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
@@ -774,6 +820,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(409, "run has an active job; stop it first")
         # Index/control plane first, bytes second: a crash mid-delete leaves
         # reclaimable filesystem garbage, never a dangling index row.
+        for j in jobs:
+            if j["kind"] == "continuous":
+                # the fleet ledgers must never show rows for a deleted job
+                queries.purge_continuous_data(conn, int(j["id"]))
         queries.delete_jobs_for_run(conn, run_id)
         queries.delete_run(conn, run_id)
         for j in jobs:                                   # per-job secret + spec/out files
@@ -939,11 +989,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/api/admin/settings")
     def api_admin_settings(conn: sqlite3.Connection = Depends(get_conn),
                            user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        from pgbench_webapp.contprobe import get_alerts_config
         return JSONResponse({
             "notify": notify.get_config(conn),
             "base_url": queries.get_setting(conn, "base_url", ""),
             "do_cluster_id": queries.get_setting(conn, "do_cluster_id", ""),
             "max_concurrency": int(queries.get_setting(conn, "max_concurrency", "1") or 1),
+            "continuous_cap": int(queries.get_setting(conn, "continuous_cap", "4") or 4),
+            "heartbeat_url": queries.get_setting(conn, "heartbeat_url", ""),
+            "cont_alerts_config": get_alerts_config(conn),
+            "cont_retention_raw_h": int(queries.get_setting(conn, "cont_retention_raw_h", "72") or 72),
+            "cont_retention_days": int(queries.get_setting(conn, "cont_retention_days", "35") or 35),
             "has_smtp_pw": bool(store.get(notify.SMTP_PASSWORD_REF)),
             "has_slack": bool(store.get(notify.SLACK_WEBHOOK_REF)),
             "has_do_token": bool(store.get(provider.DO_TOKEN_REF))})
@@ -972,6 +1028,39 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                 queries.set_setting(conn, "max_concurrency", str(mc))
             except (TypeError, ValueError):
                 raise HTTPException(400, "max_concurrency must be an integer 1–16")
+        if payload.get("continuous_cap") is not None:
+            try:
+                cc = max(1, min(16, int(payload["continuous_cap"])))
+                queries.set_setting(conn, "continuous_cap", str(cc))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "continuous_cap must be an integer 1–16")
+        if "heartbeat_url" in payload:
+            url = str(payload.get("heartbeat_url") or "").strip()
+            if url and not url.startswith(("http://", "https://")):
+                raise HTTPException(400, "heartbeat_url must be an http(s) URL")
+            queries.set_setting(conn, "heartbeat_url", url)
+        for key, lo, hi in (("cont_retention_raw_h", 1, 24 * 14),
+                            ("cont_retention_days", 1, 365)):
+            if payload.get(key) is not None:
+                try:
+                    queries.set_setting(conn, key,
+                                        str(max(lo, min(hi, int(payload[key])))))
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{key} must be an integer")
+        if payload.get("cont_alerts_config") is not None:
+            from pgbench_webapp.contprobe import ALERTS_CONFIG_DEFAULTS
+            doc = payload["cont_alerts_config"]
+            if not isinstance(doc, dict):
+                raise HTTPException(400, "cont_alerts_config must be an object")
+            clean: dict = {}
+            for k, v in doc.items():
+                if k not in ALERTS_CONFIG_DEFAULTS:
+                    raise HTTPException(400, f"unknown alert threshold '{k}'")
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                    raise HTTPException(400, f"alert threshold '{k}' must be a "
+                                             "positive number")
+                clean[k] = v
+            queries.set_setting(conn, "cont_alerts_config", json.dumps(clean))
         # Secrets only updated when a new value is supplied (blank leaves as-is).
         if payload.get("smtp_password"):
             store.set(notify.SMTP_PASSWORD_REF, payload["smtp_password"])
@@ -983,12 +1072,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return JSONResponse({"ok": True})
 
     @app.post("/api/notify/test")
-    def notify_test(request: Request, conn: sqlite3.Connection = Depends(get_conn),
+    def notify_test(request: Request, payload: Optional[dict] = None,
+                    conn: sqlite3.Connection = Depends(get_conn),
                     user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
-        _check_csrf(request, request.headers.get("x-csrf-token"))
-        sent = notify.notify(conn, store, state="test", run_id=None,
-                             label="notification test", peak_qps=None)
-        return JSONResponse({"sent": sent})
+        """Test message on every configured channel; optional custom text; the
+        per-channel outcome is explicit so a broken webhook is diagnosable."""
+        _check_csrf(request, (payload or {}).get(CSRF_FIELD)
+                    or request.headers.get("x-csrf-token"))
+        text = str((payload or {}).get("text") or "")[:500]
+        channels = notify.notify_test(conn, store, text)
+        sent = [k for k, v in channels.items() if v.get("ok")]
+        return JSONResponse({"sent": sent, "channels": channels})
 
     # ── config templates (versioned) + spec diff ──
     @app.post("/api/templates")
@@ -1068,7 +1162,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         # an inverted [start, 0] window. Fall back to "now" so live runs still get a
         # valid window — and only cache once the run is terminal, since a mid-run
         # window is partial and must not be frozen as the final provider metrics.
-        terminal = m.get("status") in ("complete", "partial", "failed", "canceled")
+        terminal = m.get("status") in TERMINAL_STATES
         end_epoch = finished_epoch or int(time.time())
         data = provider.fetch_metrics(conn, store, queries.get_setting(conn, "do_cluster_id", ""),
                                       start_epoch, end_epoch)
@@ -1167,7 +1261,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
         yield from _emit_series()
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
-        if status in ("complete", "partial", "failed", "canceled"):
+        if status in TERMINAL_STATES:
             # Final drain before `done`: the harness writes its last log lines and
             # the terminal manifest status in the same instant, so bytes can land
             # AFTER this tick's reads above. Re-read log (incl. a trailing partial
@@ -1184,6 +1278,23 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
 def _event(name: str, data: Any) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+_GIT_SHA: Optional[str] = None
+
+
+def _git_sha() -> str:
+    """Short git SHA of the installed checkout (cached; best-effort)."""
+    global _GIT_SHA
+    if _GIT_SHA is None:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(_PKG), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5)
+            _GIT_SHA = out.stdout.strip() if out.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            _GIT_SHA = ""
+    return _GIT_SHA
 
 
 def _safe_segment(ref: str) -> str:
@@ -1383,7 +1494,7 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
     m = _manifest(run_dir)
     status = str(m.get("status", ""))
     created = _epoch(m.get("created_utc"))
-    if status in ("complete", "partial", "failed", "canceled"):
+    if status in TERMINAL_STATES:
         elapsed = int(m.get("wall_time_s") or 0)
     else:
         now = int(datetime.now(timezone.utc).timestamp())

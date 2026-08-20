@@ -388,6 +388,11 @@ def compare_runs(run_dirs: list[Path], out_path: Path) -> Path:
         raise ReportError("compare needs at least two runs",
                           hint="select two or more runs.")
     modes = {_run_mode(d) for d in run_dirs}
+    if "continuous" in modes:
+        raise ReportError(
+            "continuous runs have no finite summary to compare",
+            hint="use the console's Continuous view (windowed charts/summary "
+                 "APIs) to compare always-on workloads over a chosen window.")
     if len(modes) > 1:
         raise ReportError(
             "cannot compare runs of different types (" + ", ".join(sorted(modes)) + ")",
@@ -542,7 +547,7 @@ def generate_soak_compare(run_dirs: list[Path], out_path: Path) -> Path:
     if len(kpis) == 2 and kpis[0].get("median_tps") and \
             kpis[1].get("median_tps") is not None:
         base, other = kpis[0], kpis[1]
-        def _pct(a, b):
+        def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
             return (b - a) / a * 100 if (a and b is not None) else None
         deltas = {"median_tps": _pct(base["median_tps"], other["median_tps"]),
                   "p99": _pct(base["p99"], other["p99"]) if base.get("p99") else None}

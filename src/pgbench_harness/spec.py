@@ -122,6 +122,30 @@ class Soak:
 
 
 @dataclass(frozen=True)
+class Continuous:
+    """Always-on fixed-concurrency workload: runs until explicitly stopped.
+
+    Unlike soak there is no duration — the supervisor relaunches sysbench
+    forever with capped exponential backoff + full jitter. Segments are
+    time-bounded (``segment_time_s``) purely for log rotation: a healthy
+    segment ending at its planned boundary is relaunched immediately and is
+    NOT a failure/relaunch (an unbounded segment would grow one raw log file
+    forever, which no retention pass could ever prune).
+    """
+
+    threads: int
+    report_interval_s: int = 1
+    restart_backoff_s: tuple[int, ...] = (1, 2, 5, 10, 30, 60)
+    # 0 = never give up (default). >0 = after N consecutive instant-exit
+    # relaunches (segments that produced zero samples), stop LAUNCHING the
+    # load but keep the supervisor alive (heartbeating state.json) so the
+    # web tier's probing/alerting keeps running and a stop stays graceful.
+    max_consecutive_failures: int = 0
+    segment_time_s: int = 21600          # 6h planned rotation per raw segment log
+    segment_kill_grace_s: int = 10       # SIGTERM->SIGKILL grace on overrun/hang
+
+
+@dataclass(frozen=True)
 class Cluster:
     """Kube coordinates that make a run cluster-aware: storage identity is
     captured and the pgdata block device is sampled during the load. The
@@ -204,6 +228,7 @@ class Spec:
     capture: Capture
     report: ReportCfg
     soak: Optional[Soak] = None
+    continuous: Optional[Continuous] = None
     pmm: Optional[Pmm] = None
     suite: Optional[SuiteCfg] = None
     cluster: Optional[Cluster] = None
@@ -218,6 +243,10 @@ class Spec:
     @property
     def is_suite(self) -> bool:
         return self.suite is not None
+
+    @property
+    def is_continuous(self) -> bool:
+        return self.continuous is not None
 
     def password(self) -> str:
         """Resolve the target password from the configured environment variable."""
@@ -526,6 +555,46 @@ def _parse_soak(sec: dict[str, Any]) -> Soak:
     )
 
 
+def _parse_continuous(sec: dict[str, Any]) -> Continuous:
+    _check_keys(sec, "continuous", {"threads"},
+                {"report_interval_s", "restart_backoff_s",
+                 "max_consecutive_failures", "segment_time_s",
+                 "segment_kill_grace_s"})
+    threads = _typed(sec, "continuous", "threads", int)
+    if threads < 1:
+        raise SpecError("'continuous.threads' must be >= 1")
+    interval = _typed(sec, "continuous", "report_interval_s", int, 1)
+    if interval != 1:
+        # the historical-metrics pipeline (1s samples, 1m rollups with gap_s,
+        # gap-as-outage detection) models a dense per-second timeline; a
+        # coarser interval would score healthy seconds as gaps
+        raise SpecError("'continuous.report_interval_s' must be exactly 1 — "
+                        "the metrics pipeline models a dense per-second "
+                        "timeline (missing seconds read as downtime)")
+    backoff = _int_list(sec, "continuous", "restart_backoff_s",
+                        (1, 2, 5, 10, 30, 60))
+    if list(backoff) != sorted(backoff):
+        raise SpecError("'continuous.restart_backoff_s' must be non-decreasing")
+    max_fail = _typed(sec, "continuous", "max_consecutive_failures", int, 0)
+    if max_fail < 0:
+        raise SpecError("'continuous.max_consecutive_failures' must be >= 0 "
+                        "(0 = never give up)")
+    seg_time = _typed(sec, "continuous", "segment_time_s", int, 21600)
+    if seg_time < 1:
+        raise SpecError("'continuous.segment_time_s' must be >= 1")
+    kill_grace = _typed(sec, "continuous", "segment_kill_grace_s", int, 10)
+    if kill_grace < 0:
+        raise SpecError("'continuous.segment_kill_grace_s' must be >= 0")
+    return Continuous(
+        threads=threads,
+        report_interval_s=interval,
+        restart_backoff_s=backoff,
+        max_consecutive_failures=max_fail,
+        segment_time_s=seg_time,
+        segment_kill_grace_s=kill_grace,
+    )
+
+
 def _parse_suite(sec: dict[str, Any]) -> SuiteCfg:
     _check_keys(sec, "suite", {"duration_s"},
                 {"threads", "warmup_s", "cooldown_s", "workloads",
@@ -616,7 +685,7 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
     if not isinstance(doc, dict):
         raise SpecError(f"{source}: top level of the spec must be a mapping")
     known = {"run", "target", "workload", "sweep", "capture", "report", "soak", "pmm",
-             "suite", "cluster", "limits", "device_probe"}
+             "suite", "cluster", "limits", "device_probe", "continuous"}
     unknown = set(doc) - known
     if unknown:
         hint = ""
@@ -626,17 +695,19 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
             hint = (" — the 'events' section was removed; mark events live via the "
                     "console or `pgbench-harness mark`, or rely on auto-detection")
         raise SpecError(f"unknown top-level section(s): {', '.join(sorted(unknown))}{hint}")
-    modes = [m for m in ("sweep", "soak", "suite") if m in doc]
+    modes = [m for m in ("sweep", "soak", "suite", "continuous") if m in doc]
     if len(modes) > 1:
         raise SpecError(f"spec has {' and '.join(modes)}; they are mutually exclusive "
                         "(sweep = thread sweep, soak = resilience run, "
-                        "suite = full evidentiary matrix)")
+                        "suite = full evidentiary matrix, continuous = always-on load)")
     if not modes and "device_probe" not in doc:
         raise SpecError("spec must contain a 'sweep' (steady-state), 'soak' "
-                        "(resilience), 'suite' (evidence matrix), or 'device_probe' "
-                        "section")
+                        "(resilience), 'suite' (evidence matrix), 'continuous' "
+                        "(always-on), or 'device_probe' section")
     sweep = _parse_sweep(_section(doc, "sweep")) if "sweep" in doc else None
     soak = _parse_soak(_section(doc, "soak")) if "soak" in doc else None
+    continuous = (_parse_continuous(_section(doc, "continuous"))
+                  if "continuous" in doc else None)
     suite = _parse_suite(_section(doc, "suite")) if "suite" in doc else None
     cluster = _parse_cluster(_section(doc, "cluster")) if "cluster" in doc else None
     limits = _parse_limits(_section(doc, "limits")) if "limits" in doc else Limits()
@@ -662,6 +733,7 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
         capture=_parse_capture(doc.get("capture") or {}),
         report=_parse_report(doc.get("report") or {}, sweep),
         soak=soak,
+        continuous=continuous,
         pmm=pmm,
         suite=suite,
         cluster=cluster,

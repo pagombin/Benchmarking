@@ -161,6 +161,64 @@ MIGRATIONS: list[tuple[int, str]] = [
     (8, """
     ALTER TABLE jobs ADD COLUMN pid_start TEXT;
     """),
+    # 9: Continuous Mode — desired state vs. actual state (reboot survival),
+    #    the historical-metrics index (1s samples, 1m rollups, DB-side
+    #    snapshots, ingest cursors — all REBUILDABLE from the run directory
+    #    via `pgbench-web reindex-continuous`), the availability ledger
+    #    (outages), the stored alert history, and maintenance windows.
+    #    Timestamps are ISO-8601 UTC strings (lexicographic == chronological).
+    (9, """
+    ALTER TABLE jobs ADD COLUMN desired_state TEXT NOT NULL DEFAULT '';
+    CREATE TABLE cont_samples (          -- 1-second client-side samples (recent window)
+        job_id INTEGER NOT NULL, ts_utc TEXT NOT NULL,
+        tps REAL, qps REAL, qps_r REAL, qps_w REAL, qps_o REAL,
+        lat_p99 REAL, err_s REAL, reconn_s REAL, threads INTEGER, seg TEXT,
+        PRIMARY KEY (job_id, ts_utc)
+    ) WITHOUT ROWID;
+    CREATE TABLE cont_rollup_1m (        -- 1-minute aggregates (full retention horizon)
+        job_id INTEGER NOT NULL, ts_utc TEXT NOT NULL,   -- minute floor
+        n INTEGER, tps_avg REAL, tps_min REAL, tps_max REAL,
+        qps_avg REAL, lat_p99_avg REAL, lat_p99_max REAL,
+        err_sum REAL, reconn_sum REAL, gap_s INTEGER,    -- seconds with NO sample
+        PRIMARY KEY (job_id, ts_utc)
+    ) WITHOUT ROWID;
+    CREATE TABLE cont_db_metrics (       -- DB-side snapshots (raw counters, JSON)
+        job_id INTEGER NOT NULL, ts_utc TEXT NOT NULL,
+        metrics TEXT NOT NULL,
+        PRIMARY KEY (job_id, ts_utc)
+    ) WITHOUT ROWID;
+    CREATE TABLE cont_cursors (          -- ingest position per raw segment log
+        job_id INTEGER NOT NULL, seg TEXT NOT NULL,
+        pos INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (job_id, seg)
+    ) WITHOUT ROWID;
+    CREATE TABLE outages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL, kind TEXT NOT NULL,     -- 'read' | 'write' | 'load'
+        started_utc TEXT NOT NULL, ended_utc TEXT,       -- NULL while ongoing
+        duration_s REAL, error_class TEXT, first_error TEXT,
+        planned INTEGER NOT NULL DEFAULT 0               -- overlapped a maintenance window
+    );
+    CREATE TABLE alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER, type TEXT NOT NULL, severity TEXT NOT NULL,  -- info|warn|crit
+        fired_utc TEXT NOT NULL, resolved_utc TEXT,
+        dedup_key TEXT NOT NULL, context TEXT,           -- JSON detail
+        delivery TEXT, delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        delivered_utc TEXT,
+        last_notified_utc TEXT                           -- crit re-notify cadence
+    );
+    CREATE TABLE maintenance_windows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER,                                  -- NULL = global
+        starts_utc TEXT NOT NULL, ends_utc TEXT NOT NULL, note TEXT
+    );
+    CREATE INDEX idx_outages_job ON outages(job_id, started_utc);
+    CREATE INDEX idx_outages_open ON outages(job_id) WHERE ended_utc IS NULL;
+    CREATE INDEX idx_alerts_job ON alerts(job_id, fired_utc);
+    CREATE INDEX idx_alerts_open ON alerts(dedup_key) WHERE resolved_utc IS NULL;
+    CREATE INDEX idx_alerts_undelivered ON alerts(id) WHERE delivery IS NULL;
+    """),
 ]
 
 

@@ -159,7 +159,7 @@ def build_interactive(run_dir: Path, summary: dict[str, Any],
             "baseline_tps": summary.get("baseline", {}).get("tps") or None}
 
 
-def _soak_start(run_dir: Path):
+def _soak_start(run_dir: Path) -> Optional[Any]:
     """The soak's t=0 anchor (manifest.soak.start_utc) as a datetime, or None."""
     from pgbench_harness.soak import _parse_ts_loose
     try:

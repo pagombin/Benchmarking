@@ -614,7 +614,8 @@ def _validation(kube: Kube, run: OpsRun, t: Any, cfg: dict[str, Any],
     for pod in instances:
         raw = _pod_raw(kube, pod) or {}
         cs = (raw.get("status") or {}).get("containerStatuses") or []
-        pc = next((c for c in cs if c.get("name") == "pmm-client"), {})
+        pc: dict[str, Any] = next(
+            (c for c in cs if c.get("name") == "pmm-client"), {})
         rec = _psql(kube, pod, cfg["database"], "SELECT pg_is_in_recovery();")
         ext = _psql(kube, pod, cfg["database"],
                     f"SELECT 1 FROM pg_extension WHERE extname='{cfg['extension']}';")

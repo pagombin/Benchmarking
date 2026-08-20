@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — Continuous Mode: always-on benchmarking with an availability ledger
+
+- **New run mode `continuous:`** (`pgbench-harness continuous`): a
+  fixed-concurrency workload that runs **until explicitly stopped**, to
+  experience the platform like a real 24/7 customer. The supervisor
+  relaunches sysbench on any exit with a capped exponential backoff + full
+  jitter; auth failures are classified distinctly and jump straight to the
+  max interval. Raw logs rotate as timestamped segments
+  (`raw/cont_seg<NNNN>.log`, 6h default); `state.json` heartbeats supervisor
+  liveness; SIGTERM finalizes to `status: stopped` and exits 0.
+- **Reboot survival — desired state vs actual state.** `jobs.desired_state`
+  (`running`/`stopped`) records the durable user intent; a continuous job
+  whose harness process is gone while desired-running is re-queued and
+  relaunched with `--run-dir <same run>` (new segment, one unbroken
+  timeline) at worker startup (droplet reboot) or by the housekeeping tick
+  (harness crash, 30s holdoff). Explicit stops persist `stopped` BEFORE
+  signalling so nothing can resurrect them. Continuous jobs run in their own
+  worker lane (`continuous_cap`, default 4) and never occupy a benchmark
+  slot; submissions require a saved target (durable credential) and are
+  limited to one active workload per target.
+- **Historical metrics** (windows 10m…30d + custom ≤31 days): the worker
+  ingests the raw segments into SQLite — 1s samples (72h) and 1m rollups
+  with `gap_s` (35d) — with per-segment cursors and PK-idempotent replays;
+  `pgbench-web reindex-continuous --job N` rebuilds a job's index from the
+  run directory. A DB-side collector snapshots raw counters (connections,
+  pg_stat_database, WAL, checkpointer, archiver, replication lag, size,
+  dead tuples, pg_stat_statements top-N) every 15s; the API computes rates.
+- **Availability prober + outage ledger**: read (`SELECT 1`) and write
+  (single-row canary upsert) probes every 5s, healthy→degraded→down at 3
+  consecutive failures; outages (kind read/write/load) open and close in a
+  queryable ledger with durations and error classes; maintenance windows
+  mark overlapping outages `planned` and suppress their alerts.
+- **Alert engine + Slack**: store-first alert history with dedup while
+  unresolved, crit re-notify cadence, and rules for db_unreachable /
+  db_recovered / error_rate / latency / tps_drop (vs 24h median) /
+  auth_failure / harness_relaunch / load_gap / loadgen_disk / no_data.
+  Slack delivery retries up to 5× with backoff and records
+  delivery/attempts/delivered on each row. `POST /api/notify/test` now takes
+  optional custom text and reports per-channel success/failure. Optional
+  dead-man heartbeat GETs `heartbeat_url` every 60s while a workload runs.
+- **Console**: new Continuous fleet board (health dot, uptime 24h, TPS
+  sparkline, open-outage badge, stop/resume) and detail view (window pills +
+  shareable custom ranges, KPI band with uptime/MTBF/MTTR, charts with
+  outage/maintenance shading, DB-side panels, outage ledger, alert history,
+  maintenance CRUD); Settings gains the continuous lane cap, retention,
+  heartbeat URL and a friendly alert-thresholds form.
+
 ## Unreleased — pmm-enable refuses up front when the rollout is pinned
 
 - **Field failure (2026-08-04)**: pmm-enable patched the CR while a

@@ -41,6 +41,21 @@ if not os.environ.get("PGPASSWORD"):
 
 low = sql.lower()
 
+# Continuous-mode probe knobs: FAKE_PSQL_PROBE_FAIL in {read, write, all}
+# fails the corresponding probe with a connection error.
+_probe_fail = os.environ.get("FAKE_PSQL_PROBE_FAIL", "")
+if low == "select 1" and _probe_fail in ("read", "all"):
+    print("psql: error: connection to server failed: Connection refused",
+          file=sys.stderr)
+    sys.exit(2)
+if "pgbench_harness_canary" in low:
+    if _probe_fail in ("write", "all"):
+        print("psql: error: connection to server failed: Connection refused",
+              file=sys.stderr)
+        sys.exit(2)
+    print("INSERT 0 1")
+    sys.exit(0)
+
 if "pg_is_in_recovery" in low:
     # Cluster Ops write probe: answer from the fake kube cluster's state so
     # outages (pgkill/pod-delete/switchover/node-loss) are client-visible.
@@ -121,6 +136,45 @@ state_dir = os.environ.get("FAKE_PSQL_STATE", "")
 prepared = state_dir and os.path.exists(os.path.join(state_dir, "prepared"))
 wrong_schema = os.environ.get("FAKE_PSQL_WRONG_SCHEMA")
 
+# ── continuous-mode DB collector split queries. These match the EXACT query
+#    PREFIX (never substrings): the LivePgSampler's consolidated row_to_json
+#    query also mentions pg_stat_checkpointer / replay_lag / pg_stat_database,
+#    and a substring match here would shadow it and blank the sampler. ──
+if low.startswith("select count(*) filter (where state='active')"):
+    print("3|5|1|9")
+    sys.exit(0)
+if low.startswith("select xact_commit, xact_rollback"):
+    n = int(time.time())
+    print(f"{n * 90}|{n}|{n * 9000}|{n * 100}|0|2048")
+    sys.exit(0)
+if low.startswith("select wal_records, wal_bytes"):
+    n = int(time.time())
+    print(f"{n * 20}|{n * 80000}")
+    sys.exit(0)
+if low.startswith("select num_timed, num_requested from pg_stat_checkpointer"):
+    if os.environ.get("FAKE_PSQL_OLD_CKPT"):
+        print("ERROR:  relation \"pg_stat_checkpointer\" does not exist",
+              file=sys.stderr)
+        sys.exit(1)
+    print("12|3")
+    sys.exit(0)
+if low.startswith("select checkpoints_timed, checkpoints_req"):
+    print("40|7")
+    sys.exit(0)
+if low.startswith("select archived_count, failed_count"):
+    print("100|" + os.environ.get("FAKE_PSQL_ARCHIVE_FAILED", "0"))
+    sys.exit(0)
+if low.startswith("select coalesce(max(extract(epoch from replay_lag))"):
+    print("0.5|2")
+    sys.exit(0)
+if low.startswith("select coalesce(sum(n_dead_tup)"):
+    print("1234")
+    sys.exit(0)
+if low.startswith("select left(regexp_replace("):
+    print("SELECT c FROM sbtest1 WHERE id=?|50000|123456")
+    print("UPDATE sbtest2 SET k=k+1 WHERE id=?|20000|65432")
+    sys.exit(0)
+
 if low == "select 1":
     print("1")
 elif "select version()" in low:
@@ -137,7 +191,10 @@ elif "show pool_mode" in low:
     print('ERROR:  unrecognized configuration parameter "pool_mode"', file=sys.stderr)
     sys.exit(1)
 elif "pg_extension" in low:
-    print("0")
+    if "pg_stat_statements" in low and os.environ.get("FAKE_PSQL_PGSS") == "1":
+        print("1")
+    else:
+        print("0")
 elif "to_regclass" in low and "values" in low:
     # count of expected tables resolving on the search_path
     names = table_names(sql)

@@ -761,9 +761,11 @@ def preflight_steps(spec: Spec, password: str,
 
 
 def peak_threads(spec: Spec) -> int:
-    """Highest concurrency a run will reach (sweep or soak), for preflight sizing."""
+    """Highest concurrency a run will reach (any mode), for preflight sizing."""
     if spec.soak is not None:
         return spec.soak.threads
+    if spec.continuous is not None:
+        return spec.continuous.threads
     if spec.suite is not None:
         return max(spec.suite.threads)
     assert spec.sweep is not None
@@ -963,9 +965,11 @@ def _sample_dt(prev: dict[str, Any], cur: dict[str, Any]) -> float:
     (clock_timestamp at read time) so the rate denominator is the true sampling
     interval; fall back to the harness monotonic clock if db_epoch is unavailable."""
     try:
-        d = float(cur.get("db_epoch")) - float(prev.get("db_epoch"))
-        if d > 0:
-            return d
+        a, b = cur.get("db_epoch"), prev.get("db_epoch")
+        if a is not None and b is not None:
+            d = float(a) - float(b)
+            if d > 0:
+                return d
     except (TypeError, ValueError):
         pass
     return max(1e-9, float(cur["_mono"]) - float(prev["_mono"]))

@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { usePageTitle } from "../lib/ui";
 
 // Environment health (harness `doctor`): version, git SHA, sysbench/psql on PATH.
 export function Diagnostics() {
+  usePageTitle("Environment");
   const [text, setText] = useState("loading…");
   const [ok, setOk] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);

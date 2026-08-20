@@ -139,6 +139,16 @@ def delete_jobs_for_run(conn: sqlite3.Connection, run_id: str) -> None:
     conn.execute("DELETE FROM jobs WHERE run_id=?", (run_id,))
 
 
+def purge_continuous_data(conn: sqlite3.Connection, job_id: int) -> None:
+    """Remove a job's continuous-mode rows (samples/rollups/db metrics/cursors/
+    outages/alerts) — called when the run itself is deleted, so the fleet-wide
+    ledgers never show rows for a job that no longer exists."""
+    for table in ("cont_samples", "cont_rollup_1m", "cont_db_metrics",
+                  "cont_cursors", "outages", "alerts"):
+        conn.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
+    conn.execute("DELETE FROM maintenance_windows WHERE job_id=?", (job_id,))
+
+
 def delete_run(conn: sqlite3.Connection, run_id: str) -> None:
     conn.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
 
@@ -178,12 +188,14 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
 def enqueue_job(conn: sqlite3.Connection, kind: str, spec_yaml: str, target_id: Optional[int],
                 requested_by: str, scheduled_utc: Optional[str] = None,
                 resume_run_id: Optional[str] = None, options: Optional[str] = None,
-                kube_target_id: Optional[int] = None) -> int:
+                kube_target_id: Optional[int] = None,
+                desired_state: str = "") -> int:
     cur = conn.execute(
         "INSERT INTO jobs(kind, state, spec_yaml, target_id, scheduled_utc, created_utc, "
-        "requested_by, resume_run_id, options, kube_target_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "requested_by, resume_run_id, options, kube_target_id, desired_state) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (kind, "queued", spec_yaml, target_id, scheduled_utc, utc_now_iso(),
-         requested_by, resume_run_id, options, kube_target_id))
+         requested_by, resume_run_id, options, kube_target_id, desired_state))
     return int(cur.lastrowid or 0)
 
 
@@ -201,13 +213,22 @@ def list_jobs(conn: sqlite3.Connection, states: tuple[str, ...] = ()) -> list[sq
 def running_count(conn: sqlite3.Connection) -> int:
     """Running jobs that count against max_concurrency.
 
-    Telemetry monitors (ops_monitor) run indefinitely by design, so they get
-    their own lane: they never consume a benchmark/ops concurrency slot (a
-    single monitor would otherwise wedge the queue forever). Their own cap is
-    one per kube target, enforced at enqueue time.
+    Telemetry monitors (ops_monitor) and continuous workloads run indefinitely
+    by design, so they get their own lanes: they never consume a benchmark/ops
+    concurrency slot (one indefinite job would otherwise wedge the queue
+    forever). Monitors are capped at one per kube target at enqueue time;
+    continuous jobs have their own cap (the ``continuous_cap`` setting,
+    enforced by claim_next_job and mirrored in the worker loop's accounting).
     """
     return int(conn.execute("SELECT count(*) FROM jobs WHERE state='running' "
-                            "AND kind != 'ops_monitor'").fetchone()[0])
+                            "AND kind NOT IN ('ops_monitor', 'continuous')")
+               .fetchone()[0])
+
+
+def continuous_running_count(conn: sqlite3.Connection) -> int:
+    """Running jobs in the continuous lane (counts against continuous_cap)."""
+    return int(conn.execute("SELECT count(*) FROM jobs WHERE state='running' "
+                            "AND kind='continuous'").fetchone()[0])
 
 
 def update_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
@@ -217,20 +238,30 @@ def update_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
     conn.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*fields.values(), job_id))
 
 
-def claim_next_job(conn: sqlite3.Connection, max_concurrency: int) -> Optional[sqlite3.Row]:
-    """Atomically claim the oldest eligible queued job, honouring concurrency.
+def claim_next_job(conn: sqlite3.Connection, max_concurrency: int,
+                   continuous_cap: int = 4) -> Optional[sqlite3.Row]:
+    """Atomically claim the oldest eligible queued job, honouring per-lane
+    concurrency: benchmark/ops jobs against ``max_concurrency``, continuous
+    jobs against ``continuous_cap`` (their own lane — a 30-day workload must
+    never wedge the benchmark queue, and vice versa).
 
     A job is eligible if not scheduled in the future. Uses an immediate
     transaction so two workers can't claim the same row.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        if running_count(conn) >= max_concurrency:
+        bench_full = running_count(conn) >= max_concurrency
+        cont_full = continuous_running_count(conn) >= continuous_cap
+        if bench_full and cont_full:
             conn.execute("COMMIT")
             return None
+        where = "state='queued' AND (scheduled_utc IS NULL OR scheduled_utc <= ?)"
+        if bench_full:
+            where += " AND kind = 'continuous'"
+        if cont_full:
+            where += " AND kind != 'continuous'"
         row = conn.execute(
-            "SELECT * FROM jobs WHERE state='queued' "
-            "AND (scheduled_utc IS NULL OR scheduled_utc <= ?) ORDER BY id LIMIT 1",
+            f"SELECT * FROM jobs WHERE {where} ORDER BY id LIMIT 1",
             (utc_now_iso(),)).fetchone()
         if row is None:
             conn.execute("COMMIT")

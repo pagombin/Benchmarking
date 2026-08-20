@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { Job, Me, OpsRun, Run } from "../types";
 import { fmtInt, fmtWhen, relAge } from "../lib/format";
+import { usePageTitle } from "../lib/ui";
 
 const STATUSES = ["", "complete", "partial", "running", "failed"];
 const KINDS = [["", "All"], ["bench", "Benchmarks"], ["ops", "Cluster ops"]] as const;
@@ -42,6 +43,7 @@ function opsSummary(r: OpsRun): string {
 }
 
 export function History({ me }: { me: Me }) {
+  usePageTitle("Runs");
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [opsRuns, setOpsRuns] = useState<OpsRun[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);

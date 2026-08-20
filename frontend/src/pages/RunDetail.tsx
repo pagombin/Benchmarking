@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import type { Job, Me, Run } from "../types";
+import type { ContJob, Job, Me, Run } from "../types";
 import { LiveChart } from "../components/LiveChart";
 import { LogConsole } from "../components/LogConsole";
 import { SeriesTable } from "../components/SeriesTable";
@@ -10,6 +10,7 @@ import {
   appendBatch, appendPg, emptyPg, emptySeries, openStream, trimPg, trimSeries,
   type PgSeries, type Progress, type Series,
 } from "../lib/sse";
+import { usePageTitle } from "../lib/ui";
 
 function clock(s: number): string {
   const m = Math.floor(s / 60);
@@ -29,6 +30,7 @@ const PALETTE = {
 
 export function RunDetail({ me }: { me: Me }) {
   const { runId = "" } = useParams();
+  usePageTitle(runId);
   const [run, setRun] = useState<Run | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [series, setSeries] = useState<Series>(emptySeries());
@@ -54,6 +56,19 @@ export function RunDetail({ me }: { me: Me }) {
       .then((js) => setActiveJob(js.find((j) => j.run_id === runId) ?? null))
       .catch(() => {});
   }, [runId]);
+
+  // Continuous runs have no finite summary or SSE budget — their home is the
+  // continuous detail page (metrics, outages, alerts). Redirect there.
+  const nav = useNavigate();
+  useEffect(() => {
+    if (run?.mode !== "continuous") return;
+    api.get<ContJob[]>("/api/continuous")
+      .then((js) => {
+        const j = js.find((x) => x.run_id === runId);
+        if (j) nav(`/continuous/${j.id}`, { replace: true });
+      })
+      .catch(() => {});
+  }, [run?.mode, runId, nav]);
 
   useEffect(() => {
     if (!run || !["complete", "partial", "failed"].includes(run.status || "")) return;

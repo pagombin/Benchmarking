@@ -44,7 +44,7 @@ SUSTAIN_WINDOW_S = 10
 HIGH_IOPS_MARKERS = ("iops", "throughput", "qos", "performance", "burst")
 
 
-def _kube(spec: Spec):
+def _kube(spec: Spec) -> Any:
     from pgbench_harness.ops.kube import Kube
     assert spec.cluster is not None
     return Kube(context=spec.cluster.context, namespace=spec.cluster.namespace)
@@ -52,6 +52,7 @@ def _kube(spec: Spec):
 
 def _primary_pod(spec: Spec, kube: Any) -> str:
     from pgbench_harness.ops.discover import resolve_leader_resilient
+    assert spec.cluster is not None
     _instances, leader, _view, _attempts = resolve_leader_resilient(
         kube, spec.cluster.cr_name, timeout_s=45, poll_s=3)
     return leader
@@ -92,12 +93,13 @@ class DeviceIoSampler:
     RESPAWN_BACKOFF_S = 5.0
     MAX_RESPAWN_WARNINGS = 10
 
-    def __init__(self, spec: Spec, run_dir: Path, logger=None) -> None:
+    def __init__(self, spec: Spec, run_dir: Path,
+                 logger: Optional[Any] = None) -> None:
         self.spec = spec
         self.run_dir = run_dir
         self.logger = logger
         self._proc: Optional[subprocess.Popen] = None
-        self._fh = None
+        self._fh: Optional[Any] = None
         self._watch: Optional[threading.Thread] = None
         self._stopped = threading.Event()
         self._respawns = 0
@@ -215,7 +217,8 @@ class DeviceIoSampler:
             self._fh = None
 
 
-def capture_storage_identity(spec: Spec, run_dir: Path, logger=None) -> dict[str, Any]:
+def capture_storage_identity(spec: Spec, run_dir: Path,
+                             logger: Optional[Any] = None) -> dict[str, Any]:
     """PVC -> PV -> StorageClass -> placement, recorded as config evidence.
 
     "Config shows no high-IOPS marker" is itself evidence, so identical-to-

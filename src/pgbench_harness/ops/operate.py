@@ -58,7 +58,7 @@ def _pods_view(kube: Kube, cr_name: str) -> dict[str, Any]:
     return classify_pods(items, cr_name)
 
 
-def _watch_until(run: OpsRun, what: str, check, timeout_s: float,
+def _watch_until(run: OpsRun, what: str, check: Any, timeout_s: float,
                  poll_s: float = 2.0) -> bool:
     """Poll ``check()`` (returns (done, detail)) until done or timeout,
     streaming progress into status.json for the live cockpit."""
@@ -408,6 +408,7 @@ def _op_schedules(kube: Kube, run: OpsRun, spec: OpsSpec, params: dict[str, Any]
 
     plans = []
     if schedules is not None:
+        assert ridx is not None      # the unknown-repo abort above guarantees it
         cur = dict((repos[ridx] or {}).get("schedules") or {})
         merged = dict(cur)
         for k, v in schedules.items():
@@ -449,6 +450,7 @@ def _op_schedules(kube: Kube, run: OpsRun, spec: OpsSpec, params: dict[str, Any]
     pgb = (((after.get("spec") or {}).get("backups") or {}).get("pgbackrest") or {})
     ok = True
     if schedules is not None:
+        assert ridx is not None      # narrowed by the unknown-repo abort
         live = dict(((pgb.get("repos") or [{}])[ridx] or {}).get("schedules") or {})
         ok = ok and live == merged
         run.event("verify", f"schedules now {json.dumps(live)}")

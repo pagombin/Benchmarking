@@ -11,7 +11,7 @@ import signal
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from pgbench_harness import capture, report, report_soak, soak, sysbench
 from pgbench_harness.errors import PreflightError, RunError
@@ -80,6 +80,7 @@ def cmd_validate(spec_path: Path) -> int:
     """`validate` subcommand: parse + validate a spec without connecting (CI lint)."""
     spec = load_spec(spec_path)  # raises SpecError (CLI prints message + hint, exit 2)
     mode = ("soak" if spec.is_soak else "suite" if spec.is_suite
+            else "continuous" if spec.is_continuous
             else "sweep" if spec.sweep else "device-probe")
     print(f"OK: {spec_path} is valid.")
     print(f"  label    : {spec.run.label}  ({spec.run.edition} / {spec.run.tshirt_size})")
@@ -91,6 +92,10 @@ def cmd_validate(spec_path: Path) -> int:
         assert spec.soak is not None
         print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)} "
               f"(events: operator-marked only)")
+    elif spec.is_continuous:
+        assert spec.continuous is not None
+        print(f"  cont.    : {spec.continuous.threads} threads, runs until stopped "
+              f"(segments rotate every {fmt_duration(spec.continuous.segment_time_s)})")
     elif spec.is_suite:
         assert spec.suite is not None
         n = len(spec.suite.workloads) + (2 if spec.suite.pgbench else 0)
@@ -382,6 +387,14 @@ def _init_run(
     if resume:
         run_dir = run_dir_opt or _find_resume_dir(results_dir, spec.run.label)
         manifest = Manifest.load(run_dir)
+        if manifest.mode != "sweep":
+            # resuming a soak/continuous/suite dir as a sweep would replay the
+            # wrong plan against the wrong artifacts (levels vs segments)
+            raise RunError(
+                f"--resume points at a '{manifest.mode}' run ({run_dir.name}); "
+                "`run --resume` only resumes sweeps",
+                hint="soak/suite runs re-run fresh; continuous runs resume via "
+                     "`continuous --run-dir`.")
         return run_dir, manifest
     assert spec.sweep is not None
     run_id = make_run_id(spec.run.label)
@@ -486,6 +499,7 @@ def _execute_level(
     lvl: Level, logger: logging.Logger, live: Optional[IncrementalCsvWriter] = None,
 ) -> None:
     """Run one (rep, threads) level: stats snapshots, sysbench, outcome bookkeeping."""
+    assert spec.sweep is not None
     raw_rel = f"raw/{lvl.key}.log"
     lvl.raw_log = raw_rel
     lvl.status = STATUS_RUNNING
@@ -847,10 +861,11 @@ def _soak_supervisor(
             # the child so the clean-abort path runs instead of ENOSPC
             # corrupting artifacts days in.
             inner_cb = _live_soak_callback(live, base_dt, seen_offsets, seg_log.stem)
-            disk_state = {"next_check": time.monotonic() + 60.0}
+            disk_state: dict = {"next_check": time.monotonic() + 60.0}
 
             def _cb(ts_iso: str, red_line: str,
-                    _inner=inner_cb, _ds=disk_state) -> None:
+                    _inner: Callable[[str, str], None] = inner_cb,
+                    _ds: dict = disk_state) -> None:
                 _inner(ts_iso, red_line)
                 if time.monotonic() >= _ds["next_check"]:
                     _ds["next_check"] = time.monotonic() + 60.0
@@ -1070,7 +1085,7 @@ def cmd_soak(
     # current child explicitly, or a single-segment soak would keep running
     # for up to the whole remaining window (days) before seeing the flag.
     import signal
-    stop = {"flag": False, "procs": {}}
+    stop: dict = {"flag": False, "procs": {}}
 
     def _on_signal(_signum: int, _frame: object) -> None:
         stop["flag"] = True
@@ -1187,6 +1202,12 @@ def cmd_report(run_dir: Path) -> int:
     """`report` subcommand: regenerate the report for an existing run (sweep or soak)."""
     setup_logging()
     mode = Manifest.load(run_dir).mode
+    if mode == "continuous":
+        raise RunError(
+            "continuous runs have no static HTML report — they have no finite "
+            "window to report on",
+            hint="the console's Continuous view (windowed charts, outage ledger, "
+                 "alert history) is the reporting surface; export CSVs from there.")
     if mode in ("suite", "probe"):
         from pgbench_harness import report_evidence
         out = report_evidence.generate_evidence_report(run_dir)
@@ -1221,7 +1242,8 @@ def cluster_target_mismatch(spec: Spec) -> str:
     return ""
 
 
-def _start_observation(spec: Spec, run_dir: Path, logger: logging.Logger):
+def _start_observation(spec: Spec, run_dir: Path,
+                       logger: logging.Logger) -> Optional[Any]:
     """Cluster-aware evidence capture: storage identity + 1s device sampler.
     Pure-SQL runs (no cluster: section) skip this entirely; any failure is a
     recorded warning, never a run failure."""

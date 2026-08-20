@@ -189,7 +189,8 @@ def scan_crash_validity(raw_dir: Path, fire_ms: Optional[int],
             if not _GRACEFUL_SHUTDOWN.search(line):
                 continue
             ts = _line_ts_ms(line)
-            if lo is None or (ts is not None and lo <= ts <= hi):
+            if lo is None or (ts is not None and lo <= ts
+                              and (hi is None or ts <= hi)):
                 return {"graceful": True, "marker_ms": ts,
                         "line": line.strip()[:200]}
     return {"graceful": False, "marker_ms": None, "line": ""}

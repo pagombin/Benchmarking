@@ -1,37 +1,40 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
-import type { Me } from "../types";
-import { csrfToken } from "../api";
+import type { Me, WorkerStatus } from "../types";
+import { api, csrfToken } from "../api";
 import { useTheme } from "../lib/theme";
 import { Palette } from "./Palette";
 
-// Grouped sidebar navigation — the enterprise-console IA: observe first,
-// then the two harness domains, then administration.
+// Grouped sidebar navigation — enterprise-console IA: the workloads you run,
+// the fleet you run them against, what you observe, then administration.
 interface NavItem { to: string; label: string; icon: string; admin?: boolean; op?: boolean }
 interface NavGroup { title: string; items: NavItem[] }
 
 const GROUPS: NavGroup[] = [
   {
-    title: "Observe",
+    title: "Workloads",
     items: [
       { to: "/", label: "Runs", icon: "▤" },
+      { to: "/continuous", label: "Continuous", icon: "∞" },
+      { to: "/new", label: "New run", icon: "＋" },
       { to: "/tasks", label: "Tasks", icon: "☰" },
     ],
   },
   {
-    title: "Benchmarking",
+    title: "Fleet",
     items: [
-      { to: "/new", label: "New run", icon: "＋" },
       { to: "/targets", label: "DB targets", icon: "⛁" },
-      { to: "/compare", label: "Compare", icon: "⇄" },
-      { to: "/diagnostics", label: "Environment", icon: "✓", op: true },
+      { to: "/ops", label: "Clusters", icon: "⬡" },
+      { to: "/ops/runs", label: "Ops runs", icon: "◷" },
     ],
   },
   {
-    title: "Cluster Ops",
+    title: "Observability",
     items: [
-      { to: "/ops", label: "Clusters", icon: "⬡" },
-      { to: "/ops/runs", label: "Ops runs", icon: "◷" },
+      { to: "/alerts", label: "Alerts", icon: "!" },
+      { to: "/outages", label: "Outages", icon: "◍" },
+      { to: "/compare", label: "Compare", icon: "⇄" },
+      { to: "/diagnostics", label: "Environment", icon: "✓", op: true },
     ],
   },
   {
@@ -43,6 +46,38 @@ const GROUPS: NavGroup[] = [
     ],
   },
 ];
+
+/** Slim system chip: is the platform itself up (web = this page loaded;
+ *  worker = the flock probe), and what is the queue doing. */
+function SystemChip() {
+  const [ws, setWs] = useState<WorkerStatus | null>(null);
+  const [err, setErr] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const poll = () =>
+      api.get<WorkerStatus>("/api/worker/status")
+        .then((d) => { if (alive) { setWs(d); setErr(false); } })
+        .catch(() => { if (alive) setErr(true); });
+    poll();
+    const t = setInterval(poll, 30000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+  if (err) return <span className="badge failed" title="status probe failed">console degraded</span>;
+  if (!ws) return null;
+  if (!ws.worker_alive) {
+    return <span className="badge failed"
+                 title="no process holds the worker lock — queued jobs will not start">
+      worker down
+    </span>;
+  }
+  const busy = ws.active_jobs > 0 || ws.queued_jobs > 0;
+  return (
+    <span className={`badge ${busy ? "running" : "complete"}`}
+          title={`worker alive · ${ws.active_jobs} active / ${ws.queued_jobs} queued`}>
+      worker ok{busy ? ` · ${ws.active_jobs} active` : ""}
+    </span>
+  );
+}
 
 export function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
   const [theme, toggle] = useTheme();
@@ -103,11 +138,12 @@ export function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
             pgbench<span className="tick">/</span><span className="dim">harness</span>
           </div>
           <div className="spacer" />
-          <span className="subtle" style={{ fontSize: 12 }}>times are UTC</span>
+          <SystemChip />
+          <span className="subtle" style={{ fontSize: 12, marginLeft: 10 }}>times are UTC</span>
         </header>
         <main className="page">{children}</main>
         <footer className="foot">
-          pgbench-harness {me.version} · self-signed TLS — verify the fingerprint shown at install
+          pgbench-harness {me.version}{me.sha ? ` · ${me.sha}` : ""} · self-signed TLS — verify the fingerprint shown at install
         </footer>
       </div>
 
