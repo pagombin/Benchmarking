@@ -362,11 +362,19 @@ def probe_job_loop(cfg: Config, job_id: int,
     except Exception:  # noqa: BLE001 — a prober death must not take the worker down
         pass
     finally:
-        for t in (read_t, write_t, load_t):
-            try:
-                t.close_open_outage("job stopped")
-            except sqlite3.Error:
-                pass
+        try:
+            still_active = _job_active(conn, job_id)
+        except sqlite3.Error:
+            still_active = True
+        if not still_active:
+            # the job STOPPED: an open ledger row must not dangle forever.
+            # If the loop merely paused (bounded test run / prober restart),
+            # leave open outages alone — a fresh tracker re-adopts them.
+            for t in (read_t, write_t, load_t):
+                try:
+                    t.close_open_outage("job stopped")
+                except sqlite3.Error:
+                    pass
         LAST_PROBE_TICK.pop(job_id, None)
         conn.close()
 

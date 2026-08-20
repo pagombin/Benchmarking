@@ -140,6 +140,30 @@ def test_batched_delete_clears_large_backlog(bcfg):
     conn.close()
 
 
+# ── prober exit closes open outages ONLY when the job truly stopped ─
+
+def test_prober_exit_keeps_outage_open_unless_job_stopped(bcfg):
+    from pgbench_webapp import contprobe, queries
+    cfg = bcfg
+    conn = _conn(cfg)
+    jid = queries.enqueue_job(conn, "continuous", "spec: {}", None, "t",
+                              desired_state="running")
+    queries.update_job(conn, jid, state="running")
+    t = contprobe.OutageTracker(conn, jid, "read", 1)
+    t.observe(False, "connection refused")
+    # a bounded prober pass over an ACTIVE job (no target resolvable -> it
+    # just ticks) must leave the open outage alone
+    contprobe.probe_job_loop(cfg, jid, max_ticks=1)
+    assert conn.execute("SELECT ended_utc FROM outages").fetchone()["ended_utc"] is None
+    # once the job stops, the exiting prober closes the dangling row
+    queries.update_job(conn, jid, state="canceled", desired_state="stopped")
+    contprobe.probe_job_loop(cfg, jid, max_ticks=1)
+    row = conn.execute("SELECT * FROM outages").fetchone()
+    assert row["ended_utc"] is not None
+    assert "[job stopped]" in (row["first_error"] or "")
+    conn.close()
+
+
 # ── B-003 / B-004: CLI tolerance for the continuous mode ────────────
 
 def test_compare_refuses_continuous_cleanly(tmp_path):
