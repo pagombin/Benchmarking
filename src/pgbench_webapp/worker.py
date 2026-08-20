@@ -545,6 +545,29 @@ def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
         conn.close()
 
 
+def _acquire_singleton_lock(cfg: Config) -> Optional[Any]:
+    """Exclusive flock on <data_dir>/worker.lock, held for the process's life.
+
+    The whole design assumes ONE claimer (reconcile adopts orphans by pid,
+    probers own outage rows, housekeeping requeues) — a second worker process
+    against the same data dir would double-probe, double-ingest, and race the
+    reconcile. claim_next_job's BEGIN IMMEDIATE prevents double-CLAIMS either
+    way; this lock refuses the second process outright with a clear error.
+    Returns the open file handle (keep a reference!) or None if already held.
+    """
+    import fcntl
+    ensure_dirs(cfg)
+    fh = open(cfg.data_dir / "worker.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(f"{os.getpid()}\n")
+    fh.flush()
+    return fh
+
+
 def worker_loop(cfg: Optional[Config] = None) -> None:
     """Long-running poll loop (the ``pgbench-worker`` service).
 
@@ -555,6 +578,12 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
     """
     cfg = cfg or load_config()
     ensure_dirs(cfg)
+    lock = _acquire_singleton_lock(cfg)
+    if lock is None:
+        raise SystemExit(
+            "another pgbench-worker already holds the data-dir lock "
+            f"({cfg.data_dir / 'worker.lock'}) — a second worker would "
+            "double-probe and race the reconcile; refusing to start.")
     conn = connect(cfg.db_path)
     reconcile_startup(cfg, conn)
     contworker.start_background(cfg)   # continuous-mode ingest/probe/alert threads

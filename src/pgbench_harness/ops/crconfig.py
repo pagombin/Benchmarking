@@ -640,7 +640,7 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
         ttl = _eff("ttl", "leaderLeaseDurationSeconds", 30.0)
         loop_wait = _eff("loop_wait", "syncPeriodSeconds", 10.0)
         retry = _eff("retry_timeout", "", 10.0)
-        if None in (ttl, loop_wait, retry):
+        if ttl is None or loop_wait is None or retry is None:
             run.finalize("failed", error="patroni_dcs: ttl/loop_wait/"
                          "retry_timeout must be numeric")
             return EXIT_FAILED
@@ -692,7 +692,7 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
         # and refuse to call drift a success.
         dcs_drift: dict[str, str] = {}
         for name, value in settings.items():
-            node: Any = dcs_pre
+            node = dcs_pre
             for seg in name.split("."):
                 node = node.get(seg) if isinstance(node, dict) else None
             if node is not None and str(node).lower() != str(coerce(value)).lower():
@@ -729,7 +729,7 @@ def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
         live = {}
         if isinstance(doc, dict):
             for name in settings:
-                node: Any = doc
+                node = doc
                 for seg in name.split("."):
                     node = node.get(seg) if isinstance(node, dict) else None
                 live[name] = node
@@ -1085,8 +1085,8 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             atomic_write_text(run.run_dir / "validation.json", json.dumps(
                 {"blockers": blockers, "warnings": warnings, "forced": force},
                 indent=2))
-        for w in warnings:
-            run.event("validate", "hazard warning", w)
+        for warn_line in warnings:
+            run.event("validate", "hazard warning", warn_line)
         if blockers:
             if force:
                 run.event("validate", "hazards OVERRIDDEN (force=true)",

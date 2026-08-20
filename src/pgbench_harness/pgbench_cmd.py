@@ -63,7 +63,7 @@ def parse_pgbench_progress(line: str) -> Optional[IntervalSample]:
     lat = 0.0 if "nan" in m.group("lat").lower() else float(m.group("lat"))
     failed = float(m.group("failed") or 0)
     return IntervalSample(
-        t_offset=float(m.group("t")), threads=0, tps=tps, qps=tps,
+        t_offset=int(float(m.group("t"))), threads=0, tps=tps, qps=tps,
         r=0.0, w=0.0, o=0.0, lat_pct=0, lat_ms=lat, err_s=failed, reconn_s=0.0)
 
 

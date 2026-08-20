@@ -109,11 +109,12 @@ def workload_descriptions(spec: Spec) -> list[dict[str, Any]]:
         segs = [IO_STRESS_MIXES[w.mix] if w.type == "io_stress" else w.type]
     out = []
     for seg in segs:
-        d = dict(WORKLOAD_SQL.get(seg, {"driver": "?", "label": seg,
-                                        "per_txn": [], "profile": ""}))
+        d: dict[str, Any] = dict(WORKLOAD_SQL.get(
+            seg, {"driver": "?", "label": seg, "per_txn": [], "profile": ""}))
         d["workload"] = seg
         if spec.workload.rand_type and d.get("driver") == "sysbench":
-            d["profile"] += f"; key distribution: --rand-type={spec.workload.rand_type}"
+            d["profile"] = (str(d.get("profile") or "")
+                            + f"; key distribution: --rand-type={spec.workload.rand_type}")
         out.append(d)
     return out
 

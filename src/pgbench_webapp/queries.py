@@ -139,6 +139,16 @@ def delete_jobs_for_run(conn: sqlite3.Connection, run_id: str) -> None:
     conn.execute("DELETE FROM jobs WHERE run_id=?", (run_id,))
 
 
+def purge_continuous_data(conn: sqlite3.Connection, job_id: int) -> None:
+    """Remove a job's continuous-mode rows (samples/rollups/db metrics/cursors/
+    outages/alerts) — called when the run itself is deleted, so the fleet-wide
+    ledgers never show rows for a job that no longer exists."""
+    for table in ("cont_samples", "cont_rollup_1m", "cont_db_metrics",
+                  "cont_cursors", "outages", "alerts"):
+        conn.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
+    conn.execute("DELETE FROM maintenance_windows WHERE job_id=?", (job_id,))
+
+
 def delete_run(conn: sqlite3.Connection, run_id: str) -> None:
     conn.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
 

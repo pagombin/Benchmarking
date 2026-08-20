@@ -76,7 +76,8 @@ def leader_by_label(pods: list[dict[str, Any]]) -> Optional[str]:
 
 def resolve_leader_resilient(kube: Any, cr_name: str, timeout_s: float = 120,
                              poll_s: float = 5.0,
-                             notify=None) -> tuple[list[str], str, Any, list[str]]:
+                             notify: Optional[Any] = None,
+                             ) -> tuple[list[str], str, Any, list[str]]:
     """Leader discovery that survives mid-roll elections and dying exec targets.
 
     Strategy per attempt: (1) the operator's role label on pods (no exec at

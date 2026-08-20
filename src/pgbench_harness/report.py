@@ -336,7 +336,7 @@ def _read_env(env_dir: Path, name: str) -> str:
     return p.read_text(encoding="utf-8").strip() if p.exists() else "n/a"
 
 
-def build_pmm_links(spec: Spec, start_iso: str, end_iso: str):
+def build_pmm_links(spec: Spec, start_iso: str, end_iso: str) -> Any:
     """PMM UI deep links scoped to the run's window. Grafana (PMM3's UI) takes
     epoch-milliseconds ``from``/``to`` query params on /graph/d/... URLs."""
     if spec.pmm is None:

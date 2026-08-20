@@ -112,7 +112,7 @@ def _level_window(spec: Spec) -> tuple[int, int]:
     return spec.suite.warmup_s, spec.suite.duration_s
 
 
-def _parse_level_log(log_path, seg: str) -> ParsedLog:
+def _parse_level_log(log_path: Path, seg: str) -> ParsedLog:
     """Driver-aware raw-log parse: pgbench segments use the pgbench parser."""
     if seg.startswith("pgbench"):
         from pgbench_harness.pgbench_cmd import parse_pgbench_progress

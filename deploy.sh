@@ -645,7 +645,11 @@ install_systemd_units() {
   fi
 }
 
-# Fallback unit writer (used only if packaging/systemd/* is missing).
+# Fallback unit writer (used only if packaging/systemd/* is missing). These
+# heredocs MUST stay directive-identical to packaging/systemd/*.service — the
+# two had drifted (the fallback lacked the hardening block), and a droplet
+# installed from a partial checkout silently ran with weaker units.
+# tests/test_deploy_units.py compares them programmatically.
 write_builtin_unit() {
   local unit="$1"
   case "${unit}" in
@@ -653,6 +657,7 @@ write_builtin_unit() {
       cat >"${SYSTEMD_DIR}/${unit}" <<EOF
 [Unit]
 Description=pgbench-harness web UI (uvicorn, TLS)
+Documentation=file://${APP_DIR}/OPERATIONS.md
 After=network-online.target
 Wants=network-online.target
 
@@ -665,11 +670,23 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${BIN_WEB}
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGINT
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+UMask=0077
 ReadWritePaths=${DATA_DIR} ${LOG_DIR}
+AmbientCapabilities=
+CapabilityBoundingSet=
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
 
 [Install]
 WantedBy=multi-user.target
@@ -678,7 +695,8 @@ EOF
     "${WORKER_UNIT}")
       cat >"${SYSTEMD_DIR}/${unit}" <<EOF
 [Unit]
-Description=pgbench-harness queue worker
+Description=pgbench-harness queue worker (runs sysbench / psql jobs)
+Documentation=file://${APP_DIR}/OPERATIONS.md
 After=network-online.target
 Wants=network-online.target
 
@@ -692,13 +710,22 @@ EnvironmentFile=-${SECRETS_ENV_FILE}
 ExecStart=${BIN_WORKER}
 Restart=on-failure
 RestartSec=3
-KillMode=process
 TimeoutStopSec=120
+KillSignal=SIGTERM
+KillMode=process
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=false
+UMask=0077
 ReadWritePaths=${DATA_DIR} ${LOG_DIR}
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
 
 [Install]
 WantedBy=multi-user.target

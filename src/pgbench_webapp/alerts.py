@@ -198,14 +198,19 @@ def deliver_pending(conn: sqlite3.Connection, store: Any, *,
     n = 0
     for row in rows:
         n += 1
-        if not enabled:
-            record_delivery(conn, int(row["id"]), DELIVERY_NONE, 0, False)
+        try:
+            if not enabled:
+                record_delivery(conn, int(row["id"]), DELIVERY_NONE, 0, False)
+                continue
+            ok, tries = send_with_retry(send, webhook or "",
+                                        slack_text(conn, row, base_url),
+                                        attempts=attempts, base_delay_s=base_delay_s)
+            record_delivery(conn, int(row["id"]),
+                            DELIVERY_OK if ok else DELIVERY_FAILED, tries, ok)
+        except sqlite3.Error:
+            # one row's bookkeeping hiccup (locked db) must not stall the
+            # queue behind it; the row stays pending and retries next tick
             continue
-        ok, tries = send_with_retry(send, webhook or "",
-                                    slack_text(conn, row, base_url),
-                                    attempts=attempts, base_delay_s=base_delay_s)
-        record_delivery(conn, int(row["id"]),
-                        DELIVERY_OK if ok else DELIVERY_FAILED, tries, ok)
     return n
 
 

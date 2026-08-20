@@ -28,11 +28,10 @@ def _chart_scaling(segs: dict[str, list[dict]], metric: str, title: str,
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(7.5, 4))
     for seg, rows in segs.items():
-        pts = [(r["threads"], r.get(metric)) for r in rows
-               if r.get(metric) is not None]
-        if pts:
-            ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                    marker="o", label=seg)
+        xs = [int(r["threads"]) for r in rows if r.get(metric) is not None]
+        ys = [float(r[metric]) for r in rows if r.get(metric) is not None]
+        if xs:
+            ax.plot(xs, ys, marker="o", label=seg)
     ax.set_xscale("log", base=2)
     ax.set_xlabel("clients / threads")
     ax.set_ylabel(ylabel)

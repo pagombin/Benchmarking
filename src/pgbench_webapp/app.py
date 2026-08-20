@@ -204,6 +204,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         _LOGIN_ATTEMPTS.pop(ip, None)
         token = new_token()
         expires = (datetime.now(timezone.utc) + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # opportunistic hygiene: expired sessions otherwise accumulate forever
+        conn.execute("DELETE FROM sessions WHERE expires_utc < ?", (utc_now_iso(),))
         queries.create_session(conn, token, row["id"], expires)
         queries.audit(conn, username, "login", detail=f"ip={ip}")
         resp = RedirectResponse("/", status_code=303)
@@ -719,6 +721,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     _CSV_FILES = {"samples": "parsed/samples.csv",
                   "timeseries": "parsed/soak_timeseries.csv",
+                  "continuous": "parsed/cont_timeseries.csv",
                   "pg": "parsed/pg_timeseries.csv",
                   "device": "parsed/device_io.csv"}
 
@@ -731,8 +734,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         p = _run_dir_safe(cfg, run_id) / rel
         if not p.exists():
             raise HTTPException(404, "no such data for this run")
-        return Response(p.read_text(encoding="utf-8"), media_type="text/csv",
-                        headers={"Content-Disposition": f'attachment; filename="{run_id}-{which}.csv"'})
+        # stream from disk: a month-long continuous series is hundreds of MB —
+        # read_text() would buffer the whole file (twice) in the web tier
+        return FileResponse(p, media_type="text/csv",
+                            filename=f"{run_id}-{which}.csv")
 
     @app.get("/runs/{run_id}/spec")
     def run_spec(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
@@ -788,6 +793,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(409, "run has an active job; stop it first")
         # Index/control plane first, bytes second: a crash mid-delete leaves
         # reclaimable filesystem garbage, never a dangling index row.
+        for j in jobs:
+            if j["kind"] == "continuous":
+                # the fleet ledgers must never show rows for a deleted job
+                queries.purge_continuous_data(conn, int(j["id"]))
         queries.delete_jobs_for_run(conn, run_id)
         queries.delete_run(conn, run_id)
         for j in jobs:                                   # per-job secret + spec/out files

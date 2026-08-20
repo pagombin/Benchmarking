@@ -117,7 +117,7 @@ def parse_ops_spec(doc: Any) -> OpsSpec:
                             f"{', '.join(OPERATE_OPERATIONS)} (got '{operation or '<missing>'}')")
         if operation == "scale":
             try:
-                n = int(params.get("replicas"))
+                n = int(str(params.get("replicas")))
             except (TypeError, ValueError):
                 raise SpecError("ops spec: scale needs integer params.replicas")
             if not 1 <= n <= 16:
