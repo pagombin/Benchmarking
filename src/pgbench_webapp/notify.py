@@ -82,6 +82,41 @@ def _send_slack(webhook: Optional[str], text: str) -> bool:
     return True
 
 
+def notify_test(conn: sqlite3.Connection, store: SecretStore,
+                text: str = "") -> dict[str, dict[str, Any]]:
+    """Send a test message on every configured channel, reporting per-channel
+    success/failure EXPLICITLY (the plain notify() swallows errors, which makes
+    'why didn't my webhook fire' undiagnosable from the UI)."""
+    c = get_config(conn)
+    subject = "[pgbench-harness] test notification"
+    body = text.strip() or ("This is a test notification from the "
+                            "pgbench-harness console.")
+    webhook = store.get(SLACK_WEBHOOK_REF)
+    out: dict[str, dict[str, Any]] = {
+        "email": {"configured": bool((c.get("smtp") or {}).get("host")),
+                  "ok": False, "error": ""},
+        "slack": {"configured": bool((c.get("slack") or {}).get("enabled"))
+                  and bool(webhook), "ok": False, "error": ""},
+    }
+    if out["email"]["configured"]:
+        try:
+            out["email"]["ok"] = _send_email(c, store.get(SMTP_PASSWORD_REF),
+                                             subject, body)
+            if not out["email"]["ok"]:
+                out["email"]["error"] = "no recipient (smtp.to) configured"
+        except Exception as exc:  # noqa: BLE001 — report, never raise
+            out["email"]["error"] = str(exc)[:300]
+    if out["slack"]["configured"]:
+        try:
+            out["slack"]["ok"] = _send_slack(webhook, f"*{subject}*\n{body}")
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            if webhook:
+                err = err.replace(webhook, "***")   # never echo the secret URL
+            out["slack"]["error"] = err[:300]
+    return out
+
+
 def notify_health(conn: sqlite3.Connection, store: SecretStore, *, target: str,
                   prev_status: str, status: str, summary: str = "") -> list[str]:
     """Health TRANSITION alert (ok→warn, warn→crit, recovery...). Same
