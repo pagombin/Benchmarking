@@ -76,8 +76,18 @@ def requeue_continuous(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     Records a ``loadgen_restart`` event in the run's events.jsonl and an
     informational ``harness_relaunch`` alert row.
     """
-    queries.update_job(conn, job["id"], state="queued", pid=None, pid_start="",
-                       exit_code=None, error="", finished_utc=None)
+    # Conditional on the DURABLE intent: a stop that raced this decision (set
+    # desired_state='stopped' after we read the row) must win — never
+    # resurrect an explicitly stopped workload.
+    # (callers guarantee the harness process is gone: reconcile checked the
+    # pid, housekeeping filters terminal states — so 'running' here is stale)
+    conn.execute(
+        "UPDATE jobs SET state='queued', pid=NULL, pid_start='', exit_code=NULL, "
+        "error='', finished_utc=NULL WHERE id=? AND desired_state='running' "
+        "AND state != 'canceling'", (job["id"],))
+    fresh = queries.get_job(conn, job["id"])
+    if fresh is None or fresh["state"] != "queued":
+        return                       # the stop (or someone else) won the race
     _append_run_event(cfg.results_dir, job["run_id"], "loadgen_restart",
                       "harness relaunch", reason)
     try:
@@ -207,6 +217,9 @@ def dead_man_heartbeat(cfg: Config, conn: sqlite3.Connection) -> bool:
 # ── the alert engine: sample/collector/supervisor-derived conditions ─
 
 ENGINE_TICK_S = 10.0
+# worker-process start (monotonic): the no_data rule waits this long after a
+# boot before it may declare the pipeline wedged (probe ticks are in-process)
+_ENGINE_EPOCH = time.monotonic()
 
 
 def _iso(dt: datetime) -> str:
@@ -297,6 +310,11 @@ def evaluate_job_conditions(cfg: Config, conn: sqlite3.Connection,
     # no_data (crit): neither samples nor probe results for > no_data_s while
     # the job claims to be running — the pipeline itself is wedged.
     nds = float(acfg["no_data_s"])
+    # Grace after worker start: LAST_PROBE_TICK is in-process, so right after
+    # a boot every probe looks "never seen" — the pipeline must get one full
+    # no_data_s to produce a first result before it can be called wedged.
+    if time.monotonic() - _ENGINE_EPOCH < nds:
+        return
     started_ok = False
     try:
         started = datetime.strptime(job["started_utc"] or "",

@@ -83,6 +83,18 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     """
     store = store or _store(cfg)
     ensure_dirs(cfg)
+    if job["kind"] == "continuous":
+        # Last-line defence for the stop-vs-relaunch race: a user stop that
+        # landed between this job being (re)queued and claimed must win —
+        # desired_state is the durable intent, never launch against 'stopped'.
+        fresh0 = queries.get_job(conn, job["id"])
+        desired = ((fresh0["desired_state"] if fresh0 is not None
+                    and "desired_state" in fresh0.keys() else "") or "")
+        if desired == "stopped":
+            queries.update_job(conn, job["id"], state="canceled", pid=None,
+                               finished_utc=utc_now_iso(),
+                               error="stopped before launch (desired_state)")
+            return "canceled"
     spec_file = _spec_path(cfg, job["id"])
     spec_file.write_text(job["spec_yaml"], encoding="utf-8")  # never contains a secret
 

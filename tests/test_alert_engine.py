@@ -312,7 +312,8 @@ def test_auth_failure_condition_from_state_json(acfg_env):
     conn.close()
 
 
-def test_no_data_condition(acfg_env):
+def test_no_data_condition(acfg_env, monkeypatch):
+    import time as _t
     from pgbench_webapp import contworker, queries
     from pgbench_webapp import contprobe
     from pgbench_webapp.contprobe import get_alerts_config
@@ -320,6 +321,13 @@ def test_no_data_condition(acfg_env):
     conn = _conn(cfg)
     jid = _job(conn)                        # started 2020, no samples, no probes
     job = queries.get_job(conn, jid)
+    # a freshly-booted worker gets a grace period: no firing yet
+    monkeypatch.setattr(contworker, "_ENGINE_EPOCH", _t.monotonic())
+    contworker.evaluate_job_conditions(cfg, conn, job, get_alerts_config(conn))
+    assert conn.execute("SELECT count(*) FROM alerts WHERE type='no_data'"
+                        ).fetchone()[0] == 0
+    # past the grace, a silent pipeline is a crit
+    monkeypatch.setattr(contworker, "_ENGINE_EPOCH", _t.monotonic() - 10000)
     contworker.evaluate_job_conditions(cfg, conn, job, get_alerts_config(conn))
     assert conn.execute("SELECT count(*) FROM alerts WHERE type='no_data'"
                         ).fetchone()[0] == 1

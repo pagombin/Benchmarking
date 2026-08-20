@@ -232,6 +232,44 @@ def test_housekeeping_requeues_crashed_harness(wcfg):
     conn.close()
 
 
+def test_requeue_loses_race_to_stop(wcfg):
+    """A stop that lands between the relaunch decision and the requeue UPDATE
+    must win: the conditional requeue keys on the DURABLE desired_state, and a
+    stale job row in hand cannot resurrect the workload."""
+    from pgbench_webapp import contworker, queries
+    cfg = wcfg
+    conn = _conn(cfg)
+    jid = _enqueue_cont(conn, state="failed")
+    stale = queries.get_job(conn, jid)          # read while desired='running'
+    queries.update_job(conn, jid, desired_state="stopped")   # the racing stop
+    contworker.requeue_continuous(cfg, conn, stale, "test relaunch")
+    job = queries.get_job(conn, jid)
+    assert job["state"] == "failed"             # NOT resurrected
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
+    conn.close()
+
+
+def test_run_job_refuses_launch_when_desired_stopped(wcfg):
+    """Belt over braces: even a CLAIMED continuous job re-checks desired_state
+    before exec — a stop landing in the claim window converges to canceled
+    without ever launching the harness."""
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.secrets_store import SecretStore
+    cfg = wcfg
+    conn = _conn(cfg)
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    jid = _enqueue_cont(conn)
+    claimed = queries.claim_next_job(conn, 1, continuous_cap=4)
+    assert claimed is not None and claimed["id"] == jid
+    queries.update_job(conn, jid, desired_state="stopped")   # stop wins the race
+    state = worker.run_job(cfg, conn, queries.get_job(conn, jid), store)
+    assert state == "canceled"
+    job = queries.get_job(conn, jid)
+    assert job["state"] == "canceled" and job["pid"] is None
+    assert job["run_id"] is None                 # the harness never launched
+    conn.close()
+
+
 # ── the continuous lane ─────────────────────────────────────────────
 
 def test_claim_lanes_are_independent(wcfg):
