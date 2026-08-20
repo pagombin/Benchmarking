@@ -80,6 +80,7 @@ def cmd_validate(spec_path: Path) -> int:
     """`validate` subcommand: parse + validate a spec without connecting (CI lint)."""
     spec = load_spec(spec_path)  # raises SpecError (CLI prints message + hint, exit 2)
     mode = ("soak" if spec.is_soak else "suite" if spec.is_suite
+            else "continuous" if spec.is_continuous
             else "sweep" if spec.sweep else "device-probe")
     print(f"OK: {spec_path} is valid.")
     print(f"  label    : {spec.run.label}  ({spec.run.edition} / {spec.run.tshirt_size})")
@@ -91,6 +92,10 @@ def cmd_validate(spec_path: Path) -> int:
         assert spec.soak is not None
         print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)} "
               f"(events: operator-marked only)")
+    elif spec.is_continuous:
+        assert spec.continuous is not None
+        print(f"  cont.    : {spec.continuous.threads} threads, runs until stopped "
+              f"(segments rotate every {fmt_duration(spec.continuous.segment_time_s)})")
     elif spec.is_suite:
         assert spec.suite is not None
         n = len(spec.suite.workloads) + (2 if spec.suite.pgbench else 0)
@@ -1187,6 +1192,12 @@ def cmd_report(run_dir: Path) -> int:
     """`report` subcommand: regenerate the report for an existing run (sweep or soak)."""
     setup_logging()
     mode = Manifest.load(run_dir).mode
+    if mode == "continuous":
+        raise RunError(
+            "continuous runs have no static HTML report — they have no finite "
+            "window to report on",
+            hint="the console's Continuous view (windowed charts, outage ledger, "
+                 "alert history) is the reporting surface; export CSVs from there.")
     if mode in ("suite", "probe"):
         from pgbench_harness import report_evidence
         out = report_evidence.generate_evidence_report(run_dir)

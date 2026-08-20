@@ -143,6 +143,32 @@ def build_soak_command(spec: Spec, threads: int, time_s: int,
     return SysbenchCommand(argv=tuple(argv), cwd=cwd)
 
 
+def build_continuous_command(spec: Spec, threads: int, time_s: int) -> SysbenchCommand:
+    """Build one continuous-mode segment: fixed concurrency for *time_s* seconds.
+
+    Segments are bounded only for log rotation — the supervisor relaunches the
+    next segment immediately on a clean boundary exit. Same driver caveats as
+    soak: no --reconnect (it would distort steady throughput); a connection
+    loss exits sysbench and the supervisor's backoff ladder owns the relaunch.
+    """
+    assert spec.continuous is not None
+    script, wargs, cwd = _workload_args(spec)
+    argv = (
+        ["sysbench", script]
+        + _connection_args(spec)
+        + wargs
+        + [
+            f"--threads={threads}",
+            f"--time={time_s}",
+            f"--report-interval={spec.continuous.report_interval_s}",
+            "--percentile=99",
+        ]
+        + (["--histogram"] if spec.capture.histogram else [])
+        + ["run"]
+    )
+    return SysbenchCommand(argv=tuple(argv), cwd=cwd)
+
+
 def build_prepare_command(spec: Spec) -> SysbenchCommand:
     """Build the sysbench `prepare` command (parallel load, capped at 16 threads)."""
     script, wargs, cwd = _workload_args(spec)
@@ -150,6 +176,8 @@ def build_prepare_command(spec: Spec) -> SysbenchCommand:
         peak = max(spec.sweep.threads)
     elif spec.suite is not None:
         peak = max(spec.suite.threads)
+    elif spec.continuous is not None:
+        peak = spec.continuous.threads
     else:
         assert spec.soak is not None
         peak = spec.soak.threads

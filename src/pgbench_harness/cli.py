@@ -87,6 +87,18 @@ def _build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--dry-run", action="store_true",
                     help="print the soak sysbench command and planned events, then exit")
 
+    ct = sub.add_parser("continuous", help="always-on fixed-concurrency load; "
+                                           "runs until explicitly stopped")
+    ct.add_argument("--spec", required=True, type=Path)
+    ct.add_argument("--results-dir", type=Path, default=Path("results"))
+    ct.add_argument("--run-dir", type=Path, default=None,
+                    help="existing continuous run directory to append a new "
+                         "segment to (the reboot/relaunch resume path)")
+    ct.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing")
+    ct.add_argument("--dry-run", action="store_true",
+                    help="print the segment command and backoff ladder, then exit")
+
     mk = sub.add_parser("mark", help="stamp a timeline event into a (running) soak run")
     mk.add_argument("--run-dir", required=True, type=Path)
     mk.add_argument("--type", required=True,
@@ -210,6 +222,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from pgbench_harness.runner import cmd_soak
             return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run,
                             prepare=args.prepare)
+        if args.command == "continuous":
+            from pgbench_harness.continuous import cmd_continuous
+            if args.prepare and not args.dry_run:
+                from pgbench_harness.runner import _maybe_prepare
+                from pgbench_harness.util import setup_logging
+                _maybe_prepare(args.spec, args.results_dir, True, setup_logging())
+            return cmd_continuous(args.spec, args.results_dir,
+                                  run_dir_opt=args.run_dir, dry_run=args.dry_run)
         if args.command == "mark":
             from pgbench_harness.runner import cmd_mark
             return cmd_mark(args.run_dir, args.type, args.label, args.note)

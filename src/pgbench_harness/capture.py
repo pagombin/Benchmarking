@@ -761,9 +761,11 @@ def preflight_steps(spec: Spec, password: str,
 
 
 def peak_threads(spec: Spec) -> int:
-    """Highest concurrency a run will reach (sweep or soak), for preflight sizing."""
+    """Highest concurrency a run will reach (any mode), for preflight sizing."""
     if spec.soak is not None:
         return spec.soak.threads
+    if spec.continuous is not None:
+        return spec.continuous.threads
     if spec.suite is not None:
         return max(spec.suite.threads)
     assert spec.sweep is not None
