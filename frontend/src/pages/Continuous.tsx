@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { ContJob, Me, Target } from "../types";
 import { fmtNum, relAge } from "../lib/format";
+import { usePageTitle } from "../lib/ui";
 
 // Continuous workloads: always-on 24/7 load against a saved target — the
 // "experience the platform like a real customer" board. Start/stop/resume
@@ -46,6 +47,7 @@ function healthDot(j: ContJob): { cls: string; title: string } {
 }
 
 export function Continuous({ me }: { me: Me }) {
+  usePageTitle("Continuous");
   const [jobs, setJobs] = useState<ContJob[] | null>(null);
   const [targets, setTargets] = useState<Target[]>([]);
   const [form, setForm] = useState({ ...BLANK });
@@ -121,18 +123,19 @@ export function Continuous({ me }: { me: Me }) {
           <thead><tr>
             <th></th><th>Target</th><th>Workload</th><th className="num">Threads</th>
             <th>State</th><th className="num">Uptime 24h</th><th className="num">TPS 24h</th>
-            <th>TPS (30m)</th><th>Last sample</th><th>Outage</th><th></th>
+            <th>TPS (30m)</th><th>Last sample</th><th>Outage</th><th>Last alert</th><th></th>
           </tr></thead>
           <tbody>
             {jobs === null ? (
-              <tr><td colSpan={11} className="empty mono">loading…</td></tr>
+              <tr><td colSpan={12} className="empty mono">loading…</td></tr>
             ) : jobs.length === 0 ? (
-              <tr><td colSpan={11} className="empty">
+              <tr><td colSpan={12} className="empty">
                 No continuous workloads yet{canOp ? " — start one below." : "."}
               </td></tr>
             ) : jobs.map((j) => {
               const dot = healthDot(j);
               const openOutage = j.open_outages[0];
+              const lastAlert = j.open_alerts[0];
               const active = ["queued", "running", "canceling"].includes(j.state);
               return (
                 <tr key={j.id}>
@@ -159,6 +162,14 @@ export function Continuous({ me }: { me: Me }) {
                     {openOutage
                       ? <span className="badge failed" title={`${openOutage.kind} outage since ${openOutage.started_utc}`}>
                           {openOutage.kind} · {relAge(openOutage.started_utc)}
+                        </span>
+                      : <span className="subtle">—</span>}
+                  </td>
+                  <td>
+                    {lastAlert
+                      ? <span className={`badge ${lastAlert.severity === "crit" ? "failed" : "running"}`}
+                              title={`${lastAlert.type} · fired ${lastAlert.fired_utc} (open)`}>
+                          {lastAlert.type} · {relAge(lastAlert.fired_utc)}
                         </span>
                       : <span className="subtle">—</span>}
                   </td>

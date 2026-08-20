@@ -3,8 +3,10 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { Run } from "../types";
 import { fmtInt, fmtWhen } from "../lib/format";
+import { usePageTitle } from "../lib/ui";
 
 export function Compare() {
+  usePageTitle("Compare");
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [viewing, setViewing] = useState<string[] | null>(null);

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { Me } from "../types";
+import { usePageTitle } from "../lib/ui";
 
 interface UserRow { id: number; username: string; role: string; disabled: number; created_utc: string; }
 const ROLES = ["viewer", "operator", "admin"];
 
 export function Users({ me }: { me: Me }) {
+  usePageTitle("Users");
   const [users, setUsers] = useState<UserRow[] | null>(null);
   const [form, setForm] = useState({ username: "", password: "", role: "viewer" });
   const [err, setErr] = useState<string | null>(null);

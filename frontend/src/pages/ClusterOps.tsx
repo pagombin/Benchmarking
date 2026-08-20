@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { Me, KubeTarget } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
+import { usePageTitle } from "../lib/ui";
 
 const BLANK = {
   name: "", kubeconfig_path: "", kubeconfig_content: "", context: "",
@@ -102,6 +103,7 @@ const FIELD_HELP: Record<string, string> = {
 };
 
 export function ClusterOps({ me }: { me: Me }) {
+  usePageTitle("Clusters");
   const [targets, setTargets] = useState<KubeTarget[] | null>(null);
   const [form, setForm] = useState({ ...BLANK });
   const [editing, setEditing] = useState<KubeTarget | null>(null);

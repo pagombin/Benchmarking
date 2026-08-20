@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { fmtWhen } from "../lib/format";
+import { usePageTitle } from "../lib/ui";
 
 interface AuditRow { id: number; ts_utc: string; username: string | null; action: string; target: string; detail: string; }
 
 export function Audit() {
+  usePageTitle("Audit");
   const [rows, setRows] = useState<AuditRow[] | null>(null);
   const [q, setQ] = useState("");
   const [err, setErr] = useState<string | null>(null);

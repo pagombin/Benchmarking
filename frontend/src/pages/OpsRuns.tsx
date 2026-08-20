@@ -3,8 +3,10 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { OpsRun } from "../types";
 import { OpsRunsTable } from "./KubeTargetView";
+import { usePageTitle } from "../lib/ui";
 
 export function OpsRuns() {
+  usePageTitle("Ops runs");
   const nav = useNavigate();
   const [runs, setRuns] = useState<OpsRun[] | null>(null);
   const [kind, setKind] = useState("");

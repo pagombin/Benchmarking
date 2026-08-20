@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { Me, Target } from "../types";
+import { usePageTitle } from "../lib/ui";
 
 const BLANK = { name: "", host: "", port: 5432, dbname: "defaultdb", dbuser: "doadmin", sslmode: "require", password: "" };
 
 export function Targets({ me }: { me: Me }) {
+  usePageTitle("DB targets");
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [form, setForm] = useState({ ...BLANK });
   const [editId, setEditId] = useState<number | null>(null);   // null = create mode

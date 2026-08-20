@@ -10,6 +10,8 @@ import { Targets } from "./pages/Targets";
 import { NewRun } from "./pages/NewRun";
 import { Continuous } from "./pages/Continuous";
 import { ContinuousView } from "./pages/ContinuousView";
+import { Alerts } from "./pages/Alerts";
+import { Outages } from "./pages/Outages";
 import { JobView } from "./pages/JobView";
 import { Diagnostics } from "./pages/Diagnostics";
 import { Tasks } from "./pages/Tasks";
@@ -59,6 +61,8 @@ export function App() {
           <Route path="/new" element={<NewRun me={me} />} />
           <Route path="/continuous" element={<Continuous me={me} />} />
           <Route path="/continuous/:jobId" element={<ContinuousView me={me} />} />
+          <Route path="/alerts" element={<Alerts />} />
+          <Route path="/outages" element={<Outages />} />
           <Route path="/targets" element={<Targets me={me} />} />
           <Route path="/diagnostics" element={<Diagnostics />} />
           <Route path="/tasks" element={<Tasks />} />

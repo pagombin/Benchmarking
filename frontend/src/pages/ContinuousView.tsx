@@ -6,6 +6,7 @@ import type {
 } from "../types";
 import { ContChart } from "../components/ContChart";
 import { fmtCompact, fmtNum, fmtWhen, relAge } from "../lib/format";
+import { usePageTitle } from "../lib/ui";
 
 // Continuous workload detail: preset window pills + custom range (URL-persisted
 // so links are shareable), KPI band, charts with outage/maintenance shading,
@@ -61,6 +62,7 @@ export function ContinuousView({ me }: { me: Me }) {
   const [err, setErr] = useState<string | null>(null);
   const [mwForm, setMwForm] = useState({ starts: "", ends: "", note: "", global: false });
   const canOp = me.role === "operator" || me.role === "admin";
+  usePageTitle(job ? `${job.target_name ?? job.target_host ?? `job ${job.id}`} · Continuous` : "Continuous");
 
   const qs = custom
     ? `from=${encodeURIComponent(from)}${to ? `&to=${encodeURIComponent(to)}` : ""}`
@@ -170,6 +172,67 @@ export function ContinuousView({ me }: { me: Me }) {
     catch (ex) { alert((ex as Error).message); }
   }
 
+  // Report-window export: a self-contained HTML snapshot of the KPI band and
+  // the outage ledger for the selected window — the artifact you paste into a
+  // ticket or an SLA review, generated client-side from data already loaded.
+  function exportReport() {
+    if (!job || !summary || !ts) return;
+    const e2 = (v: unknown) => String(v ?? "")
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const name = job.target_name ?? job.target_host ?? `job ${job.id}`;
+    const su = summary;
+    const kpis: [string, string][] = [
+      ["Uptime", su.uptime_pct == null ? "—" : `${fmtNum(su.uptime_pct, su.uptime_pct === 100 ? 0 : 3)}%`],
+      ["Downtime", fmtDur(su.downtime_s)],
+      ["Unplanned outages", String(su.outages_unplanned_db)],
+      ["Planned outages", String(su.outages_planned)],
+      ["Load-gap outages", String(su.outages_load)],
+      ["MTBF", fmtDur(su.mtbf_s)],
+      ["MTTR", fmtDur(su.mttr_s)],
+      ["Longest outage", fmtDur(su.longest_outage_s)],
+      ["Avg TPS", su.tps_avg == null ? "—" : fmtNum(su.tps_avg, 0)],
+      ["Worst p99", su.lat_p99_max == null ? "—" : `${fmtNum(su.lat_p99_max, 0)} ms`],
+      ["Errors", fmtNum(su.errors_total, 0)],
+      ["Harness relaunches", String(su.harness_relaunches)],
+    ];
+    const outRows = ts.outages.map((o) =>
+      `<tr><td>${e2(o.kind)}${o.planned ? " (planned)" : ""}</td>`
+      + `<td>${e2(o.started_utc)}</td><td>${e2(o.ended_utc ?? "ongoing")}</td>`
+      + `<td class="n">${e2(fmtDur(o.duration_s))}</td>`
+      + `<td>${e2(o.error_class ?? "")}</td><td>${e2(o.first_error ?? "")}</td></tr>`).join("\n")
+      || '<tr><td colspan="6">No outages in this window.</td></tr>';
+    const html = `<!doctype html><html><head><meta charset="utf-8">
+<title>Availability report — ${e2(name)}</title>
+<style>
+ body{font:14px/1.5 -apple-system,Segoe UI,sans-serif;color:#1a2230;max-width:880px;margin:32px auto;padding:0 16px}
+ h1{font-size:20px;margin:0 0 2px} .sub{color:#5a6676;font-size:12.5px;margin-bottom:18px}
+ table{border-collapse:collapse;width:100%;margin:10px 0 22px}
+ th,td{border:1px solid #d7dde6;padding:6px 9px;text-align:left;font-size:13px;vertical-align:top}
+ th{background:#f2f5f9} td.n{text-align:right;font-variant-numeric:tabular-nums}
+ .kpis td:first-child{color:#5a6676;width:190px}
+</style></head><body>
+<h1>Availability report — ${e2(name)}</h1>
+<div class="sub">${e2(job.workload_type)} · ${e2(job.threads)} threads · run ${e2(job.run_id ?? "—")}<br>
+Window (UTC): ${e2(su.from_utc)} → ${e2(su.to_utc)} (${fmtDur(su.window_s)})<br>
+Generated ${e2(new Date().toISOString().slice(0, 19))}Z · uptime counts unplanned read/write
+outages only; planned maintenance and load-generator gaps are listed but not charged.</div>
+<table class="kpis"><tbody>
+${kpis.map(([k, v]) => `<tr><td>${e2(k)}</td><td>${e2(v)}</td></tr>`).join("\n")}
+</tbody></table>
+<h1 style="font-size:16px">Outage ledger</h1>
+<table><thead><tr><th>Kind</th><th>Started (UTC)</th><th>Ended</th><th>Duration</th>
+<th>Class</th><th>First error</th></tr></thead><tbody>
+${outRows}
+</tbody></table>
+</body></html>`;
+    const blob = new Blob([html], { type: "text/html" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `availability-${name.replace(/[^a-zA-Z0-9._-]+/g, "_")}-${custom ? "custom" : window_}.html`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
   if (err && !job) {
     return <div className="banner-err" style={{ margin: 20 }}>{err}</div>;
   }
@@ -213,6 +276,18 @@ export function ContinuousView({ me }: { me: Me }) {
                  title="to (UTC, empty = now)" style={{ width: 190 }} />
           <button className="btn-sm" type="submit">custom (UTC, ≤30d)</button>
         </form>
+        <div className="spacer" />
+        <button className="btn-sm" onClick={exportReport} disabled={!summary || !ts}
+                title="Self-contained HTML snapshot of the KPIs + outage ledger for this window">
+          Export report
+        </button>
+        {job.run_id && (
+          <a className="btn-sm" style={{ textDecoration: "none" }}
+             href={`/runs/${job.run_id}/csv?which=continuous`}
+             title="Raw per-second samples for the whole run (CSV, can be large)">
+            Raw CSV
+          </a>
+        )}
       </div>
 
       {s && (

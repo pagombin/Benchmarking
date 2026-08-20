@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { usePageTitle } from "../lib/ui";
 
 interface SmtpCfg { host: string; port: number; user: string; from: string; to: string; tls: boolean; }
 interface AlertsCfg { [k: string]: number }
@@ -35,7 +36,17 @@ const THRESHOLDS: { key: string; label: string; unit: string }[] = [
   { key: "no_data_s", label: "No-data alert after", unit: "s" },
 ];
 
+// Shipped defaults, kept in lock-step with contprobe.ALERTS_CONFIG_DEFAULTS —
+// "Restore defaults" fills the form; nothing is persisted until Save.
+const THRESHOLD_DEFAULTS: AlertsCfg = {
+  probe_interval_s: 5, probe_failures_to_down: 3, load_gap_s: 30,
+  err_rate_threshold: 1.0, err_rate_hold_s: 60,
+  latency_p99_ms: 500, latency_hold_s: 300, tps_drop_pct: 50,
+  renotify_min: 60, disk_warn_pct: 85, no_data_s: 120,
+};
+
 export function Settings() {
+  usePageTitle("Settings");
   const [s, setS] = useState<SettingsResp | null>(null);
   const [smtp, setSmtp] = useState<SmtpCfg>({ host: "", port: 587, user: "", from: "", to: "", tls: true });
   const [slackEnabled, setSlackEnabled] = useState(false);
@@ -134,7 +145,12 @@ export function Settings() {
       </div>
 
       <div className="card">
-        <div className="card-head"><h2>Continuous mode — alert thresholds</h2></div>
+        <div className="card-head"><h2>Continuous mode — alert thresholds</h2>
+          <button className="btn-sm"
+            onClick={() => setAlertsCfg({ ...alertsCfg, ...THRESHOLD_DEFAULTS })}
+            title="Reset the fields below to the shipped defaults (takes effect on Save)">
+            Restore defaults
+          </button></div>
         <p className="subtle" style={{ marginTop: -6, marginBottom: 10, fontSize: 12.5 }}>
           Drives the availability prober, the outage ledger, and Slack alerting for continuous
           workloads. Every alert is stored in the history whether or not delivery succeeds.
