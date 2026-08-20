@@ -14,13 +14,38 @@ from pgbench_webapp.db import migrate
 
 
 def web_main(argv: list[str] | None = None) -> int:
-    """Run the uvicorn TLS server, or `pgbench-web migrate`."""
+    """Run the uvicorn TLS server, or a maintenance subcommand:
+
+    ``pgbench-web migrate``                    apply DB migrations.
+    ``pgbench-web reindex-continuous --job N`` wipe and rebuild one continuous
+        job's SQLite series from its run directory's raw segment logs (the
+        filesystem is the source of truth; SQLite is a rebuildable index).
+    """
     args = argv if argv is not None else sys.argv[1:]
     cfg = load_config()
     ensure_dirs(cfg)
     if args and args[0] == "migrate":
         n = migrate(cfg.db_path)
         print(f"migrations: applied {n}")
+        return 0
+    if args and args[0] == "reindex-continuous":
+        if len(args) < 3 or args[1] != "--job" or not args[2].isdigit():
+            print("usage: pgbench-web reindex-continuous --job <job_id>",
+                  file=sys.stderr)
+            return 2
+        migrate(cfg.db_path)
+        from pgbench_webapp.contmetrics import reindex_continuous
+        from pgbench_webapp.db import connect
+        conn = connect(cfg.db_path)
+        try:
+            out = reindex_continuous(cfg, conn, int(args[2]))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            conn.close()
+        print(f"reindexed job {args[2]}: {out['samples']} samples across "
+              f"{out['minutes']} minute rollups")
         return 0
     import uvicorn
     ssl_kwargs: dict[str, Any] = {}
