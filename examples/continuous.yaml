@@ -1,0 +1,37 @@
+# Continuous Mode: an always-on 24/7 workload that runs until explicitly
+# stopped — survives sysbench crashes (supervisor backoff), worker restarts
+# (re-attach), and droplet reboots (desired-state relaunch via the console).
+#
+#   pgbench-harness continuous --spec examples/continuous.yaml --prepare
+#   # resume after a reboot/crash (the console does this automatically):
+#   pgbench-harness continuous --spec examples/continuous.yaml \
+#       --run-dir results/<run_id>
+#
+# The web console (Continuous page) is the primary interface: it enforces a
+# saved target (durable credential), runs the availability prober, keeps 30
+# days of metrics + the outage ledger, and delivers Slack alerts.
+
+run:
+  label: "continuous-advanced-247"
+  edition: advanced
+  tshirt_size: 8c32g
+  notes: "24/7 stability soak — experience the platform like a real customer"
+
+target:
+  host: private-your-cluster.db.ondigitalocean.com
+  port: 5432
+  database: sbtest
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require
+
+workload:
+  type: oltp_read_write
+  tables: 8
+  table_size: 100000
+
+continuous:
+  threads: 16                       # fixed concurrency, forever
+  # restart_backoff_s: [1, 2, 5, 10, 30, 60]   # sysbench relaunch ladder
+  # max_consecutive_failures: 0     # 0 = never give up (default)
+  # segment_time_s: 21600           # raw-log rotation (6h); not a failure

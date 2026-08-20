@@ -8,9 +8,12 @@ YAML spec fully defines a run; the harness drives **sysbench** (including
 **self-contained HTML report** per run plus cross-run comparison reports.
 Around the CLI engine sit a self-hosted **web console** (live run cockpit,
 history, compare, RBAC — see [Web application](#web-application-self-hosted-ui)),
-an **IOPS ceiling verification framework** with device-level evidence
-bundles, and a **Cluster Ops** module for operating Kubernetes-hosted
-Percona PG clusters (config, backups, failover drills, diagnostics, health).
+**Continuous Mode** (an always-on 24/7 workload with 30 days of queryable
+metrics, an outage ledger and Slack alerting — see
+[Continuous mode](#continuous-mode-always-on-workload)), an **IOPS ceiling
+verification framework** with device-level evidence bundles, and a
+**Cluster Ops** module for operating Kubernetes-hosted Percona PG clusters
+(config, backups, failover drills, diagnostics, health).
 
 ```
 pgbench-harness validate      --spec run.yaml        # lint a spec without connecting (CI-friendly)
@@ -22,6 +25,9 @@ pgbench-harness soak          --spec soak.yaml [--prepare]  # resilience: fixed 
                                                             # event; or knee finder via soak.rate_steps
 pgbench-harness suite         --spec suite.yaml [--prepare] # IOPS evidentiary matrix: 4 OLTP workloads
                                                             # + pgbench, one consolidated bundle
+pgbench-harness continuous    --spec cont.yaml [--prepare] [--run-dir results/<run_id>]
+                                                     # always-on load until stopped; --run-dir resumes an
+                                                     # existing run (new segment, same timeline)
 pgbench-harness device-probe  --spec probe.yaml      # sysbench fileio against the pgdata volume (TEST
                                                      # CLUSTERS ONLY; requires allow_device_probe: true)
 pgbench-harness evidence-pack --spec pack.yaml       # one-click core-four probe pack + narrative
@@ -41,6 +47,7 @@ The run mode is chosen by the spec — exactly one of these sections:
 |-----------------|----------------|------------------|
 | `sweep:`        | `run`          | steady-state thread-ladder sweep |
 | `soak:`         | `soak`         | fixed concurrency through a failover/scale event; with `rate_steps` it becomes the IOPS **knee finder** |
+| `continuous:`   | `continuous`   | always-on fixed concurrency, runs **until explicitly stopped** — survives sysbench crashes, service restarts, and droplet reboots; feeds the console's historical metrics, outage ledger and alerting |
 | `suite:`        | `suite`        | the storage-team evidentiary matrix (4 sysbench OLTP workloads + pgbench TPC-B / SELECT-only × thread ladder) in one bundle |
 | `device_probe:` | `device-probe` | sysbench **fileio** on the pgdata volume from a pod on the primary's node — the definitive device-ceiling test |
 | `device_probe:` + `pack: true` | `evidence-pack` | the core four probes (rndrd 16K/8K, rndwr 16K, rndwr under replication, all O_DIRECT) as one job + consolidated narrative |
@@ -178,7 +185,7 @@ workload:
   # mix: read_heavy                       # picks the stock lua mix
   # rand_type: uniform                    # key distribution (uniform defeats hot-set caching)
 
-# ---- pick EXACTLY ONE mode section: sweep / soak / suite / device_probe ----
+# ---- pick EXACTLY ONE mode section: sweep / soak / suite / continuous / device_probe ----
 
 sweep:
   threads: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]  # required
@@ -201,6 +208,19 @@ soak:                                     # fixed-concurrency resilience run (se
   # volume actually serves. Each step start is stamped as an event.
   # rate_steps: [1000, 2000, 4000, 8000, 0]
   # step_duration_s: 300
+
+continuous:                               # always-on load; no duration — runs until stopped
+  threads: 16                             # required; fixed concurrency
+  report_interval_s: 1                    # default 1; must be 1 (the metrics pipeline models a
+                                          # dense per-second timeline — gaps ARE the outage signal)
+  restart_backoff_s: [1, 2, 5, 10, 30, 60]  # default; sysbench relaunch ladder (capped, full
+                                          # jitter; auth failures jump straight to the max)
+  max_consecutive_failures: 0             # default 0 = never give up. >0 = after N instant-exit
+                                          # relaunches, stop LAUNCHING the load but keep the
+                                          # supervisor alive (probing/alerting continues)
+  segment_time_s: 21600                   # default 6h; raw-log rotation boundary — a clean
+                                          # boundary exit relaunches immediately, NOT a failure
+  segment_kill_grace_s: 10                # default 10; SIGTERM->SIGKILL grace on a hung segment
 
 suite:                                    # IOPS evidentiary matrix (storage-team parity)
   duration_s: 300                         # required; per cell
@@ -515,6 +535,65 @@ With `soak.rate_steps` the same mode becomes the IOPS **knee finder**: offered
 load climbs through throttled rate steps (sysbench `--rate`) while the device
 series records what the volume actually serves; each step start is stamped as
 an event.
+
+## Continuous mode (always-on workload)
+
+Continuous mode runs a fixed-concurrency workload (tpcc / oltp_read_only /
+oltp_read_write / oltp_write_only) against a cluster **indefinitely — until a
+user explicitly stops it** — to experience the platform like a real 24/7
+customer and quantify its stability. It is designed around three failure
+classes, each with its own owner:
+
+| what dies | who recovers it |
+|-----------|-----------------|
+| sysbench (crash, connection loss) | the harness **supervisor** relaunches it with a capped exponential backoff + full jitter; auth failures (`password authentication failed`, `no pg_hba.conf entry`) jump straight to the max interval so a bad credential never hammers the cluster |
+| the worker/web service (deploys) | the harness child survives (`KillMode=process`) and the worker **re-attaches** at startup, exactly like sweeps/soaks |
+| the whole droplet (reboot) or the harness process itself | the web tier's **desired-state reconcile**: a continuous job whose process is gone while `desired_state='running'` is re-queued and relaunched with `--run-dir <same run>`, appending a **new segment to the same run directory** — one unbroken timeline |
+
+Key concepts:
+
+* **Segments.** Raw logs rotate every `segment_time_s` (default 6h) as
+  `raw/cont_seg<NNNN>.log`, each line stamped with read-time UTC exactly like
+  soak. A clean boundary exit relaunches immediately and is *not* a failure.
+  `state.json` in the run dir heartbeats supervisor liveness every ~10s.
+* **Historical metrics.** The worker tails the raw segments into SQLite:
+  1-second samples (kept 72h) and 1-minute rollups with `gap_s` — seconds in
+  the minute with **no** sample, i.e. downtime — kept 35 days. Query windows:
+  10m/30m/1h/12h/24h/48h/5d/7d/14d/30d plus a custom range (≤ 31 days).
+  The tables are a rebuildable index over the run directory:
+  `pgbench-web reindex-continuous --job <id>` proves it.
+* **Availability prober.** Independent of sysbench: a read probe (`SELECT 1`)
+  and a write probe (single-row canary upsert) every 5s with 3s timeouts;
+  3 consecutive failures = **down**, opening a row in the **outage ledger**
+  (kind `read`/`write`); recovery closes it with its duration. A sample stall
+  while probes stay green opens a distinct `load` outage (loadgen-side).
+  Outages overlapping a **maintenance window** are `planned` and suppressed
+  from alerting.
+* **Alerting.** Store-first (every alert is a history row before any
+  delivery), deduplicated while unresolved, re-notified for standing crits.
+  Types: `db_unreachable` (crit), `db_recovered`, `error_rate`, `latency`,
+  `tps_drop` (vs the trailing 24h median), `auth_failure` (crit),
+  `harness_relaunch`, `load_gap`, `loadgen_disk`, `no_data` (crit). Slack
+  delivery retries up to 5× with backoff and records the outcome per row.
+  An optional **dead-man heartbeat** (`heartbeat_url`, healthchecks.io-style)
+  is pinged every 60s while a workload runs, so even a powered-off droplet
+  gets noticed — by the external service, when the pings stop.
+* **Lifecycle.** Continuous jobs must reference a **saved target** (its
+  encrypted password survives reboots; a per-job password would not). One
+  continuous workload per target. The worker runs them in their own lane
+  (`continuous_cap`, default 4) so a 30-day workload never wedges the
+  benchmark queue. There is no static HTML report — the console's Continuous
+  view (windowed charts, KPI band, outage ledger, alert history) is the
+  reporting surface; CSVs export from there.
+
+```bash
+# CLI (the console's Continuous page is the primary interface):
+pgbench-harness continuous --spec cont.yaml --results-dir results/   # fresh
+pgbench-harness continuous --spec cont.yaml --run-dir results/<run_id>  # resume
+```
+
+See OPERATIONS.md → *Continuous mode runbook* for the disk budget, reboot
+behavior, Slack/heartbeat pairing, threshold tuning, and the reindex procedure.
 
 ## Web application (self-hosted UI)
 
