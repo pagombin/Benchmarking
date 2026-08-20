@@ -64,6 +64,159 @@ export interface PrepareStats {
   target_host?: string;
 }
 
+// ── continuous mode ──
+
+export interface ContSupervisor {
+  status?: string;
+  seg?: number;
+  segments_total?: number;
+  relaunches?: number;
+  consecutive_failures?: number;
+  last_error_class?: string;
+  updated_utc?: string;
+  load_stopped?: boolean;
+}
+
+export interface ContOpenOutage { id: number; kind: string; started_utc: string; planned: number }
+export interface ContOpenAlert { id: number; type: string; severity: string; fired_utc: string }
+
+export interface ContJob {
+  id: number;
+  kind: string;
+  state: string;
+  desired_state: string;
+  run_id: string | null;
+  target_id: number | null;
+  requested_by: string;
+  created_utc: string;
+  started_utc?: string | null;
+  finished_utc?: string | null;
+  exit_code?: number | null;
+  error: string | null;
+  target_name: string | null;
+  target_host: string | null;
+  last_sample_utc: string;
+  open_outages: ContOpenOutage[];
+  open_alerts: ContOpenAlert[];
+  supervisor: ContSupervisor | null;
+  workload_type: string;
+  threads: number | null;
+  label: string;
+  spark?: { t: number[]; tps: (number | null)[] };
+  uptime_24h_pct?: number | null;
+  tps_avg_24h?: number | null;
+  manifest?: { status: string; continuous: Record<string, unknown> } | null;
+}
+
+export interface Outage {
+  id: number;
+  job_id: number;
+  kind: string;                 // read | write | load
+  started_utc: string;
+  ended_utc: string | null;
+  duration_s: number | null;
+  error_class: string | null;
+  first_error: string | null;
+  planned: number;
+}
+
+export interface AlertRow {
+  id: number;
+  job_id: number | null;
+  type: string;
+  severity: "info" | "warn" | "crit";
+  fired_utc: string;
+  resolved_utc: string | null;
+  dedup_key: string;
+  context: string;
+  delivery: string | null;
+  delivery_attempts: number;
+  delivered_utc: string | null;
+}
+
+export interface MaintWindow {
+  id: number;
+  job_id: number | null;
+  starts_utc: string;
+  ends_utc: string;
+  note: string | null;
+}
+
+export interface ContEvent { ts_utc: string; type: string; label: string; note?: string }
+
+export interface ContTimeseries {
+  job_id: number;
+  from_utc: string;
+  to_utc: string;
+  resolution: "1s" | "1m";
+  points: number;
+  t: number[];
+  tps_avg: (number | null)[];
+  tps_min: (number | null)[];
+  qps_avg: (number | null)[];
+  lat_p99_avg: (number | null)[];
+  lat_p99_max: (number | null)[];
+  err_sum: (number | null)[];
+  reconn_sum: (number | null)[];
+  gap_s: (number | null)[];
+  outages: Outage[];
+  maintenance: MaintWindow[];
+  events: ContEvent[];
+}
+
+export interface ContSummary {
+  job_id: number;
+  from_utc: string;
+  to_utc: string;
+  window_s: number;
+  uptime_pct: number | null;
+  downtime_s: number;
+  outages_total: number;
+  outages_unplanned_db: number;
+  outages_load: number;
+  outages_planned: number;
+  outages_open: number;
+  mtbf_s: number | null;
+  mttr_s: number | null;
+  longest_outage_s: number;
+  observed_seconds: number;
+  gap_seconds: number;
+  tps_avg: number | null;
+  errors_total: number;
+  reconnects_total: number;
+  lat_p99_p50: number | null;
+  lat_p99_p95: number | null;
+  lat_p99_p99: number | null;
+  lat_p99_max: number | null;
+  harness_relaunches: number;
+}
+
+export interface ContDbMetrics {
+  t: number[];
+  points: number;
+  conn_active: (number | null)[];
+  conn_idle: (number | null)[];
+  conn_idle_tx: (number | null)[];
+  conn_total: (number | null)[];
+  repl_lag_s: (number | null)[];
+  repl_count: (number | null)[];
+  db_size: (number | null)[];
+  dead_tup: (number | null)[];
+  ckpt_timed: (number | null)[];
+  ckpt_req: (number | null)[];
+  xact_commit_rate: (number | null)[];
+  xact_rollback_rate: (number | null)[];
+  blks_hit_rate: (number | null)[];
+  blks_read_rate: (number | null)[];
+  wal_bytes_rate: (number | null)[];
+  archived_count_rate: (number | null)[];
+  archive_failed_rate: (number | null)[];
+  deadlocks_rate: (number | null)[];
+  temp_bytes_rate: (number | null)[];
+  wal_records_rate: (number | null)[];
+  top_queries: { q: string; calls: number; total_ms: number }[] | null;
+}
+
 // ── cluster ops ──
 
 export interface KubeTarget {

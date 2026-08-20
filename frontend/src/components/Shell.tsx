@@ -22,6 +22,7 @@ const GROUPS: NavGroup[] = [
     title: "Benchmarking",
     items: [
       { to: "/new", label: "New run", icon: "＋" },
+      { to: "/continuous", label: "Continuous", icon: "∞" },
       { to: "/targets", label: "DB targets", icon: "⛁" },
       { to: "/compare", label: "Compare", icon: "⇄" },
       { to: "/diagnostics", label: "Environment", icon: "✓", op: true },
