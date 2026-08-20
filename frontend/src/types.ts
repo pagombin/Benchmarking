@@ -6,6 +6,13 @@ export interface Me {
   user: string;
   role: Role;
   version: string;
+  sha?: string;
+}
+
+export interface WorkerStatus {
+  worker_alive: boolean;
+  active_jobs: number;
+  queued_jobs: number;
 }
 
 export interface Run {

@@ -175,7 +175,34 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/api/me")
     def api_me(user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         return JSONResponse({"user": user["username"], "role": user["role"],
-                             "version": __version__})
+                             "version": __version__, "sha": _git_sha()})
+
+    # ── system status: is the WORKER alive? (the console's status chip) ──
+    # The worker holds an exclusive flock on <data_dir>/worker.lock for its
+    # whole life; if we can grab it, nothing is claiming the queue.
+    @app.get("/api/worker/status")
+    def api_worker_status(user: sqlite3.Row = Depends(require("viewer")),
+                          conn: sqlite3.Connection = Depends(get_conn)) -> JSONResponse:
+        alive = False
+        lock_path = cfg.data_dir / "worker.lock"
+        if lock_path.exists():
+            import fcntl
+            try:
+                with open(lock_path, "r") as fh:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fh, fcntl.LOCK_UN)   # we got it => worker gone
+                    except OSError:
+                        alive = True                      # held => worker alive
+            except OSError:
+                pass
+        active = int(conn.execute(
+            "SELECT count(*) FROM jobs WHERE state IN ('running', 'canceling')"
+        ).fetchone()[0])
+        queued = int(conn.execute(
+            "SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0])
+        return JSONResponse({"worker_alive": alive, "active_jobs": active,
+                             "queued_jobs": queued})
 
     # ── auth ──
     @app.get("/login", response_class=HTMLResponse)
@@ -1251,6 +1278,23 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
 def _event(name: str, data: Any) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+_GIT_SHA: Optional[str] = None
+
+
+def _git_sha() -> str:
+    """Short git SHA of the installed checkout (cached; best-effort)."""
+    global _GIT_SHA
+    if _GIT_SHA is None:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(_PKG), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5)
+            _GIT_SHA = out.stdout.strip() if out.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            _GIT_SHA = ""
+    return _GIT_SHA
 
 
 def _safe_segment(ref: str) -> str:

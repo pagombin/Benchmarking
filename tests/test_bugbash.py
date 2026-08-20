@@ -225,6 +225,29 @@ def test_delete_run_purges_continuous_tables(bcfg):
     conn.close()
 
 
+# ── UI-9: worker status chip endpoint ───────────────────────────────
+
+def test_worker_status_endpoint(bcfg):
+    from fastapi.testclient import TestClient
+    from pgbench_webapp import admin, worker
+    from pgbench_webapp.app import create_app
+    cfg = bcfg
+    admin.create_admin("admin", "apw")
+    client = TestClient(create_app(cfg))
+    assert client.get("/api/worker/status").status_code == 401   # auth required
+    r = client.get("/api/worker/status", auth=("admin", "apw")).json()
+    assert r["worker_alive"] is False                # no worker holds the lock
+    lock = worker._acquire_singleton_lock(cfg)       # "start" a worker
+    try:
+        r = client.get("/api/worker/status", auth=("admin", "apw")).json()
+        assert r["worker_alive"] is True
+        assert r["active_jobs"] == 0 and r["queued_jobs"] == 0
+    finally:
+        lock.close()
+    me = client.get("/api/me", auth=("admin", "apw")).json()
+    assert "sha" in me                               # footer provenance
+
+
 # ── B-007: expired sessions are pruned on login ─────────────────────
 
 def test_expired_sessions_pruned_on_login(bcfg):
