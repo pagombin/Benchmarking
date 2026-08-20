@@ -222,6 +222,9 @@ footer.foot {
 .card {
   background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow);
+  /* wide tables (fleet board, ledgers) scroll inside the card instead of
+     overflowing its border — nothing inside a card overlays past its edge */
+  overflow-x: auto;
 }
 .card + .card { margin-top: 16px; }
 .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
@@ -238,6 +241,9 @@ thead th {
   white-space: nowrap;
 }
 tbody td { padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+/* many-column boards (continuous fleet) tighten horizontal padding so the
+   row actions stay on-screen at common widths; the card still scrolls beyond */
+table.dense thead th, table.dense tbody td { padding-left: 8px; padding-right: 8px; }
 /* Wide data tables scroll inside their card instead of overflowing the page. */
 .table-scroll { overflow-x: auto; }
 /* Long machine strings (CR paths, option names, URIs) wrap instead of

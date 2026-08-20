@@ -25,7 +25,7 @@ function Spark({ spark }: { spark?: { t: number[]; tps: (number | null)[] } }) {
   if (!spark || spark.t.length < 2) return <span className="subtle mono">—</span>;
   const vals = spark.tps.map((v) => (v == null || !Number.isFinite(v) ? 0 : v));
   const max = Math.max(...vals, 1);
-  const w = 120, h = 26;
+  const w = 90, h = 26;
   const pts = vals.map((v, i) =>
     `${(i / (vals.length - 1)) * w},${h - (v / max) * (h - 2) - 1}`).join(" ");
   return (
@@ -119,7 +119,7 @@ export function Continuous({ me }: { me: Me }) {
 
       <div className="card">
         <div className="card-head"><h2>Workloads</h2></div>
-        <table>
+        <table className="dense">
           <thead><tr>
             <th></th><th>Target</th><th>Workload</th><th className="num">Threads</th>
             <th>State</th><th className="num">Uptime 24h</th><th className="num">TPS 24h</th>
@@ -168,6 +168,8 @@ export function Continuous({ me }: { me: Me }) {
                   <td>
                     {lastAlert
                       ? <span className={`badge ${lastAlert.severity === "crit" ? "failed" : "running"}`}
+                              style={{ display: "inline-block", maxWidth: 150, overflow: "hidden",
+                                       textOverflow: "ellipsis", whiteSpace: "nowrap", verticalAlign: "middle" }}
                               title={`${lastAlert.type} · fired ${lastAlert.fired_utc} (open)`}>
                           {lastAlert.type} · {relAge(lastAlert.fired_utc)}
                         </span>

@@ -15,7 +15,7 @@ committed to `src/pgbench_webapp/static/spa/`.
 | P0 | 0 | — |
 | P1 | 4 | B-001, B-002, B-014, B-026 |
 | P2 | 10 | B-003…006, B-008, B-011…013, B-016, B-018 |
-| P3 | 4 | B-007, B-009, B-010, B-021 (documented) |
+| P3 | 5 | B-007, B-009, B-010, B-021 (documented), B-027 |
 | Verified-sound (no bug, behavior now proven by test) | 8 | B-015, B-017, B-019, B-020, B-022…025 |
 
 Every fix has a regression test except the three pure-UI items (B-008/9/10),
