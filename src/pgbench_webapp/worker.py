@@ -159,6 +159,17 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     elif kind == "continuous":
         argv = [cfg.harness_bin, "continuous", "--spec", str(spec_file),
                 "--results-dir", str(cfg.results_dir)]
+        opts = {}
+        if job["options"]:
+            try:
+                opts = json.loads(job["options"])
+            except (ValueError, TypeError):
+                opts = {}
+        if opts.get("prepare") and not job["run_id"]:
+            # first launch only: a reboot relaunch must go straight into the
+            # supervisor (its backoff ladder owns a down target), not stall
+            # in a dataset check against a database that may be unreachable
+            argv.append("--prepare")
         # A relaunch (reboot/crash reconcile) resumes the SAME run directory:
         # new segments append, the historical series stays one timeline. If
         # the run dir vanished from disk, fall through to a fresh run — the

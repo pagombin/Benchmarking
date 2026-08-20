@@ -21,6 +21,7 @@ on disk (older rollup minutes, whose raw was already pruned, are preserved).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -290,6 +291,322 @@ def maybe_wal_checkpoint(conn: sqlite3.Connection, every_s: float = 3600.0) -> b
     except sqlite3.Error:
         pass
     return True
+
+
+# ── windowed queries (the historical-metrics API) ───────────────────
+
+WINDOWS: dict[str, int] = {
+    "10m": 600, "30m": 1800, "1h": 3600, "12h": 43200, "24h": 86400,
+    "48h": 172800, "5d": 432000, "7d": 604800, "14d": 1209600, "30d": 2592000,
+}
+MAX_RANGE_S = 31 * 86400
+HIGH_RES_MAX_S = 6 * 3600        # <= 6h -> 1s samples; else 1m rollups
+MAX_POINTS = 2000
+
+
+class RangeError(ValueError):
+    """A window/range the API must reject with a 400, not a 500."""
+
+
+def _parse_iso(ts: str) -> datetime:
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise RangeError(f"unrecognized UTC timestamp: {ts!r} "
+                     "(expected e.g. 2026-08-20T12:00:00Z)")
+
+
+def resolve_range(window: str = "", frm: str = "", to: str = "",
+                  now: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    """window=10m|...|30d sugar, or an explicit from/to pair (<= 31 days)."""
+    now = now or datetime.now(timezone.utc)
+    if window:
+        if window not in WINDOWS:
+            raise RangeError(f"unknown window '{window}' "
+                             f"(use one of {', '.join(WINDOWS)})")
+        return now - timedelta(seconds=WINDOWS[window]), now
+    if not frm:
+        raise RangeError("pass window=<preset> or from=<ISO UTC>[&to=<ISO UTC>]")
+    t0 = _parse_iso(frm)
+    t1 = _parse_iso(to) if to else now
+    if t1 <= t0:
+        raise RangeError("'to' must be after 'from'")
+    if (t1 - t0).total_seconds() > MAX_RANGE_S:
+        raise RangeError("range too large: at most 31 days")
+    return t0, t1
+
+
+def _epoch(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+
+def _bucket_rows(rows: list[dict[str, Any]], max_points: int) -> list[dict[str, Any]]:
+    """Min/max-preserving decimation: averages stay averages, mins take the
+    bucket min, maxes the bucket max, sums add up — outage dips are never
+    smoothed away."""
+    n = len(rows)
+    if n <= max_points:
+        return rows
+    size = -(-n // max_points)      # ceil
+    out: list[dict[str, Any]] = []
+    for i in range(0, n, size):
+        chunk = rows[i:i + size]
+
+        def vals(key: str) -> list[float]:
+            return [c[key] for c in chunk if c.get(key) is not None]
+
+        b: dict[str, Any] = {"t": chunk[0]["t"]}
+        for key in ("tps_avg", "qps_avg", "lat_p99_avg"):
+            v = vals(key)
+            b[key] = sum(v) / len(v) if v else None
+        v = vals("tps_min")
+        b["tps_min"] = min(v) if v else None
+        v = vals("lat_p99_max")
+        b["lat_p99_max"] = max(v) if v else None
+        for key in ("err_sum", "reconn_sum", "gap_s"):
+            v = vals(key)
+            b[key] = sum(v) if v else 0
+        out.append(b)
+    return out
+
+
+def timeseries(cfg: Config, conn: sqlite3.Connection, job_id: int,
+               t0: datetime, t1: datetime,
+               run_id: str = "") -> dict[str, Any]:
+    """Windowed series + annotations. Resolution is chosen server-side:
+    <= 6h -> the 1s samples table, else the 1m rollups; either way the
+    result is decimated (min-preserving) to <= ~2000 points."""
+    span = (t1 - t0).total_seconds()
+    a, b = _iso_z(t0), _iso_z(t1)
+    rows: list[dict[str, Any]]
+    if span <= HIGH_RES_MAX_S:
+        resolution = "1s"
+        rows = [{
+            "t": _epoch(_parse_iso(r["ts_utc"])),
+            "tps_avg": r["tps"], "tps_min": r["tps"], "qps_avg": r["qps"],
+            "lat_p99_avg": r["lat_p99"], "lat_p99_max": r["lat_p99"],
+            "err_sum": r["err_s"], "reconn_sum": r["reconn_s"], "gap_s": 0,
+        } for r in conn.execute(
+            "SELECT * FROM cont_samples WHERE job_id=? AND ts_utc >= ? "
+            "AND ts_utc <= ? ORDER BY ts_utc", (job_id, a, b))]
+    else:
+        resolution = "1m"
+        rows = [{
+            "t": _epoch(_parse_iso(r["ts_utc"])),
+            "tps_avg": r["tps_avg"], "tps_min": r["tps_min"],
+            "qps_avg": r["qps_avg"], "lat_p99_avg": r["lat_p99_avg"],
+            "lat_p99_max": r["lat_p99_max"], "err_sum": r["err_sum"],
+            "reconn_sum": r["reconn_sum"], "gap_s": r["gap_s"],
+        } for r in conn.execute(
+            "SELECT * FROM cont_rollup_1m WHERE job_id=? AND ts_utc >= ? "
+            "AND ts_utc <= ? ORDER BY ts_utc", (job_id, a, b))]
+    rows = _bucket_rows(rows, MAX_POINTS)
+    payload: dict[str, Any] = {
+        "job_id": job_id, "from_utc": a, "to_utc": b,
+        "resolution": resolution, "points": len(rows),
+        "t": [r["t"] for r in rows],
+    }
+    for key in ("tps_avg", "tps_min", "qps_avg", "lat_p99_avg", "lat_p99_max",
+                "err_sum", "reconn_sum", "gap_s"):
+        payload[key] = [r[key] for r in rows]
+    payload["outages"] = [dict(r) for r in conn.execute(
+        "SELECT * FROM outages WHERE job_id=? AND started_utc <= ? "
+        "AND (ended_utc IS NULL OR ended_utc >= ?) ORDER BY started_utc",
+        (job_id, b, a))]
+    payload["maintenance"] = [dict(r) for r in conn.execute(
+        "SELECT * FROM maintenance_windows WHERE (job_id IS NULL OR job_id=?) "
+        "AND starts_utc <= ? AND ends_utc >= ? ORDER BY starts_utc",
+        (job_id, b, a))]
+    payload["events"] = _run_events(cfg, run_id, a, b) if run_id else []
+    return payload
+
+
+def _run_events(cfg: Config, run_id: str, a: str, b: str) -> list[dict[str, Any]]:
+    """events.jsonl entries inside [a, b] for chart annotation."""
+    path = cfg.results_dir / run_id / "events.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            ts = _second(str(ev.get("ts_utc", "")))
+            if a <= ts <= b:
+                out.append({"ts_utc": ts, "type": ev.get("type", ""),
+                            "label": ev.get("label", ""),
+                            "note": ev.get("note", "")})
+    except OSError:
+        return []
+    return out[-500:]
+
+
+def _union_seconds(intervals: list[tuple[float, float]]) -> float:
+    """Total covered seconds of possibly-overlapping [start, end] intervals."""
+    total = 0.0
+    last_end = float("-inf")
+    for s, e in sorted(intervals):
+        if e <= last_end:
+            continue
+        total += e - max(s, last_end)
+        last_end = e
+    return total
+
+
+def _percentile(vals: list[float], pct: float) -> Optional[float]:
+    if not vals:
+        return None
+    vs = sorted(vals)
+    idx = min(len(vs) - 1, max(0, int(round(pct / 100.0 * (len(vs) - 1)))))
+    return vs[idx]
+
+
+def summary(cfg: Config, conn: sqlite3.Connection, job_id: int,
+            t0: datetime, t1: datetime) -> dict[str, Any]:
+    """Window KPIs: uptime %, MTBF, MTTR, outage counts, latency percentiles,
+    throughput, error totals. Uptime counts UNPLANNED db (read/write) outages
+    only; 'load' outages are loadgen-side and reported separately."""
+    a, b = _iso_z(t0), _iso_z(t1)
+    span = (t1 - t0).total_seconds()
+    outs = [dict(r) for r in conn.execute(
+        "SELECT * FROM outages WHERE job_id=? AND started_utc <= ? "
+        "AND (ended_utc IS NULL OR ended_utc >= ?) ORDER BY started_utc",
+        (job_id, b, a))]
+    db_unplanned = [o for o in outs if o["kind"] in ("read", "write")
+                    and not o["planned"]]
+    intervals: list[tuple[float, float]] = []
+    durations: list[float] = []
+    longest = 0.0
+    for o in db_unplanned:
+        s = max(t0.timestamp(), _parse_iso(o["started_utc"]).timestamp())
+        e = min(t1.timestamp(),
+                _parse_iso(o["ended_utc"]).timestamp() if o["ended_utc"]
+                else t1.timestamp())
+        if e > s:
+            intervals.append((s, e))
+            durations.append(e - s)
+            longest = max(longest, e - s)
+    down_s = _union_seconds(intervals)
+    uptime_pct = round(100.0 * (1 - down_s / span), 4) if span > 0 else None
+
+    # latency/throughput stats from the finest table covering the span
+    use_samples = span <= HIGH_RES_MAX_S
+    if use_samples:
+        lat = [float(r[0]) for r in conn.execute(
+            "SELECT lat_p99 FROM cont_samples WHERE job_id=? AND ts_utc >= ? "
+            "AND ts_utc <= ? AND lat_p99 IS NOT NULL", (job_id, a, b))]
+        agg = conn.execute(
+            "SELECT count(*) AS n, avg(tps) AS tps_avg, sum(err_s) AS errs, "
+            "sum(reconn_s) AS reconns FROM cont_samples "
+            "WHERE job_id=? AND ts_utc >= ? AND ts_utc <= ?",
+            (job_id, a, b)).fetchone()
+        observed_s = int(agg["n"] or 0)
+        gap_s = max(0, int(span) - observed_s)
+    else:
+        lat = [float(r[0]) for r in conn.execute(
+            "SELECT lat_p99_max FROM cont_rollup_1m WHERE job_id=? "
+            "AND ts_utc >= ? AND ts_utc <= ? AND lat_p99_max IS NOT NULL",
+            (job_id, a, b))]
+        agg = conn.execute(
+            "SELECT count(*) AS n, avg(tps_avg) AS tps_avg, sum(err_sum) AS errs, "
+            "sum(reconn_sum) AS reconns, sum(gap_s) AS gaps, sum(n) AS secs "
+            "FROM cont_rollup_1m WHERE job_id=? AND ts_utc >= ? AND ts_utc <= ?",
+            (job_id, a, b)).fetchone()
+        observed_s = int(agg["secs"] or 0)
+        gap_s = max(0, int(span) - observed_s)
+    relaunches = int(conn.execute(
+        "SELECT count(*) FROM alerts WHERE job_id=? AND type='harness_relaunch' "
+        "AND fired_utc >= ? AND fired_utc <= ?", (job_id, a, b)).fetchone()[0])
+    return {
+        "job_id": job_id, "from_utc": a, "to_utc": b,
+        "window_s": int(span),
+        "uptime_pct": uptime_pct,
+        "downtime_s": round(down_s, 1),
+        "outages_total": len(outs),
+        "outages_unplanned_db": len(db_unplanned),
+        "outages_load": sum(1 for o in outs if o["kind"] == "load"),
+        "outages_planned": sum(1 for o in outs if o["planned"]),
+        "outages_open": sum(1 for o in outs if not o["ended_utc"]),
+        # MTBF over the window (span / incident count) and mean repair time —
+        # both None until there is at least one incident to measure.
+        "mtbf_s": round(span / len(db_unplanned), 1) if db_unplanned else None,
+        "mttr_s": (round(sum(durations) / len(durations), 1)
+                   if durations else None),
+        "longest_outage_s": round(longest, 1) if durations else 0,
+        "observed_seconds": observed_s,
+        "gap_seconds": gap_s,
+        "tps_avg": round(float(agg["tps_avg"]), 1) if agg["tps_avg"] is not None else None,
+        "errors_total": round(float(agg["errs"] or 0.0), 1),
+        "reconnects_total": round(float(agg["reconns"] or 0.0), 1),
+        "lat_p99_p50": _percentile(lat, 50),
+        "lat_p99_p95": _percentile(lat, 95),
+        "lat_p99_p99": _percentile(lat, 99),
+        "lat_p99_max": max(lat) if lat else None,
+        "harness_relaunches": relaunches,
+    }
+
+
+_DB_RATE_FIELDS = ("xact_commit", "xact_rollback", "blks_hit", "blks_read",
+                   "wal_records", "wal_bytes", "archived_count",
+                   "archive_failed", "deadlocks", "temp_bytes")
+_DB_GAUGE_FIELDS = ("conn_active", "conn_idle", "conn_idle_tx", "conn_total",
+                    "repl_lag_s", "repl_count", "db_size", "dead_tup",
+                    "ckpt_timed", "ckpt_req")
+
+
+def db_metrics_series(conn: sqlite3.Connection, job_id: int,
+                      t0: datetime, t1: datetime,
+                      max_points: int = 1000) -> dict[str, Any]:
+    """DB-side series over a window: gauges as-is; counters as per-second
+    rates between consecutive snapshots (a counter going backwards — stats
+    reset / failover — yields a None, never a negative spike)."""
+    a, b = _iso_z(t0), _iso_z(t1)
+    raw: list[tuple[int, dict[str, Any]]] = []
+    for r in conn.execute(
+            "SELECT ts_utc, metrics FROM cont_db_metrics WHERE job_id=? "
+            "AND ts_utc >= ? AND ts_utc <= ? ORDER BY ts_utc", (job_id, a, b)):
+        try:
+            raw.append((_epoch(_parse_iso(r["ts_utc"])),
+                        json.loads(r["metrics"])))
+        except (ValueError, KeyError):
+            continue
+    out: dict[str, Any] = {"t": [], "top_queries": None}
+    for f in _DB_GAUGE_FIELDS:
+        out[f] = []
+    for f in _DB_RATE_FIELDS:
+        out[f + "_rate"] = []
+    prev: Optional[tuple[int, dict[str, Any]]] = None
+    for ts, m in raw:
+        out["t"].append(ts)
+        for f in _DB_GAUGE_FIELDS:
+            out[f].append(m.get(f))
+        for f in _DB_RATE_FIELDS:
+            rate = None
+            if prev is not None:
+                dt = ts - prev[0]
+                va, vb = prev[1].get(f), m.get(f)
+                if dt > 0 and va is not None and vb is not None and vb >= va:
+                    rate = round((vb - va) / dt, 3)
+            out[f + "_rate"].append(rate)
+        prev = (ts, m)
+    if raw and raw[-1][1].get("top_queries"):
+        out["top_queries"] = raw[-1][1]["top_queries"]
+    # decimate by stride (rates already computed on raw neighbours)
+    n = len(out["t"])
+    if n > max_points:
+        stride = -(-n // max_points)
+        for k, v in out.items():
+            if isinstance(v, list):
+                out[k] = v[::stride]
+    out["points"] = len(out["t"])
+    return out
 
 
 # ── rebuild path (invariant: SQLite is a rebuildable index) ─────────

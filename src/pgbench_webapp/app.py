@@ -156,6 +156,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     # Cluster Ops routes live in their own module (same closure-style pattern).
     from pgbench_webapp import ops_routes
     ops_routes.register(app, cfg, store)
+    # Continuous Mode routes (lifecycle, historical metrics, outages, alerts).
+    from pgbench_webapp import continuous_routes
+    continuous_routes.register(app, cfg, store)
 
     def page(request: Request, name: str, user: Optional[sqlite3.Row], **ctx: Any) -> HTMLResponse:
         ctx.update(version=__version__, csrf=request.cookies.get("pgbench_csrf", ""),
@@ -362,6 +365,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
+        if v["mode"] == "continuous":
+            # continuous has its own lifecycle contract (saved target required,
+            # desired_state, one per target) enforced by its own endpoint
+            raise HTTPException(400, "continuous specs are started via "
+                                     "POST /api/continuous (the Continuous page), "
+                                     "not /api/runs")
         if v["mode"] in ("device-probe", "evidence-pack"):
             # destructive-adjacent: saturates the pgdata volume. Admin + the
             # in-spec arming flag (the runner refuses without it anyway).
@@ -944,11 +953,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/api/admin/settings")
     def api_admin_settings(conn: sqlite3.Connection = Depends(get_conn),
                            user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        from pgbench_webapp.contprobe import get_alerts_config
         return JSONResponse({
             "notify": notify.get_config(conn),
             "base_url": queries.get_setting(conn, "base_url", ""),
             "do_cluster_id": queries.get_setting(conn, "do_cluster_id", ""),
             "max_concurrency": int(queries.get_setting(conn, "max_concurrency", "1") or 1),
+            "continuous_cap": int(queries.get_setting(conn, "continuous_cap", "4") or 4),
+            "heartbeat_url": queries.get_setting(conn, "heartbeat_url", ""),
+            "cont_alerts_config": get_alerts_config(conn),
+            "cont_retention_raw_h": int(queries.get_setting(conn, "cont_retention_raw_h", "72") or 72),
+            "cont_retention_days": int(queries.get_setting(conn, "cont_retention_days", "35") or 35),
             "has_smtp_pw": bool(store.get(notify.SMTP_PASSWORD_REF)),
             "has_slack": bool(store.get(notify.SLACK_WEBHOOK_REF)),
             "has_do_token": bool(store.get(provider.DO_TOKEN_REF))})
@@ -977,6 +992,39 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                 queries.set_setting(conn, "max_concurrency", str(mc))
             except (TypeError, ValueError):
                 raise HTTPException(400, "max_concurrency must be an integer 1–16")
+        if payload.get("continuous_cap") is not None:
+            try:
+                cc = max(1, min(16, int(payload["continuous_cap"])))
+                queries.set_setting(conn, "continuous_cap", str(cc))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "continuous_cap must be an integer 1–16")
+        if "heartbeat_url" in payload:
+            url = str(payload.get("heartbeat_url") or "").strip()
+            if url and not url.startswith(("http://", "https://")):
+                raise HTTPException(400, "heartbeat_url must be an http(s) URL")
+            queries.set_setting(conn, "heartbeat_url", url)
+        for key, lo, hi in (("cont_retention_raw_h", 1, 24 * 14),
+                            ("cont_retention_days", 1, 365)):
+            if payload.get(key) is not None:
+                try:
+                    queries.set_setting(conn, key,
+                                        str(max(lo, min(hi, int(payload[key])))))
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{key} must be an integer")
+        if payload.get("cont_alerts_config") is not None:
+            from pgbench_webapp.contprobe import ALERTS_CONFIG_DEFAULTS
+            doc = payload["cont_alerts_config"]
+            if not isinstance(doc, dict):
+                raise HTTPException(400, "cont_alerts_config must be an object")
+            clean: dict = {}
+            for k, v in doc.items():
+                if k not in ALERTS_CONFIG_DEFAULTS:
+                    raise HTTPException(400, f"unknown alert threshold '{k}'")
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                    raise HTTPException(400, f"alert threshold '{k}' must be a "
+                                             "positive number")
+                clean[k] = v
+            queries.set_setting(conn, "cont_alerts_config", json.dumps(clean))
         # Secrets only updated when a new value is supplied (blank leaves as-is).
         if payload.get("smtp_password"):
             store.set(notify.SMTP_PASSWORD_REF, payload["smtp_password"])
