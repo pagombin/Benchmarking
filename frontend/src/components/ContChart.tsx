@@ -61,6 +61,11 @@ export function ContChart({ title, xs, series, height = 220, yFormat,
   const plot = useRef<uPlot | null>(null);
   const bandsRef = useRef<Band[]>(bands ?? []);
   const markersRef = useRef<VMarker[]>(markers ?? []);
+  // Set in the create-effect, consumed by the update-effects below: uPlot
+  // defers its first paint to a rAF, and a synchronous redraw()/setData() in
+  // the same commit that constructed it corrupts the x-scale — the chart
+  // then renders axes but no series, permanently (B-026).
+  const fresh = useRef(false);
   bandsRef.current = bands ?? [];
   markersRef.current = markers ?? [];
 
@@ -148,6 +153,7 @@ export function ContChart({ title, xs, series, height = 220, yFormat,
     const data: uPlot.AlignedData = [xs, ...series.map((s) => clean(s.values))] as uPlot.AlignedData;
     const u = new uPlot(opts, data, el);
     plot.current = u;
+    fresh.current = true;
     const ro = new ResizeObserver(() => u.setSize({ width: el.clientWidth, height }));
     ro.observe(el);
     return () => {
@@ -159,12 +165,15 @@ export function ContChart({ title, xs, series, height = 220, yFormat,
   }, [title, height, series.map((s) => `${s.label}:${s.scale ?? "y"}`).join("|")]);
 
   useEffect(() => {
-    if (plot.current) {
+    if (plot.current && !fresh.current) {
       plot.current.setData([xs, ...series.map((s) => clean(s.values))] as uPlot.AlignedData);
     }
   }, [xs, series]);
 
-  useEffect(() => { plot.current?.redraw(); }, [bands, markers]);
+  useEffect(() => {
+    if (fresh.current) { fresh.current = false; return; }   // constructor already draws these
+    plot.current?.redraw();
+  }, [bands, markers]);
 
   return <div className="chart" ref={host} />;
 }

@@ -13,7 +13,7 @@ committed to `src/pgbench_webapp/static/spa/`.
 | Severity | Count | IDs |
 |----------|------:|-----|
 | P0 | 0 | — |
-| P1 | 3 | B-001, B-002, B-014 |
+| P1 | 4 | B-001, B-002, B-014, B-026 |
 | P2 | 10 | B-003…006, B-008, B-011…013, B-016, B-018 |
 | P3 | 4 | B-007, B-009, B-010, B-021 (documented) |
 | Verified-sound (no bug, behavior now proven by test) | 8 | B-015, B-017, B-019, B-020, B-022…025 |
@@ -39,15 +39,18 @@ which are build-verified per the brief (no new frontend test framework).
    and the same lock powers the new `/api/worker/status` probe and the
    header "worker down" chip, so a dead worker is visible instead of a
    silently growing queue.
-4. **B-005 — deploy.sh's fallback systemd units had lost the entire
+4. **B-026 — every continuous chart rendered blank** (axes and grid, no
+   series, no outage shading). uPlot defers its first paint to an animation
+   frame; ContChart's mount effects called `redraw()` synchronously in the
+   construction commit, corrupting the x-scale before that first paint.
+   Found by driving the built SPA against a seeded console in headless
+   Chromium and probing canvas pixels; fixed with a mount-tick guard.
+5. **B-005 — deploy.sh's fallback systemd units had lost the entire
    hardening block** (UMask/Protect*/Restrict*…) relative to
    `packaging/systemd/*`. Re-synced directive-for-directive, with a test
    that extracts the heredocs and diffs them against the packaged units so
-   drift is now structurally impossible.
-5. **B-012 — "mypy must stay clean" was untrue: 43 pre-existing errors,**
-   two hiding latent runtime bugs (a None-bound comparison in ops/stitch, a
-   clobbered loop variable in ops/crconfig that corrupted warning output).
-   All 43 fixed; `mypy src/pgbench_harness` is actually clean on 2.3.1.
+   drift is now structurally impossible. (Honorable mention: B-012 — the 43
+   pre-existing mypy errors, two hiding latent runtime bugs; all fixed.)
 
 ## UI: before → after
 

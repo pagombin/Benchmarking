@@ -32,6 +32,7 @@ G frontend, H e2e) from the bug-bash brief.
 | B-023 | ok | E | app._sse / _job_sse | Verified: byte-offset incremental reads, bounded backfill (21600 rows), max_ticks ceilings, no DB connection pinned by run streams; non-UTF-8 handled with errors="replace" | none needed | existing SSE tests |
 | B-024 | ok | C | ops_routes.ops_run_file | Verified: per-component `_safe_segment` makes traversal impossible on the artifact download path | none needed | `test_run_routes_reject_path_traversal` (existing) |
 | B-025 | ok | H | whole stack | The full journey now exists as one test: config → target → prepare → continuous → samples/rollups → sysbench crash → reboot → relaunch+alert → probe outage → mocked Slack delivery record → stop → no resurrection → no secret in any artifact | — | `test_continuous_full_journey.py` |
+| B-026 | P1 | G | ContChart.tsx | Every continuous chart rendered axes but **no series and no shading** — uPlot defers its first paint to a rAF, and the component's mount-time effects called `redraw()` synchronously in the same commit that constructed the plot, corrupting the x-scale before the first paint (axes ranges survive; series paths and x-splits come out empty, permanently) | A `fresh` ref set at construction makes the setData/redraw effects skip their mount-tick invocation; later (post-paint) updates behave as before | Found and verified against a live seeded console in headless Chromium (canvas pixel probe: 0 series-color pixels before, ~6k after); UI build-verified per the no-frontend-framework rule |
 
 ## Section walk summary
 
@@ -56,5 +57,8 @@ G frontend, H e2e) from the bug-bash brief.
   populated DBs (existing test); every new setting reads through a default.
 * **G (frontend)**: findings B-008/9/10 fixed in Part 2 (see
   SUMMARY-BUGBASH.md); api.ts already routes 401s to /login; formatters
-  already guard NaN/null.
+  already guard NaN/null. Driving the built SPA against a seeded console in
+  a real (headless) browser then surfaced B-026 — the continuous charts
+  drew axes but never their series — which no amount of tsc/build checking
+  could have caught.
 * **H**: `test_continuous_full_journey.py` — the end-to-end drill in ~13s.
