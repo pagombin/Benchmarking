@@ -788,6 +788,24 @@ def capture_env(run_dir: Path, spec: Spec, password: str, pf: PreflightResult) -
     atomic_write_text(env_dir / "host_info.txt", host_info())
 
 
+def _check_mysql_require_pk(spec: Spec, password: str) -> str:
+    """TPC-C on MySQL: the spec-mandated PK-less history tables cannot be
+    created while sql_require_primary_key=ON (managed defaults, e.g.
+    DigitalOcean). Returns a warning string, or '' when fine. The variable
+    only gates CREATE/ALTER, so it can be re-enabled after the load."""
+    if spec.target.engine != "mysql" or spec.workload.type != "tpcc":
+        return ""
+    ok, out = psql_query_soft(spec, password, "SELECT @@sql_require_primary_key")
+    if ok and out.strip() == "1":
+        return ("sql_require_primary_key=ON on the target — TPC-C's history "
+                "tables have no primary key (per spec), so `prepare` WILL fail "
+                "with error 3750. Disable it for the load (DO: Settings → "
+                "Advanced configuration, or doctl databases configuration "
+                "update … '{\"sql_require_primary_key\": false}'); it only "
+                "gates CREATE/ALTER and can be re-enabled afterwards.")
+    return ""
+
+
 def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> PreflightResult:
     """Run all preflight checks; raise PreflightError on any hard failure."""
     pf = PreflightResult()
@@ -808,6 +826,9 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
     pf.pooler_probe = detect_pooler(spec, password)
     logger.info("preflight: server %s, max_connections=%s", pf.server_version, pf.max_connections)
     logger.info("preflight: pooler probe: %s", pf.pooler_probe)
+    pk_warn = _check_mysql_require_pk(spec, password)
+    if pk_warn:
+        pf.warnings.append(pk_warn)
     _check_pg_stat_monitor(spec, password, pf)
     _check_ceiling(spec, password, pf, logger)
     pf.dataset = check_dataset(spec, password)
@@ -864,6 +885,12 @@ def preflight_steps(spec: Spec, password: str,
         yield ev("Pooler probe", "info", detect_pooler(spec, password))
     except Exception as exc:  # noqa: BLE001
         yield ev("Pooler probe", "info", str(exc))
+    try:
+        pk_warn = _check_mysql_require_pk(spec, password)
+        if pk_warn:
+            yield ev("sql_require_primary_key", "fail", pk_warn)
+    except Exception as exc:  # noqa: BLE001
+        yield ev("sql_require_primary_key", "warn", str(exc))
     if spec.target.engine == "mysql":
         yield ev("pg_stat_monitor", "info",
                  "n/a on MySQL — per-statement stats come from "

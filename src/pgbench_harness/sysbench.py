@@ -164,7 +164,13 @@ def build_continuous_command(spec: Spec, threads: int, time_s: int) -> SysbenchC
 
 
 def build_prepare_command(spec: Spec) -> SysbenchCommand:
-    """Build the sysbench `prepare` command (parallel load, capped at 16 threads)."""
+    """Build the sysbench `prepare` command.
+
+    Load parallelism defaults to min(16, peak run threads); for very large
+    datasets on big loadgen hosts, workload.prepare_threads raises it
+    explicitly (sysbench parallelizes per table / per tpcc warehouse, so it
+    helps only while tables × scale provides that many independent units).
+    """
     script, wargs, cwd = _workload_args(spec)
     if spec.sweep is not None:
         peak = max(spec.sweep.threads)
@@ -175,7 +181,7 @@ def build_prepare_command(spec: Spec) -> SysbenchCommand:
     else:
         assert spec.soak is not None
         peak = spec.soak.threads
-    threads = min(16, peak)
+    threads = spec.workload.prepare_threads or min(16, peak)
     argv = (
         ["sysbench", script]
         + _connection_args(spec)

@@ -70,7 +70,8 @@ def test_mysql_refuses_pgbench_suite() -> None:
 
 # ── sysbench command construction ───────────────────────────────────
 
-def test_mysql_sysbench_argv_and_env() -> None:
+def test_mysql_sysbench_argv_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP", "--mysql-ssl[=on|off] use SSL")
     spec = parse_spec(mysql_doc())
     cmd = build_run_command(spec, threads=4)
     argv = " ".join(cmd.argv)
@@ -88,7 +89,8 @@ def test_mysql_sysbench_argv_and_env() -> None:
     assert "PGPASSWORD" not in env or env.get("PGPASSWORD") != TEST_PASSWORD
 
 
-def test_mysql_ssl_disable_maps_to_off() -> None:
+def test_mysql_ssl_disable_maps_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP", "--mysql-ssl[=on|off] use SSL")
     doc = mysql_doc()
     doc["target"]["sslmode"] = "disable"
     cmd = build_prepare_command(parse_spec(doc))
@@ -449,3 +451,100 @@ def test_worker_e2e_mysql_continuous(web, monkeypatch):
               and "pw-secret-mysql" in p.read_text(errors="ignore")]
     assert leaked == []
     conn.close()
+
+
+def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TLS trust setup rides the ENV, not argv: sysbench 1.0.20 rejects
+    --mysql-ssl-ca, and its SSL context init fails without a reachable CA
+    ('SSL_CTX_set_default_verify_paths failed'). client_env points
+    SSL_CERT_FILE/DIR at the system bundle; PGB_MYSQL_SSL_CA overrides,
+    empty leaves the env untouched; sslmode=disable sets nothing."""
+    monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP",
+                        "...mysql-ssl[=on|off]...")            # a 1.0.20 build
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl=on" in args                            # old dialect
+    assert not any(a.startswith("--mysql-ssl-ca") for a in args)  # 1.0.20-safe
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP",
+                        "...mysql-ssl=STRING...mysql-ssl-ca=STRING...")  # 1.1.0
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl=REQUIRED" in args                      # mode dialect
+    # require = encrypt-only: NO CA (a CA makes libmysql verify, and managed
+    # providers sign with private CAs -> 'certificate verify failed')
+    assert not any(a.startswith("--mysql-ssl-ca") for a in args)
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
+                                            sslmode="verify-full")
+    assert "--mysql-ssl=VERIFY_IDENTITY" in args
+    if engines.mysql_ssl_ca():                                 # verify wants a CA
+        assert any(a.startswith("--mysql-ssl-ca=") for a in args)
+    monkeypatch.setenv("PGB_MYSQL_SSL_CA", "/root/do-ca.crt")  # operator-pinned CA
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl-ca=/root/do-ca.crt" in args
+    monkeypatch.delenv("PGB_MYSQL_SSL_CA")
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
+                                            sslmode="disable")
+    assert "--mysql-ssl=DISABLED" in args
+    assert not any(a.startswith("--mysql-ssl-ca") for a in args)
+    env = engines.client_env("mysql", "pw")
+    if engines.mysql_ssl_ca():                       # system bundle present
+        assert env["SSL_CERT_FILE"] == engines.mysql_ssl_ca()
+        assert env["SSL_CERT_DIR"]
+    monkeypatch.setenv("PGB_MYSQL_SSL_CA", "/custom/provider-ca.pem")
+    env = engines.client_env("mysql", "pw")
+    assert env["SSL_CERT_FILE"] == "/custom/provider-ca.pem"
+    monkeypatch.setenv("PGB_MYSQL_SSL_CA", "")
+    env = engines.client_env("mysql", "pw")
+    assert "SSL_CERT_FILE" not in env
+    monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
+    env = engines.client_env("mysql", "pw", sslmode="disable")
+    assert "SSL_CERT_FILE" not in env
+    # an operator's own SSL_CERT_FILE is never clobbered
+    monkeypatch.setenv("SSL_CERT_FILE", "/operator/own.pem")
+    env = engines.client_env("mysql", "pw")
+    assert env["SSL_CERT_FILE"] == "/operator/own.pem"
+
+
+def test_mysql_tpcc_require_pk_preflight(fake_env: Path, tmp_path: Path,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """sql_require_primary_key=ON + TPC-C is caught BEFORE the load: a
+    warning in run_preflight and a fail event in the live checklist, with
+    the disable-for-load guidance; OFF stays silent, and oltp specs never
+    run the check."""
+    doc = mysql_doc()
+    tpcc = tmp_path / "tpcc"
+    tpcc.mkdir()
+    (tpcc / "tpcc.lua").write_text("-- stub")
+    doc["workload"] = {"type": "tpcc", "tpcc_path": str(tpcc),
+                      "tables": 1, "scale": 1}
+    import logging as _logging
+    monkeypatch.setenv("FAKE_MYSQL_REQUIRE_PK", "1")
+    spec = parse_spec(doc)
+    warn = capture._check_mysql_require_pk(spec, TEST_PASSWORD)
+    assert "error 3750" in warn and "re-enabled afterwards" in warn
+    events = {e["name"]: e for e in capture.preflight_steps(
+        spec, TEST_PASSWORD, _logging.getLogger("t"))}
+    assert events["sql_require_primary_key"]["status"] == "fail"
+    monkeypatch.setenv("FAKE_MYSQL_REQUIRE_PK", "0")
+    assert capture._check_mysql_require_pk(spec, TEST_PASSWORD) == ""
+    assert capture._check_mysql_require_pk(
+        parse_spec(mysql_doc()), TEST_PASSWORD) == ""   # oltp: no check
+
+
+def test_prepare_threads_knob() -> None:
+    """workload.prepare_threads lifts the min(16, peak) load-parallelism
+    default for huge datasets; 0/omitted keeps the old behavior; out-of-range
+    values are refused at validation."""
+    from pgbench_harness.sysbench import build_prepare_command
+    spec = parse_spec(mysql_doc())                    # sweep peaks at 4 threads
+    assert "--threads=4" in build_prepare_command(spec).argv
+    doc = mysql_doc()
+    doc["workload"]["prepare_threads"] = 48
+    assert "--threads=48" in build_prepare_command(parse_spec(doc)).argv
+    doc["workload"]["prepare_threads"] = 300
+    with pytest.raises(SpecError, match="prepare_threads"):
+        parse_spec(doc)
+    doc["workload"]["prepare_threads"] = -1
+    with pytest.raises(SpecError, match="prepare_threads"):
+        parse_spec(doc)

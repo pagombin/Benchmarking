@@ -16,6 +16,7 @@ for the credential — so one module owns the differences:
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import Any, Optional
 
 ENGINES = ("postgres", "mysql")
@@ -94,10 +95,24 @@ def client_env(engine: str, password: str, sslmode: str = "require",
     password is ``MYSQL_PWD``, which libmysqlclient reads whenever no
     explicit password option is supplied — the same no-secret-in-argv
     contract as libpq's ``PGPASSWORD``.
+
+    When TLS is on, the standard OpenSSL variables are pointed at the
+    system CA bundle: sysbench's MySQL driver (and some client builds)
+    initialize their TLS context via ``SSL_CTX_set_default_verify_paths``,
+    which fails outright on stock Ubuntu (no default cert *file*, only the
+    certs dir) with ``error 2026: SSL_CTX_set_default_verify_paths
+    failed``. sysbench 1.0.20 has no ``--mysql-ssl-ca`` option, so the env
+    route is the one that works everywhere. Peer verification is NOT
+    enabled by this — it only lets the context initialize.
     """
     env = dict(os.environ)
     if engine == "mysql":
         env["MYSQL_PWD"] = password
+        if sslmode != "disable":
+            ca = mysql_ssl_ca()
+            if ca:
+                env.setdefault("SSL_CERT_FILE", ca)
+                env.setdefault("SSL_CERT_DIR", os.path.dirname(ca) or "/etc/ssl/certs")
         return env
     env["PGPASSWORD"] = password
     env["PGSSLMODE"] = sslmode
@@ -113,13 +128,90 @@ def cell_sep(engine: str) -> str:
     return "\t" if engine == "mysql" else "|"
 
 
+_MYSQL_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian/Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL/Fedora
+    "/etc/ssl/cert.pem",                    # Alpine/macOS
+)
+
+
+def mysql_ssl_ca() -> str:
+    """CA bundle the OpenSSL env vars point at when MySQL TLS is on (see
+    client_env). ``PGB_MYSQL_SSL_CA`` overrides the autodetected path — set
+    it to a provider CA file if you want one, or to the empty string to
+    leave the environment untouched."""
+    override = os.environ.get("PGB_MYSQL_SSL_CA")
+    if override is not None:
+        return override
+    for p in _MYSQL_CA_BUNDLES:
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+# Cached `sysbench --help` text: which driver options this build knows.
+# Ubuntu's 1.0.20 package lacks --mysql-ssl-ca (and its MariaDB-linked TLS
+# init fails against TLS-required servers); newer builds (Percona's, or
+# upstream master) have the flag. Probed once per process, never raising.
+_SYSBENCH_HELP: Optional[str] = None
+
+
+def _sysbench_help() -> str:
+    global _SYSBENCH_HELP
+    if _SYSBENCH_HELP is None:
+        try:
+            out = subprocess.run(["sysbench", "--help"], capture_output=True,
+                                 text=True, timeout=10)
+            _SYSBENCH_HELP = (out.stdout or "") + (out.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            _SYSBENCH_HELP = ""
+    return _SYSBENCH_HELP
+
+
+def sysbench_supports(option: str) -> bool:
+    """True when the installed sysbench lists *option* in its --help."""
+    return option in _sysbench_help()
+
+
+# sysbench's --mysql-ssl option changed shape between releases: 1.0.x takes
+# on|off; 1.1.0 (upstream master, Percona newer builds) takes the MySQL
+# ssl-mode strings and rejects 'on' outright. Detected from --help; when the
+# probe can't tell (sysbench missing), the packaged 1.0.x shape is assumed.
+_MYSQL_SSL_SYSBENCH_MODE = {
+    "disable": "DISABLED",
+    "allow": "PREFERRED",
+    "prefer": "PREFERRED",
+    "require": "REQUIRED",
+    "verify-ca": "VERIFY_CA",
+    "verify-full": "VERIFY_IDENTITY",
+}
+
+
+def _sysbench_mysql_ssl_value(sslmode: str) -> str:
+    if "mysql-ssl[=on|off]" in _sysbench_help():
+        return "off" if sslmode == "disable" else "on"
+    if "mysql-ssl" in _sysbench_help():
+        return _MYSQL_SSL_SYSBENCH_MODE.get(sslmode, "REQUIRED")
+    return "off" if sslmode == "disable" else "on"
+
+
 def sysbench_connection_args(engine: str, host: str, port: int, user: str,
                              database: str, sslmode: str = "require") -> list[str]:
     """sysbench driver + connection flags. Password stays OUT of argv for both
-    drivers (PGPASSWORD / MYSQL_PWD via the child env)."""
+    drivers (PGPASSWORD / MYSQL_PWD via the child env). The --mysql-ssl value
+    matches what the INSTALLED sysbench build understands — Ubuntu's 1.0.20
+    wants on|off; 1.1.0 wants ssl-mode strings and rejects 'on'.
+
+    A CA file is passed ONLY when verification is wanted: handing libmysql a
+    CA makes it verify the server certificate, and managed providers (e.g.
+    DigitalOcean) sign with private CAs the system bundle can't verify — so
+    'require' stays encrypt-only (exactly libpq's sslmode=require), while
+    verify-ca/verify-full attach the bundle, and PGB_MYSQL_SSL_CA pins an
+    operator-supplied CA (the provider's downloadable cert) in any mode.
+    """
     if engine == "mysql":
-        ssl = "off" if sslmode == "disable" else "on"
-        return [
+        ssl = _sysbench_mysql_ssl_value(sslmode)
+        args = [
             "--db-driver=mysql",
             f"--mysql-host={host}",
             f"--mysql-port={port}",
@@ -127,6 +219,13 @@ def sysbench_connection_args(engine: str, host: str, port: int, user: str,
             f"--mysql-db={database}",
             f"--mysql-ssl={ssl}",
         ]
+        if ssl not in ("off", "DISABLED") and sysbench_supports("mysql-ssl-ca"):
+            ca = os.environ.get("PGB_MYSQL_SSL_CA") or ""
+            if not ca and sslmode in ("verify-ca", "verify-full"):
+                ca = mysql_ssl_ca()
+            if ca:
+                args.append(f"--mysql-ssl-ca={ca}")
+        return args
     return [
         "--db-driver=pgsql",
         f"--pgsql-host={host}",

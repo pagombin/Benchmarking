@@ -181,6 +181,8 @@ workload:
   scale: 30                               # required for tpcc
   # table_size: 10000                     # required for oltp_* types
   extra_args: ["--use_fk=0", "--trx_level=RC"]   # optional; passed through verbatim
+  # prepare_threads: 48                   # optional; dataset-load parallelism
+  #                                       # (default min(16, peak run threads))
   # io_stress only (cache-defeating storage pressure):
   # dataset_gb: 64                        # primary size control (table_size derived from it);
   #                                       # use >= 2x instance RAM so reads miss the caches
