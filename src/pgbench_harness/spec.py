@@ -69,6 +69,11 @@ class Workload:
     dataset_gb: float = 0.0
     mix: str = ""
     rand_type: str = ""
+    # dataset-load parallelism: 0 = auto (min(16, peak run threads)). Raise it
+    # for very large loads on big loadgen hosts — sysbench parallelizes the
+    # prepare per table (oltp_*) / per warehouse (tpcc), so it only helps
+    # while tables × scale provides that many independent work units.
+    prepare_threads: int = 0
 
 
 @dataclass(frozen=True)
@@ -370,10 +375,14 @@ def _parse_target(sec: dict[str, Any]) -> Target:
 def _parse_workload(sec: dict[str, Any]) -> Workload:
     _check_keys(sec, "workload", {"type", "tables"},
                 {"tpcc_path", "scale", "table_size", "extra_args",
-                 "dataset_gb", "mix", "rand_type"})
+                 "dataset_gb", "mix", "rand_type", "prepare_threads"})
     wtype = _typed(sec, "workload", "type", str)
     if wtype not in WORKLOAD_TYPES:
         raise SpecError(f"'workload.type' must be one of {WORKLOAD_TYPES}, got '{wtype}'")
+    prepare_threads = _typed(sec, "workload", "prepare_threads", int, 0)
+    if not 0 <= prepare_threads <= 256:
+        raise SpecError("'workload.prepare_threads' must be between 1 and 256 "
+                        "(or 0/omitted for the automatic default)")
     extra = sec.get("extra_args", [])
     if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
         raise SpecError("'workload.extra_args' must be a list of strings")
@@ -410,6 +419,7 @@ def _parse_workload(sec: dict[str, Any]) -> Workload:
         dataset_gb=dataset_gb,
         mix=mix,
         rand_type=rand_type,
+        prepare_threads=prepare_threads,
     )
     if wl.type == "tpcc":
         if not wl.tpcc_path:

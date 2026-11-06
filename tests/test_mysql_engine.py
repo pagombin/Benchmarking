@@ -530,3 +530,21 @@ def test_mysql_tpcc_require_pk_preflight(fake_env: Path, tmp_path: Path,
     assert capture._check_mysql_require_pk(spec, TEST_PASSWORD) == ""
     assert capture._check_mysql_require_pk(
         parse_spec(mysql_doc()), TEST_PASSWORD) == ""   # oltp: no check
+
+
+def test_prepare_threads_knob() -> None:
+    """workload.prepare_threads lifts the min(16, peak) load-parallelism
+    default for huge datasets; 0/omitted keeps the old behavior; out-of-range
+    values are refused at validation."""
+    from pgbench_harness.sysbench import build_prepare_command
+    spec = parse_spec(mysql_doc())                    # sweep peaks at 4 threads
+    assert "--threads=4" in build_prepare_command(spec).argv
+    doc = mysql_doc()
+    doc["workload"]["prepare_threads"] = 48
+    assert "--threads=48" in build_prepare_command(parse_spec(doc)).argv
+    doc["workload"]["prepare_threads"] = 300
+    with pytest.raises(SpecError, match="prepare_threads"):
+        parse_spec(doc)
+    doc["workload"]["prepare_threads"] = -1
+    with pytest.raises(SpecError, match="prepare_threads"):
+        parse_spec(doc)
