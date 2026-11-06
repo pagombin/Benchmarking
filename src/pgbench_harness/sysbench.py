@@ -1,16 +1,16 @@
 """sysbench command construction and execution with a live line-buffered tee.
 
 The target password is **never** placed on the command line. It is exported to
-the child process environment as ``PGPASSWORD`` (sysbench's pgsql driver uses
-libpq, which falls back to ``PGPASSWORD``/``PGSSLMODE`` when the corresponding
-options are unset). Command lines are therefore safe to log and to print in
-``--dry-run``.
+the child process environment — ``PGPASSWORD`` for the pgsql driver (libpq
+falls back to ``PGPASSWORD``/``PGSSLMODE`` when the corresponding options are
+unset) and ``MYSQL_PWD`` for the mysql driver (libmysqlclient's documented
+fallback when no password option is given). Command lines are therefore safe
+to log and to print in ``--dry-run`` for either engine.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 import threading
@@ -57,22 +57,16 @@ class SysbenchCommand:
 
 
 def child_env(spec: Spec, password: str) -> dict[str, str]:
-    """Environment for sysbench/psql children: password and sslmode via libpq vars."""
-    env = dict(os.environ)
-    env["PGPASSWORD"] = password
-    env["PGSSLMODE"] = spec.target.sslmode
-    return env
+    """Environment for sysbench/client children: credential via libpq/libmysql vars."""
+    from pgbench_harness.engines import client_env
+    return client_env(spec.target.engine, password, spec.target.sslmode)
 
 
 def _connection_args(spec: Spec) -> list[str]:
+    from pgbench_harness.engines import sysbench_connection_args
     t = spec.target
-    return [
-        "--db-driver=pgsql",
-        f"--pgsql-host={t.host}",
-        f"--pgsql-port={t.port}",
-        f"--pgsql-user={t.user}",
-        f"--pgsql-db={t.database}",
-    ]
+    return sysbench_connection_args(t.engine, t.host, t.port, t.user,
+                                    t.database, t.sslmode)
 
 
 def _workload_args(spec: Spec) -> tuple[str, list[str], Optional[str]]:

@@ -76,8 +76,8 @@ def spec_file(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def fake_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Put fake sysbench/psql on PATH and set the password env var."""
-    for exe in ("sysbench", "psql"):
+    """Put fake sysbench/psql/mysql on PATH and set the password env var."""
+    for exe in ("sysbench", "psql", "mysql"):
         path = FAKEBIN / exe
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")

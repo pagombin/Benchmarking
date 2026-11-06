@@ -64,12 +64,20 @@ MANIFEST_SEGMENT_CAP = 500
 
 AUTH_ERROR_RE = re.compile(
     r"password authentication failed|no pg_hba\.conf entry|"
-    r"role .* does not exist|authentication failed", re.IGNORECASE)
+    r"role .* does not exist|authentication failed|"
+    # MySQL: ER_ACCESS_DENIED_ERROR / ER_HOST_NOT_PRIVILEGED / ER_DBACCESS_DENIED
+    r"access denied for user|is not allowed to connect to this mysql server",
+    re.IGNORECASE)
 NETWORK_ERROR_RE = re.compile(
     r"connection refused|could not connect|timeout|timed out|"
     r"server closed the connection|connection reset|no route to host|"
     r"could not translate host name|connection to server .* failed|"
-    r"network is unreachable", re.IGNORECASE)
+    r"network is unreachable|"
+    # MySQL client errors: CR_CONN_HOST_ERROR (2003), CR_SERVER_LOST (2013),
+    # CR_SERVER_GONE_ERROR (2006), unresolvable host (2005)
+    r"can't connect to mysql server|lost connection to mysql server|"
+    r"mysql server has gone away|unknown mysql server host",
+    re.IGNORECASE)
 
 
 def classify_error(excerpt: str) -> str:

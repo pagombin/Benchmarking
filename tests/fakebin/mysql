@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Fake mysql client for end-to-end tests (the MySQL twin of fakebin/psql).
+
+Knobs (env vars):
+  FAKE_MYSQL_PROBE_FAIL  {read, write, all}: fail that continuous probe
+  FAKE_MYSQL_EXIT_AUTH   any query fails with ERROR 1045 Access denied
+  FAKE_MYSQL_TABLES      expected tables resolving in the default schema
+  FAKE_MYSQL_FOREIGN     count of non-benchmark tables (default 0)
+  FAKE_MYSQL_ROWS        warehouse1 row count (default 30)
+  FAKE_MYSQL_MAX_ID      max(id) of sbtest1 (default 1000)
+  FAKE_MYSQL_CANARY_COLS override the canary column-count answer
+  FAKE_MYSQL_MAX_CONN    refuse sleep() holders beyond this count
+  FAKE_MYSQL_STATE       writable state dir (falls back to FAKE_PSQL_STATE so
+                         one test state dir serves both fake clients; the fake
+                         sysbench's `prepared` marker is honored either way)
+
+Output mimics `mysql --batch --skip-column-names`: TAB-separated cells, no
+headers, NULL spelled NULL.
+"""
+import fcntl
+import os
+import re
+import sys
+import time
+
+args = sys.argv[1:]
+
+if "--version" in args:
+    print("mysql  Ver 8.0.39 for Linux on x86_64 (MySQL Community Server - GPL)")
+    sys.exit(0)
+
+sql = ""
+database = ""
+for i, a in enumerate(args):
+    if a == "-e" and i + 1 < len(args):
+        sql = args[i + 1]
+    if a == "-D" and i + 1 < len(args):
+        database = args[i + 1]
+
+if not os.environ.get("MYSQL_PWD"):
+    print("ERROR 1045 (28000): Access denied for user 'bench'@'client' "
+          "(using password: NO)", file=sys.stderr)
+    sys.exit(1)
+
+if os.environ.get("FAKE_MYSQL_EXIT_AUTH"):
+    print("ERROR 1045 (28000): Access denied for user 'bench'@'client' "
+          "(using password: YES)", file=sys.stderr)
+    sys.exit(1)
+
+low = sql.lower().strip()
+state_dir = os.environ.get("FAKE_MYSQL_STATE") or os.environ.get("FAKE_PSQL_STATE", "")
+prepared = state_dir and os.path.exists(os.path.join(state_dir, "prepared"))
+
+# ── continuous-mode probes ──
+_probe_fail = os.environ.get("FAKE_MYSQL_PROBE_FAIL", "")
+if low == "select 1" and _probe_fail in ("read", "all"):
+    print("ERROR 2003 (HY000): Can't connect to MySQL server on 'db' (111)",
+          file=sys.stderr)
+    sys.exit(1)
+if "pgbench_harness_canary" in low:
+    if _probe_fail in ("write", "all"):
+        print("ERROR 2003 (HY000): Can't connect to MySQL server on 'db' (111)",
+              file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)                      # mysql --batch prints nothing for DDL/DML
+
+# ── connection-ceiling probe hold ──
+if low.startswith("select sleep("):
+    max_conn = os.environ.get("FAKE_MYSQL_MAX_CONN")
+    if max_conn and state_dir:
+        counter = os.path.join(state_dir, "conn_counter")
+        with open(counter, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            n = int(fh.read().strip() or "0") + 1
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(n))
+        if n > int(max_conn):
+            print("ERROR 1040 (HY000): Too many connections", file=sys.stderr)
+            sys.exit(1)
+    m = re.search(r"sleep\((\d+)", low)
+    time.sleep(min(int(m.group(1)) if m else 1, 60))
+    print("0")
+    sys.exit(0)
+
+
+def names_in_list(sql_text):
+    m = re.search(r"in \(([^)]*)\)", sql_text)
+    return len(re.findall(r"'[^']*'", m.group(1))) if m else 0
+
+
+TABLE_RE = re.compile(
+    r"^(sbtest|warehouse|district|customer|history|orders|new_orders|"
+    r"order_line|stock|item)\d+$")
+
+
+def table_names(sql_text):
+    return [s for s in re.findall(r"'([^']*)'", sql_text) if TABLE_RE.match(s)]
+
+
+def counter(name, step=1):
+    """Monotonic per-state counter (mirrors fake psql's io/db/wal counters)."""
+    n = 0
+    if state_dir:
+        cf = os.path.join(state_dir, name)
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + step))
+    return n
+
+
+# ── live sampler: one JSON doc of global_status counters ──
+if low.startswith("select json_object('db_epoch'"):
+    import json as _json
+    n = int(time.time())
+    print(_json.dumps({
+        "db_epoch": time.time(),
+        "status": {
+            "com_commit": n * 90, "com_rollback": n * 10,
+            "innodb_buffer_pool_read_requests": n * 9000,
+            "innodb_buffer_pool_reads": n * 100,
+            "innodb_os_log_written": n * 500000,
+            "threads_connected": 20, "threads_running": 8,
+            "innodb_rows_read": n * 5000, "innodb_rows_inserted": n * 300,
+            "innodb_rows_updated": n * 200, "innodb_rows_deleted": n * 50,
+            "innodb_row_lock_current_waits": 2,
+            "created_tmp_disk_tables": n * 1, "created_tmp_tables": n * 4,
+        }}))
+    sys.exit(0)
+
+# ── continuous-mode DB collector split queries (exact prefixes) ──
+if low.startswith("select (select variable_value+0 from performance_schema.global_status where variable_name='threads_running')"):
+    print("3\t6\tNULL\t9")
+    sys.exit(0)
+if low.startswith("select (select variable_value+0 from performance_schema.global_status where variable_name='com_commit')"):
+    n = int(time.time())
+    print(f"{n * 90}\t{n}\t{n * 9000}\t{n * 100}\tNULL\tNULL")
+    sys.exit(0)
+if low.startswith("select null, (select variable_value+0 from performance_schema.global_status where variable_name='innodb_os_log_written')"):
+    n = int(time.time())
+    print(f"NULL\t{n * 80000}")
+    sys.exit(0)
+if low.startswith("select null, (select count(*) from information_schema.processlist"):
+    print("NULL\t2")
+    sys.exit(0)
+if "trx_rseg_history_len" in low:
+    print("1234")
+    sys.exit(0)
+if low.startswith("select left(regexp_replace("):
+    print("SELECT c FROM sbtest1 WHERE id=?\t50000\t123456")
+    print("UPDATE sbtest2 SET k=k+1 WHERE id=?\t20000\t65432")
+    sys.exit(0)
+if "events_statements_summary_by_digest" in low and low.startswith("select count(*)"):
+    print(os.environ.get("FAKE_MYSQL_DIGEST", "1"))
+    sys.exit(0)
+
+if low == "select 1":
+    print("1")
+elif "select version()" in low:
+    print("8.0.39")
+elif "select @@version" in low:
+    print("8.0.39")
+elif "select @@max_connections" in low:
+    print("500")
+elif low == "select database()":
+    print(database or "sbtest")
+elif "information_schema.columns" in low:
+    print(os.environ.get("FAKE_MYSQL_CANARY_COLS", str(names_in_list(low))))
+elif "information_schema.tables" in low and "table_name in" in low:
+    names = table_names(sql)
+    print(str(len(names)) if prepared
+          else os.environ.get("FAKE_MYSQL_TABLES", str(len(names))))
+elif "information_schema.tables" in low and "table_name not in" in low:
+    print(os.environ.get("FAKE_MYSQL_FOREIGN", "0"))
+elif "information_schema.tables" in low and "table_schema not in" in low:
+    pass                                           # find-in-any-schema: none
+elif "sum(data_length + index_length)" in low:
+    print("1073741824")
+elif "information_schema.schemata" in low:
+    print(os.environ.get("FAKE_MYSQL_DB_EXISTS", "1"))
+elif low.startswith("create database") or low.startswith("drop database"):
+    pass
+elif low.startswith("drop table"):
+    pass
+elif "json_object(" in low and "innodb_data_reads" in low:
+    n = counter("io_counter")
+    print('{"reads": %d, "writes": %d, "fsyncs": %d}' % (n * 1000, n * 500, n * 50))
+elif "json_object(" in low and "innodb_buffer_pool_reads" in low:
+    n = counter("db_counter")
+    print('{"blks_read": %d, "blks_hit": %d}' % (n * 500, n * 4500))
+elif "json_object(" in low and "innodb_os_log_written" in low:
+    n = counter("wal_counter")
+    print('{"wal_bytes": %d}' % (n * 8000000))
+elif "events_statements_summary_by_digest" in low:
+    print('[{"queryid": "abc123", "calls": 1000, "total_exec_time": 1234.5, '
+          '"mean_exec_time": 1.2, "rows": 1000}]')
+elif "performance_schema.global_variables" in low:
+    rows = [
+        ("innodb_buffer_pool_size", "4294967296"),
+        ("innodb_flush_log_at_trx_commit", "1"),
+        ("max_connections", "500"),
+        ("sync_binlog", "1"),
+        ("tmp_table_size", "16777216"),
+    ]
+    for name, val in rows:
+        print(f"{name}\t{val}")
+elif "count(*) from warehouse1" in low:
+    print(os.environ.get("FAKE_MYSQL_ROWS", "30"))
+elif "max(id) from sbtest1" in low:
+    print(os.environ.get("FAKE_MYSQL_MAX_ID", "1000"))
+elif low.startswith("select count(*)"):
+    print("0")
+else:
+    print(f"fake mysql: unhandled SQL: {sql}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)

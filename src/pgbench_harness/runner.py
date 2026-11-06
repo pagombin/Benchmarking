@@ -130,6 +130,7 @@ def cmd_doctor() -> int:
             print(f"  {label:11}: (unavailable)")
     for label, args in (("sysbench", ["sysbench", "--version"]),
                         ("psql", ["psql", "--version"]),
+                        ("mysql", ["mysql", "--version"]),
                         ("pgbench", ["pgbench", "--version"])):
         try:
             out = subprocess.run(args, capture_output=True, text=True, timeout=15)
