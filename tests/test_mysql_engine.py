@@ -70,7 +70,8 @@ def test_mysql_refuses_pgbench_suite() -> None:
 
 # ── sysbench command construction ───────────────────────────────────
 
-def test_mysql_sysbench_argv_and_env() -> None:
+def test_mysql_sysbench_argv_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP", "--mysql-ssl[=on|off] use SSL")
     spec = parse_spec(mysql_doc())
     cmd = build_run_command(spec, threads=4)
     argv = " ".join(cmd.argv)
@@ -88,7 +89,8 @@ def test_mysql_sysbench_argv_and_env() -> None:
     assert "PGPASSWORD" not in env or env.get("PGPASSWORD") != TEST_PASSWORD
 
 
-def test_mysql_ssl_disable_maps_to_off() -> None:
+def test_mysql_ssl_disable_maps_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP", "--mysql-ssl[=on|off] use SSL")
     doc = mysql_doc()
     doc["target"]["sslmode"] = "disable"
     cmd = build_prepare_command(parse_spec(doc))
@@ -460,14 +462,24 @@ def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
-    engines._SYSBENCH_HELP = "...mysql-ssl[=on|off]..."      # a 1.0.20 build
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP",
+                        "...mysql-ssl[=on|off]...")            # a 1.0.20 build
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl=on" in args                            # old dialect
     assert not any(a.startswith("--mysql-ssl-ca") for a in args)  # 1.0.20-safe
-    engines._SYSBENCH_HELP = "...mysql-ssl-ca=STRING..."      # a capable build
+    monkeypatch.setattr(engines, "_SYSBENCH_HELP",
+                        "...mysql-ssl=STRING...mysql-ssl-ca=STRING...")  # 1.1.0
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl=REQUIRED" in args                      # mode dialect
     if engines.mysql_ssl_ca():
         assert any(a.startswith("--mysql-ssl-ca=") for a in args)
-    engines._SYSBENCH_HELP = None                              # restore probe
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
+                                            sslmode="verify-full")
+    assert "--mysql-ssl=VERIFY_IDENTITY" in args
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
+                                            sslmode="disable")
+    assert "--mysql-ssl=DISABLED" in args
+    assert not any(a.startswith("--mysql-ssl-ca") for a in args)
     env = engines.client_env("mysql", "pw")
     if engines.mysql_ssl_ca():                       # system bundle present
         assert env["SSL_CERT_FILE"] == engines.mysql_ssl_ca()

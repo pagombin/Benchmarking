@@ -173,14 +173,37 @@ def sysbench_supports(option: str) -> bool:
     return option in _sysbench_help()
 
 
+# sysbench's --mysql-ssl option changed shape between releases: 1.0.x takes
+# on|off; 1.1.0 (upstream master, Percona newer builds) takes the MySQL
+# ssl-mode strings and rejects 'on' outright. Detected from --help; when the
+# probe can't tell (sysbench missing), the packaged 1.0.x shape is assumed.
+_MYSQL_SSL_SYSBENCH_MODE = {
+    "disable": "DISABLED",
+    "allow": "PREFERRED",
+    "prefer": "PREFERRED",
+    "require": "REQUIRED",
+    "verify-ca": "VERIFY_CA",
+    "verify-full": "VERIFY_IDENTITY",
+}
+
+
+def _sysbench_mysql_ssl_value(sslmode: str) -> str:
+    if "mysql-ssl[=on|off]" in _sysbench_help():
+        return "off" if sslmode == "disable" else "on"
+    if "mysql-ssl" in _sysbench_help():
+        return _MYSQL_SSL_SYSBENCH_MODE.get(sslmode, "REQUIRED")
+    return "off" if sslmode == "disable" else "on"
+
+
 def sysbench_connection_args(engine: str, host: str, port: int, user: str,
                              database: str, sslmode: str = "require") -> list[str]:
     """sysbench driver + connection flags. Password stays OUT of argv for both
-    drivers (PGPASSWORD / MYSQL_PWD via the child env). The CA flag is added
-    only when this sysbench build knows it — Ubuntu's 1.0.20 rejects
-    --mysql-ssl-ca as an invalid option and would refuse to start."""
+    drivers (PGPASSWORD / MYSQL_PWD via the child env). The --mysql-ssl value
+    and the CA flag match what the INSTALLED sysbench build understands —
+    Ubuntu's 1.0.20 wants on|off and rejects --mysql-ssl-ca; 1.1.0 wants
+    ssl-mode strings and rejects 'on'."""
     if engine == "mysql":
-        ssl = "off" if sslmode == "disable" else "on"
+        ssl = _sysbench_mysql_ssl_value(sslmode)
         args = [
             "--db-driver=mysql",
             f"--mysql-host={host}",
@@ -189,7 +212,7 @@ def sysbench_connection_args(engine: str, host: str, port: int, user: str,
             f"--mysql-db={database}",
             f"--mysql-ssl={ssl}",
         ]
-        if ssl == "on":
+        if ssl not in ("off", "DISABLED"):
             ca = mysql_ssl_ca()
             if ca and sysbench_supports("mysql-ssl-ca"):
                 args.append(f"--mysql-ssl-ca={ca}")
