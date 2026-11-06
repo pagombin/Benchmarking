@@ -1,7 +1,11 @@
-"""Database/environment capture and preflight checks (via psql).
+"""Database/environment capture and preflight checks (via the engine's client).
 
-psql is invoked with the password in ``PGPASSWORD`` and sslmode in
-``PGSSLMODE``; neither ever appears on a command line or in a stored file.
+The SQL client (psql for PostgreSQL, mysql for MySQL) is invoked with the
+password in the engine's environment variable (``PGPASSWORD`` / ``MYSQL_PWD``)
+and TLS/timeout settings via env or non-secret flags; no secret ever appears
+on a command line or in a stored file. Function names keep their historical
+``psql_*`` spelling — they are the harness's generic "run SQL on the target"
+layer and dispatch on ``spec.target.engine``.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from pgbench_harness import __version__
+from pgbench_harness import __version__, engines
 from pgbench_harness.errors import PreflightError
 from pgbench_harness.spec import Spec
 from pgbench_harness.sysbench import child_env, sysbench_version
@@ -27,7 +31,7 @@ PSQL_TIMEOUT_S = 30
 # How long the ceiling probe waits for all holders to establish before
 # declaring success. Override (e.g. for tests/slow links) via env var.
 PROBE_CONNECT_GRACE_S = float(os.environ.get("PGB_PROBE_GRACE_S", "6.0"))
-PROBE_HOLD_SQL = "SELECT pg_sleep(30)"
+PROBE_HOLD_SQL = "SELECT pg_sleep(30)"   # engine-dispatched at call time
 
 KEY_SETTINGS = [
     "shared_buffers",
@@ -96,17 +100,16 @@ class PreflightResult:
 
 def _psql_argv(spec: Spec, sql: str) -> list[str]:
     t = spec.target
-    return [
-        "psql", "-h", t.host, "-p", str(t.port), "-U", t.user, "-d", t.database,
-        "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql,
-    ]
+    return engines.client_argv(t.engine, t.host, t.port, t.user, t.database,
+                               sql, sslmode=t.sslmode)
 
 
 def psql_query(spec: Spec, password: str, sql: str, timeout: int = PSQL_TIMEOUT_S) -> str:
-    """Run one SQL statement via psql and return trimmed stdout.
+    """Run one SQL statement via the engine's client and return trimmed stdout.
 
     Raises PreflightError with the verbatim (redacted) server error on failure.
     """
+    client = engines.client_binary(spec.target.engine)
     try:
         proc = subprocess.run(
             _psql_argv(spec, sql),
@@ -115,19 +118,19 @@ def psql_query(spec: Spec, password: str, sql: str, timeout: int = PSQL_TIMEOUT_
         )
     except FileNotFoundError as exc:
         raise PreflightError(
-            "psql is not installed or not on PATH",
-            hint="apt-get install postgresql-client (see README).",
+            f"{client} is not installed or not on PATH",
+            hint=engines.client_install_hint(spec.target.engine),
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise PreflightError(
-            f"psql timed out after {timeout}s connecting to "
+            f"{client} timed out after {timeout}s connecting to "
             f"{spec.target.host}:{spec.target.port}",
             hint="check host/port, VPC reachability and firewall rules.",
         ) from exc
     if proc.returncode != 0:
         err = get_redactor().redact(proc.stderr.strip())
         raise PreflightError(
-            f"psql query failed against {spec.target.host}:{spec.target.port}: {err}",
+            f"{client} query failed against {spec.target.host}:{spec.target.port}: {err}",
             hint="verify credentials (password_env), database name and sslmode.",
         )
     return proc.stdout.strip()
@@ -150,6 +153,21 @@ def psql_version() -> str:
         raise PreflightError(
             "psql is not installed or not on PATH",
             hint="apt-get install postgresql-client (see README).",
+        ) from exc
+    return out.stdout.strip()
+
+
+def client_version(spec: Spec) -> str:
+    """Version of the engine's SQL client (psql / mysql), raising if missing."""
+    if spec.target.engine != "mysql":
+        return psql_version()
+    try:
+        out = subprocess.run(["mysql", "--version"], capture_output=True,
+                             text=True, timeout=30)
+    except FileNotFoundError as exc:
+        raise PreflightError(
+            "mysql client is not installed or not on PATH",
+            hint=engines.client_install_hint("mysql"),
         ) from exc
     return out.stdout.strip()
 
@@ -215,11 +233,12 @@ def connection_ceiling_probe(
     """
     logger.info("preflight: connection-ceiling probe with %d simultaneous connections", count)
     env = child_env(spec, password)
+    hold_sql = engines.hold_sql(spec.target.engine, 30)
     procs: list[subprocess.Popen[str]] = []
     try:
         for _ in range(count):
             procs.append(subprocess.Popen(
-                _psql_argv(spec, PROBE_HOLD_SQL),
+                _psql_argv(spec, hold_sql),
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             ))
             time.sleep(0.01)
@@ -281,13 +300,21 @@ def _sql_str(value: str) -> str:
 
 
 def count_resolvable_tables(spec: Spec, password: str, names: list[str]) -> Optional[int]:
-    """Count how many unqualified table names resolve via the session search_path.
+    """Count how many unqualified table names resolve for the session.
 
-    Uses ``to_regclass`` so the answer matches exactly how sysbench (which
-    issues unqualified ``CREATE``/``SELECT``) resolves the same names. This is
-    schema-agnostic: the dataset is "present" iff sysbench's own run would
-    find it, regardless of which schema it actually lives in.
+    PostgreSQL: ``to_regclass`` so the answer matches exactly how sysbench
+    (which issues unqualified ``CREATE``/``SELECT``) resolves the same names,
+    across whatever search_path the session has. MySQL has no search path —
+    unqualified names resolve in the connection's default schema — so the
+    equivalent check is information_schema.tables scoped to ``database()``.
     """
+    if spec.target.engine == "mysql":
+        in_list = ", ".join(_sql_str(n) for n in names)
+        return _count_query(
+            spec, password,
+            "SELECT count(*) FROM information_schema.tables "
+            f"WHERE table_schema = database() AND table_name IN ({in_list})",
+        )
     values = ", ".join(f"({_sql_str(n)})" for n in names)
     return _count_query(
         spec, password,
@@ -298,6 +325,15 @@ def count_resolvable_tables(spec: Spec, password: str, names: list[str]) -> Opti
 def find_tables_any_schema(spec: Spec, password: str, names: list[str]) -> list[str]:
     """Locate the given table names across *all* schemas, as schema.table strings."""
     in_list = ", ".join(_sql_str(n) for n in names)
+    if spec.target.engine == "mysql":
+        return _list_query(
+            spec, password,
+            "SELECT concat(table_schema, '.', table_name) "
+            "FROM information_schema.tables "
+            f"WHERE table_name IN ({in_list}) "
+            "AND table_schema NOT IN ('mysql','information_schema',"
+            "'performance_schema','sys') ORDER BY 1",
+        )
     return _list_query(
         spec, password,
         f"SELECT schemaname || '.' || tablename FROM pg_catalog.pg_tables "
@@ -308,14 +344,15 @@ def find_tables_any_schema(spec: Spec, password: str, names: list[str]) -> list[
 def database_size_bytes(spec: Spec, password: str) -> Optional[int]:
     """Current size of the target database in bytes (best effort)."""
     return _count_query(
-        spec, password, "SELECT pg_database_size(current_database())")
+        spec, password, engines.database_size_sql(spec.target.engine))
 
 
 def _check_canary_schema(spec: Spec, password: str) -> tuple[bool, str]:
     """Verify the canary table has the columns the workload's schema defines.
 
-    Resolves the canary via ``to_regclass`` (search_path-aware, so it inspects
-    the same table sysbench will use, in whichever schema it lives).
+    PostgreSQL resolves the canary via ``to_regclass`` (search_path-aware, so
+    it inspects the same table sysbench will use, in whichever schema it
+    lives); MySQL checks information_schema.columns in the default schema.
     """
     cols: tuple[str, ...]
     if spec.workload.type == "tpcc":
@@ -323,12 +360,20 @@ def _check_canary_schema(spec: Spec, password: str) -> tuple[bool, str]:
     else:
         table, cols = "sbtest1", ("id", "k", "c", "pad")
     quoted = ", ".join(_sql_str(c) for c in cols)
-    n = _count_query(
-        spec, password,
-        f"SELECT count(*) FROM pg_catalog.pg_attribute "
-        f"WHERE attrelid = to_regclass({_sql_str(table)}) "
-        f"AND attname IN ({quoted}) AND attnum > 0 AND NOT attisdropped",
-    )
+    if spec.target.engine == "mysql":
+        n = _count_query(
+            spec, password,
+            "SELECT count(*) FROM information_schema.columns "
+            f"WHERE table_schema = database() AND table_name = {_sql_str(table)} "
+            f"AND column_name IN ({quoted})",
+        )
+    else:
+        n = _count_query(
+            spec, password,
+            f"SELECT count(*) FROM pg_catalog.pg_attribute "
+            f"WHERE attrelid = to_regclass({_sql_str(table)}) "
+            f"AND attname IN ({quoted}) AND attnum > 0 AND NOT attisdropped",
+        )
     if n != len(cols):
         return False, (
             f"table '{table}' exists but does not have the expected {spec.workload.type} "
@@ -376,18 +421,32 @@ def check_dataset(spec: Spec, password: str) -> DatasetCheck:
     names = expected_table_names(spec)
     quoted = ", ".join(_sql_str(n) for n in names)
     chk = DatasetCheck(expected_tables=len(names))
-    chk.search_path = (psql_query_soft(spec, password, "SHOW search_path")[1] or "").strip()
+    if spec.target.engine == "mysql":
+        # MySQL has no search_path: unqualified names resolve in the default
+        # schema, which is what the "where does sysbench look" question means.
+        chk.search_path = (psql_query_soft(spec, password, "SELECT database()")[1]
+                           or "").strip()
+    else:
+        chk.search_path = (psql_query_soft(spec, password, "SHOW search_path")[1] or "").strip()
     present = count_resolvable_tables(spec, password, names)
     if present is None:
         chk.detail = "could not resolve benchmark tables (connectivity/permissions?)"
         return chk
     chk.present_tables = present
-    chk.foreign_tables = _count_query(
-        spec, password,
-        f"SELECT count(*) FROM pg_catalog.pg_tables "
-        f"WHERE schemaname NOT IN ('pg_catalog','information_schema') "
-        f"AND tablename NOT IN ({quoted})",
-    ) or 0
+    if spec.target.engine == "mysql":
+        chk.foreign_tables = _count_query(
+            spec, password,
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = database() AND table_type = 'BASE TABLE' "
+            f"AND table_name NOT IN ({quoted})",
+        ) or 0
+    else:
+        chk.foreign_tables = _count_query(
+            spec, password,
+            f"SELECT count(*) FROM pg_catalog.pg_tables "
+            f"WHERE schemaname NOT IN ('pg_catalog','information_schema') "
+            f"AND tablename NOT IN ({quoted})",
+        ) or 0
     if present == 0:
         # Not on the search_path — but did sysbench create them in another
         # schema? If so this is a routing/search_path problem, not a load failure.
@@ -434,8 +493,11 @@ def detect_pooler(spec: Spec, password: str) -> str:
 
     `SHOW pool_mode` is a PgBouncer admin-console command and is expected to
     fail against both PgBouncer app databases and plain PostgreSQL — the
-    verbatim response is recorded as metadata either way.
+    verbatim response is recorded as metadata either way. MySQL has no
+    PgBouncer analogue the harness can probe safely, so it records n/a.
     """
+    if spec.target.engine == "mysql":
+        return "n/a (PgBouncer probe is PostgreSQL-only; ProxySQL is transparent here)"
     ok, out = psql_query_soft(spec, password, "SHOW pool_mode")
     if ok:
         return f"pool_mode={out} (pooler admin interface answered)"
@@ -443,7 +505,9 @@ def detect_pooler(spec: Spec, password: str) -> str:
 
 
 def detect_pg_stat_monitor(spec: Spec, password: str) -> bool:
-    """True when the pg_stat_monitor extension is installed."""
+    """True when the pg_stat_monitor extension is installed (PostgreSQL only)."""
+    if spec.target.engine == "mysql":
+        return False
     ok, out = psql_query_soft(
         spec, password,
         "SELECT count(*) FROM pg_extension WHERE extname='pg_stat_monitor'",
@@ -452,12 +516,16 @@ def detect_pg_stat_monitor(spec: Spec, password: str) -> bool:
 
 
 # ── database administration (create / drop / recreate for prepare) ───────────
-MAINTENANCE_DBS = ("defaultdb", "postgres", "template1")
+MAINTENANCE_DBS = ("defaultdb", "postgres", "template1")   # engine-dispatched below
 
 
 def _ident(name: str) -> str:
-    """Quote a SQL identifier (database/table name)."""
+    """Quote a SQL identifier (PostgreSQL spelling; use _ident_for for engines)."""
     return '"' + name.replace('"', '""') + '"'
+
+
+def _ident_for(spec: Spec, name: str) -> str:
+    return engines.quote_ident(spec.target.engine, name)
 
 
 def _lit(value: str) -> str:
@@ -467,8 +535,8 @@ def _lit(value: str) -> str:
 
 def _psql_on(spec: Spec, sql: str, dbname: str) -> list[str]:
     t = spec.target
-    return ["psql", "-h", t.host, "-p", str(t.port), "-U", t.user, "-d", dbname,
-            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql]
+    return engines.client_argv(t.engine, t.host, t.port, t.user, dbname,
+                               sql, sslmode=t.sslmode)
 
 
 def psql_on(spec: Spec, password: str, dbname: str, sql: str,
@@ -486,7 +554,7 @@ def psql_on(spec: Spec, password: str, dbname: str, sql: str,
 
 def maintenance_db(spec: Spec, password: str) -> Optional[str]:
     """First reachable admin database (for CREATE/DROP DATABASE), or None."""
-    for db in MAINTENANCE_DBS:
+    for db in engines.maintenance_dbs(spec.target.engine):
         if db == spec.target.database:
             continue
         ok, _ = psql_on(spec, password, db, "SELECT 1")
@@ -496,21 +564,32 @@ def maintenance_db(spec: Spec, password: str) -> Optional[str]:
 
 
 def database_exists(spec: Spec, password: str, maint_db: str) -> bool:
-    ok, out = psql_on(spec, password, maint_db,
-                      f"SELECT 1 FROM pg_database WHERE datname = {_lit(spec.target.database)}")
+    if spec.target.engine == "mysql":
+        ok, out = psql_on(spec, password, maint_db,
+                          "SELECT 1 FROM information_schema.schemata "
+                          f"WHERE schema_name = {_lit(spec.target.database)}")
+    else:
+        ok, out = psql_on(spec, password, maint_db,
+                          f"SELECT 1 FROM pg_database WHERE datname = {_lit(spec.target.database)}")
     return ok and out.strip() == "1"
 
 
 def create_database(spec: Spec, password: str, maint_db: str) -> tuple[bool, str]:
-    return psql_on(spec, password, maint_db, f"CREATE DATABASE {_ident(spec.target.database)}")
+    return psql_on(spec, password, maint_db,
+                   f"CREATE DATABASE {_ident_for(spec, spec.target.database)}")
 
 
 def drop_database(spec: Spec, password: str, maint_db: str) -> tuple[bool, str]:
-    """Terminate other backends on the target DB, then DROP DATABASE IF EXISTS."""
-    psql_on(spec, password, maint_db,
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            f"WHERE datname = {_lit(spec.target.database)} AND pid <> pg_backend_pid()")
-    return psql_on(spec, password, maint_db, f"DROP DATABASE IF EXISTS {_ident(spec.target.database)}")
+    """Terminate other backends on the target DB (PG), then DROP DATABASE IF EXISTS.
+
+    MySQL drops in-place: DROP DATABASE waits on metadata locks itself and
+    there is no managed-safe per-database backend terminate."""
+    if spec.target.engine != "mysql":
+        psql_on(spec, password, maint_db,
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                f"WHERE datname = {_lit(spec.target.database)} AND pid <> pg_backend_pid()")
+    return psql_on(spec, password, maint_db,
+                   f"DROP DATABASE IF EXISTS {_ident_for(spec, spec.target.database)}")
 
 
 def drop_benchmark_tables(spec: Spec, password: str) -> tuple[bool, str]:
@@ -518,7 +597,9 @@ def drop_benchmark_tables(spec: Spec, password: str) -> tuple[bool, str]:
     names = expected_table_names(spec)
     if not names:
         return True, "no benchmark tables to drop"
-    stmt = "DROP TABLE IF EXISTS " + ", ".join(_ident(n) for n in names) + " CASCADE"
+    cascade = "" if spec.target.engine == "mysql" else " CASCADE"
+    stmt = ("DROP TABLE IF EXISTS "
+            + ", ".join(_ident_for(spec, n) for n in names) + cascade)
     return psql_query_soft(spec, password, stmt)
 
 
@@ -538,29 +619,64 @@ def enable_pg_stat_monitor(spec: Spec, password: str) -> tuple[bool, str]:
     ``CREATE EXTENSION IF NOT EXISTS`` is idempotent. pg_stat_monitor must be in
     ``shared_preload_libraries`` (set on the managed cluster / via a restart) for
     the CREATE to succeed; otherwise this returns the server's (redacted) reason.
+    PostgreSQL-only; MySQL per-statement stats come from performance_schema.
     """
+    if spec.target.engine == "mysql":
+        return False, "n/a on MySQL (performance_schema provides statement stats)"
     ok, out = psql_query_soft(
         spec, password, "CREATE EXTENSION IF NOT EXISTS pg_stat_monitor")
     return (ok, "extension enabled" if ok else out)
 
 
 def snapshot_bgwriter(spec: Spec, password: str) -> str:
-    """One-row JSON snapshot of pg_stat_bgwriter (column-set agnostic)."""
+    """One-row JSON snapshot of pg_stat_bgwriter (column-set agnostic; PG only)."""
+    if spec.target.engine == "mysql":
+        return "{}"
     ok, out = psql_query_soft(
         spec, password, "SELECT row_to_json(t) FROM pg_stat_bgwriter t")
     return out if ok else f'{{"error": "{out[:200]}"}}'
 
 
 def snapshot_io_stats(spec: Spec, password: str) -> dict[str, Any]:
-    """Engine-side I/O counters: pg_stat_io (PG16+), pg_stat_database, pg_stat_wal.
+    """Engine-side I/O counters.
 
-    Each source is queried independently and degrades to ``None`` if absent, so
-    this works across server versions. These are *logical* I/O counts as
-    PostgreSQL issued them (an IOPS proxy on a managed cluster where device
-    metrics aren't reachable), in 8 KB blocks; deltas of two snapshots that
-    bracket a level give read/write operation counts for that level.
+    PostgreSQL: pg_stat_io (PG16+), pg_stat_database, pg_stat_wal. MySQL:
+    InnoDB buffer-pool / redo counters from performance_schema.global_status,
+    mapped into the same three slots (io = physical page reads/writes,
+    db = logical vs physical page requests, wal = redo bytes). Each source
+    degrades to ``None`` if absent; deltas of two snapshots that bracket a
+    level give read/write operation counts for that level.
     """
     out: dict[str, Any] = {"io": None, "db": None, "wal": None}
+    if spec.target.engine == "mysql":
+        ok, val = psql_query_soft(
+            spec, password,
+            "SELECT JSON_OBJECT("
+            "'reads', (SELECT variable_value FROM performance_schema.global_status "
+            "WHERE variable_name='Innodb_data_reads'), "
+            "'writes', (SELECT variable_value FROM performance_schema.global_status "
+            "WHERE variable_name='Innodb_data_writes'), "
+            "'fsyncs', (SELECT variable_value FROM performance_schema.global_status "
+            "WHERE variable_name='Innodb_data_fsyncs'))")
+        if ok and val:
+            out["io"] = _loads(val)
+        ok, val = psql_query_soft(
+            spec, password,
+            "SELECT JSON_OBJECT("
+            "'blks_read', (SELECT variable_value FROM performance_schema.global_status "
+            "WHERE variable_name='Innodb_buffer_pool_reads'), "
+            "'blks_hit', (SELECT variable_value FROM performance_schema.global_status "
+            "WHERE variable_name='Innodb_buffer_pool_read_requests'))")
+        if ok and val:
+            out["db"] = _loads(val)
+        ok, val = psql_query_soft(
+            spec, password,
+            "SELECT JSON_OBJECT("
+            "'wal_bytes', (SELECT variable_value FROM performance_schema.global_status "
+            "WHERE variable_name='Innodb_os_log_written'))")
+        if ok and val:
+            out["wal"] = _loads(val)
+        return out
     ok, val = psql_query_soft(
         spec, password,
         "SELECT json_build_object("
@@ -597,10 +713,25 @@ def _loads(text: str) -> Optional[dict[str, Any]]:
 def snapshot_pg_stat_monitor(spec: Spec, password: str, limit: int = 50) -> str:
     """Top statements by total execution time as JSON rows (best effort).
 
-    pg_stat_monitor buckets its stats over rolling time windows, so a query can
-    appear once per bucket. Aggregate by queryid to present a single top-N rather
-    than one row per (query, bucket).
+    PostgreSQL: pg_stat_monitor aggregated by queryid (it buckets stats over
+    rolling windows, so a query can appear once per bucket). MySQL: the
+    performance_schema statement digest summary, mapped onto the same field
+    names (timer columns are picoseconds, hence /1e9 for ms).
     """
+    if spec.target.engine == "mysql":
+        sql = (
+            "SELECT coalesce(JSON_ARRAYAGG(JSON_OBJECT("
+            "'queryid', t.digest, 'calls', t.calls, "
+            "'total_exec_time', t.total_ms, 'mean_exec_time', t.mean_ms, "
+            "'rows', t.rows_sent)), '[]') FROM ("
+            "SELECT digest, count_star AS calls, "
+            "round(sum_timer_wait/1e9, 3) AS total_ms, "
+            "round(avg_timer_wait/1e9, 3) AS mean_ms, sum_rows_sent AS rows_sent "
+            "FROM performance_schema.events_statements_summary_by_digest "
+            f"ORDER BY sum_timer_wait DESC LIMIT {limit}) t"
+        )
+        ok, out = psql_query_soft(spec, password, sql)
+        return out if ok else "[]"
     sql = (
         "SELECT coalesce(json_agg(t), '[]'::json) FROM ("
         "SELECT queryid, sum(calls) AS calls, sum(total_exec_time) AS total_exec_time, "
@@ -612,7 +743,28 @@ def snapshot_pg_stat_monitor(spec: Spec, password: str, limit: int = 50) -> str:
 
 
 def capture_pg_settings(spec: Spec, password: str) -> str:
-    """Full pg_settings dump as CSV text (name,setting,unit,source)."""
+    """Full server-settings dump as CSV text (name,setting,unit,source).
+
+    PostgreSQL streams pg_settings via COPY CSV; MySQL dumps
+    performance_schema.global_variables into the same four-column shape
+    (unit/source have no MySQL analogue and stay blank).
+    """
+    if spec.target.engine == "mysql":
+        out = psql_query(
+            spec, password,
+            "SELECT variable_name, variable_value "
+            "FROM performance_schema.global_variables ORDER BY variable_name",
+            timeout=60,
+        )
+        sep = engines.cell_sep("mysql")
+        lines = ["name,setting,unit,source"]
+        for row in out.splitlines():
+            cells = row.split(sep)
+            name = cells[0] if cells else ""
+            val = cells[1] if len(cells) > 1 else ""
+            q = '"' + val.replace('"', '""') + '"' if any(c in val for c in ',"\n') else val
+            lines.append(f"{name},{q},,")
+        return "\n".join(lines)
     return psql_query(
         spec, password,
         "COPY (SELECT name, setting, unit, source FROM pg_settings ORDER BY name) "
@@ -640,7 +792,7 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
     """Run all preflight checks; raise PreflightError on any hard failure."""
     pf = PreflightResult()
     pf.sysbench_version = sysbench_version()
-    pf.psql_version = psql_version()
+    pf.psql_version = client_version(spec)
     pf.tpcc_git_sha = tpcc_git_sha(spec.workload.tpcc_path)
     logger.info("preflight: %s | %s | tpcc %s", pf.sysbench_version, pf.psql_version, pf.tpcc_git_sha)
     if spec.workload.type == "tpcc" and not Path(spec.workload.tpcc_path, "tpcc.lua").exists():
@@ -649,8 +801,10 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
             hint="git clone https://github.com/Percona-Lab/sysbench-tpcc to that path.",
         )
     pf.server_version_full = psql_query(spec, password, "SELECT version()")
-    pf.server_version = psql_query(spec, password, "SHOW server_version")
-    pf.max_connections = psql_query(spec, password, "SHOW max_connections")
+    pf.server_version = psql_query(
+        spec, password, engines.server_version_sql(spec.target.engine))
+    pf.max_connections = psql_query(
+        spec, password, engines.max_connections_sql(spec.target.engine))
     pf.pooler_probe = detect_pooler(spec, password)
     logger.info("preflight: server %s, max_connections=%s", pf.server_version, pf.max_connections)
     logger.info("preflight: pooler probe: %s", pf.pooler_probe)
@@ -678,7 +832,7 @@ def preflight_steps(spec: Spec, password: str,
         return {"name": name, "status": status, "detail": detail}
 
     try:
-        detail = f"{sysbench_version()} · {psql_version()}"
+        detail = f"{sysbench_version()} · {client_version(spec)}"
         yield ev("Load-gen tools", "ok", detail)
     except Exception as exc:  # noqa: BLE001
         yield ev("Load-gen tools", "fail", str(exc))
@@ -692,14 +846,14 @@ def preflight_steps(spec: Spec, password: str,
             return
     try:
         full = psql_query(spec, password, "SELECT version()")
-        ver = psql_query(spec, password, "SHOW server_version")
+        ver = psql_query(spec, password, engines.server_version_sql(spec.target.engine))
         yield ev("Connectivity", "ok", (full.splitlines()[0][:90] if full else "connected"))
         yield ev("Server version", "ok", ver)
     except Exception as exc:  # noqa: BLE001  (emit a checklist event, never crash the stream)
         yield ev("Connectivity", "fail", str(exc))
         return
     try:
-        mx = psql_query(spec, password, "SHOW max_connections")
+        mx = psql_query(spec, password, engines.max_connections_sql(spec.target.engine))
         peak = peak_threads(spec)
         ok = mx.isdigit() and int(mx) > peak
         yield ev("max_connections", "ok" if ok else "warn",
@@ -710,6 +864,35 @@ def preflight_steps(spec: Spec, password: str,
         yield ev("Pooler probe", "info", detect_pooler(spec, password))
     except Exception as exc:  # noqa: BLE001
         yield ev("Pooler probe", "info", str(exc))
+    if spec.target.engine == "mysql":
+        yield ev("pg_stat_monitor", "info",
+                 "n/a on MySQL — per-statement stats come from "
+                 "performance_schema statement digests")
+    else:
+        yield from _pg_stat_monitor_steps(spec, password, ev)
+    try:
+        peak = peak_threads(spec)
+        probe = connection_ceiling_probe(spec, password, peak, logger)
+        if probe.succeeded >= probe.requested:
+            yield ev("Connection ceiling", "ok",
+                     f"{probe.succeeded}/{probe.requested} simultaneous connections OK")
+        else:
+            yield ev("Connection ceiling", "warn",
+                     f"only {probe.succeeded}/{probe.requested} established; first refusal "
+                     f"at #{probe.first_failed_index}: {probe.first_error}")
+    except Exception as exc:  # noqa: BLE001
+        yield ev("Connection ceiling", "warn", str(exc))
+    try:
+        d = check_dataset(spec, password)
+        status = "ok" if d.ok else ("warn" if d.status == "missing" else "fail")
+        yield ev("Dataset", status, f"[{d.status}] {d.detail}")
+    except Exception as exc:  # noqa: BLE001
+        yield ev("Dataset", "fail", str(exc))
+
+
+def _pg_stat_monitor_steps(spec: Spec, password: str,
+                           ev: Any) -> "Iterator[dict[str, str]]":
+    """The PostgreSQL-only pg_stat_monitor preflight step (extracted verbatim)."""
     try:
         # Snapshotting the view is read-only and harmless — but the PRELOAD
         # LIBRARY is not: pg_stat_monitor showed sustained memory growth that
@@ -740,24 +923,6 @@ def preflight_steps(spec: Spec, password: str,
                          "come from pg_stat_statements if available")
     except Exception as exc:  # noqa: BLE001
         yield ev("pg_stat_monitor", "warn", str(exc))
-    try:
-        peak = peak_threads(spec)
-        probe = connection_ceiling_probe(spec, password, peak, logger)
-        if probe.succeeded >= probe.requested:
-            yield ev("Connection ceiling", "ok",
-                     f"{probe.succeeded}/{probe.requested} simultaneous connections OK")
-        else:
-            yield ev("Connection ceiling", "warn",
-                     f"only {probe.succeeded}/{probe.requested} established; first refusal "
-                     f"at #{probe.first_failed_index}: {probe.first_error}")
-    except Exception as exc:  # noqa: BLE001
-        yield ev("Connection ceiling", "warn", str(exc))
-    try:
-        d = check_dataset(spec, password)
-        status = "ok" if d.ok else ("warn" if d.status == "missing" else "fail")
-        yield ev("Dataset", status, f"[{d.status}] {d.detail}")
-    except Exception as exc:  # noqa: BLE001
-        yield ev("Dataset", "fail", str(exc))
 
 
 def peak_threads(spec: Spec) -> int:
@@ -793,6 +958,15 @@ def _collect_warnings(spec: Spec, pf: PreflightResult) -> None:
 def _check_pg_stat_monitor(spec: Spec, password: str, pf: PreflightResult) -> None:
     mode = spec.capture.pg_stat_monitor
     if mode == "false":
+        return
+    if spec.target.engine == "mysql":
+        if mode == "true":
+            raise PreflightError(
+                "capture.pg_stat_monitor is true but the target engine is MySQL "
+                "(pg_stat_monitor is a PostgreSQL extension)",
+                hint="set capture.pg_stat_monitor to auto/false for MySQL targets; "
+                     "per-statement stats come from performance_schema.",
+            )
         return
     pf.pg_stat_monitor = detect_pg_stat_monitor(spec, password)
     if mode == "true" and not pf.pg_stat_monitor:
@@ -899,6 +1073,68 @@ LIVE_PG_SQLS = (
     _build_live_sql(_CKPT_PG17, _WAL_NONE),
     _build_live_sql(_CKPT_PRE17, _WAL_NONE),
 )
+
+# MySQL: one round trip over performance_schema.global_status, pulled as a
+# single JSON document (JSON_OBJECTAGG: MySQL 5.7+/MariaDB 10.5+). The raw
+# counters are mapped in _mysql_live_row onto the SAME key names the PG
+# sampler uses, so pg_delta_row / LIVE_PG_COLUMNS / the cockpit charts work
+# unchanged: blks_hit/blks_read become buffer-pool hit/miss page requests
+# (so cache_hit_pct is the buffer-pool hit ratio), wal_bytes is redo bytes
+# written, xact_* are Com_commit/Com_rollback. Gauges with no MySQL
+# equivalent are simply absent and chart as gaps.
+_MYSQL_STATUS_VARS = (
+    "Com_commit", "Com_rollback",
+    "Innodb_buffer_pool_read_requests", "Innodb_buffer_pool_reads",
+    "Innodb_os_log_written", "Threads_connected", "Threads_running",
+    "Innodb_rows_read", "Innodb_rows_inserted", "Innodb_rows_updated",
+    "Innodb_rows_deleted", "Innodb_row_lock_current_waits",
+    "Created_tmp_disk_tables", "Created_tmp_tables",
+)
+LIVE_MYSQL_SQL = (
+    "SELECT JSON_OBJECT('db_epoch', UNIX_TIMESTAMP(NOW(4)), 'status', "
+    "(SELECT JSON_OBJECTAGG(LOWER(variable_name), variable_value) "
+    "FROM performance_schema.global_status WHERE variable_name IN ("
+    + ", ".join("'" + v + "'" for v in _MYSQL_STATUS_VARS)
+    + ")))"
+)
+
+
+def _mysql_live_row(doc: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Map the raw MySQL status JSON onto the PG sampler's key vocabulary."""
+    status = doc.get("status")
+    if not isinstance(status, dict):
+        return None
+
+    def n(key: str) -> Optional[float]:
+        v = status.get(key.lower())
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    requests, reads = n("Innodb_buffer_pool_read_requests"), n("Innodb_buffer_pool_reads")
+    row: dict[str, Any] = {
+        "db_epoch": doc.get("db_epoch"),
+        "active": n("Threads_running") or 0,
+        "total_conn": n("Threads_connected") or 0,
+        "blocked": n("Innodb_row_lock_current_waits") or 0,
+        "xact_commit": n("Com_commit"),
+        "xact_rollback": n("Com_rollback"),
+        "wal_bytes": n("Innodb_os_log_written"),
+        "tup_returned": n("Innodb_rows_read"),
+        "tup_inserted": n("Innodb_rows_inserted"),
+        "tup_updated": n("Innodb_rows_updated"),
+        "tup_deleted": n("Innodb_rows_deleted"),
+        "temp_files": n("Created_tmp_disk_tables"),
+    }
+    if requests is not None and reads is not None:
+        row["blks_read"] = reads
+        row["blks_hit"] = max(0.0, requests - reads)
+    if row["xact_commit"] is not None and row["xact_rollback"] is not None:
+        row["xacts"] = row["xact_commit"] + row["xact_rollback"]
+    return row
 LIVE_PG_COLUMNS = (
     "t", "active", "total_conn", "blocked_queries", "lock_wait_max_s",
     "xacts_s", "commits_s", "rollbacks_s",
@@ -916,10 +1152,23 @@ LIVE_PG_TIMEOUT_S = 8
 def live_pg_query(spec: Spec, password: str) -> Optional[dict[str, Any]]:
     """One engine-side sample (cumulative counters + gauges); None if unavailable.
 
-    Tries variants newest-first (PG17 checkpointer, then pre-17 bgwriter; with
-    then without pg_stat_wal), so the richest query a server supports wins. Never
-    raises; a short timeout means a stalled sample is skipped, not blocking.
+    PostgreSQL tries variants newest-first (PG17 checkpointer, then pre-17
+    bgwriter; with then without pg_stat_wal), so the richest query a server
+    supports wins. MySQL pulls the global_status subset in one round trip and
+    maps it onto the same keys. Never raises; a short timeout means a stalled
+    sample is skipped, not blocking.
     """
+    if spec.target.engine == "mysql":
+        ok, out = psql_query_soft(spec, password, LIVE_MYSQL_SQL,
+                                  timeout=LIVE_PG_TIMEOUT_S)
+        if ok and out.strip():
+            try:
+                doc = json.loads(out.strip().splitlines()[0])
+                if isinstance(doc, dict):
+                    return _mysql_live_row(doc)
+            except (ValueError, IndexError):
+                return None
+        return None
     for sql in LIVE_PG_SQLS:
         ok, out = psql_query_soft(spec, password, sql, timeout=LIVE_PG_TIMEOUT_S)
         if ok and out.strip():

@@ -220,9 +220,15 @@ install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   info "apt-get update ..."
   apt-get update -y
-  info "Installing: postgresql-client sysbench git python3-venv python3-pip openssl curl"
+  info "Installing: postgresql-client mysql-client sysbench git python3-venv python3-pip openssl curl"
   apt-get install -y --no-install-recommends \
     postgresql-client sysbench git python3-venv python3-pip openssl curl ca-certificates rsync
+  # MySQL client for engine: mysql targets — package name differs by distro
+  # (Ubuntu: mysql-client; Debian: default-mysql-client). Best-effort: a
+  # PG-only droplet works without it.
+  apt-get install -y --no-install-recommends mysql-client \
+    || apt-get install -y --no-install-recommends default-mysql-client \
+    || info "mysql client not installed (PostgreSQL-only droplet is fine)"
   ok "Packages installed."
 
   # kubectl for the Cluster Ops module (pinned to upstream stable; optional —

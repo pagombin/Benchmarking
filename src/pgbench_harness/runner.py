@@ -85,7 +85,7 @@ def cmd_validate(spec_path: Path) -> int:
     print(f"OK: {spec_path} is valid.")
     print(f"  label    : {spec.run.label}  ({spec.run.edition} / {spec.run.tshirt_size})")
     print(f"  target   : {spec.target.host}:{spec.target.port}/{spec.target.database} "
-          f"(password via ${spec.target.password_env})")
+          f"[{spec.target.engine}] (password via ${spec.target.password_env})")
     print(f"  workload : {spec.workload.type}")
     print(f"  mode     : {mode}")
     if spec.is_soak:
@@ -130,6 +130,7 @@ def cmd_doctor() -> int:
             print(f"  {label:11}: (unavailable)")
     for label, args in (("sysbench", ["sysbench", "--version"]),
                         ("psql", ["psql", "--version"]),
+                        ("mysql", ["mysql", "--version"]),
                         ("pgbench", ["pgbench", "--version"])):
         try:
             out = subprocess.run(args, capture_output=True, text=True, timeout=15)

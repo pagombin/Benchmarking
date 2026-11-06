@@ -170,6 +170,8 @@ target:
   password_env: PGB_TARGET_PASSWORD       # required; NAME of the env var holding the
                                           # password. A literal password key is rejected.
   sslmode: require                        # optional; default "require" (passed as PGSSLMODE)
+  engine: postgres                        # optional; postgres (default) | mysql — see
+                                          # "MySQL targets" below
 
 workload:
   type: tpcc                              # required; tpcc | oltp_read_only |
@@ -594,6 +596,50 @@ pgbench-harness continuous --spec cont.yaml --run-dir results/<run_id>  # resume
 
 See OPERATIONS.md → *Continuous mode runbook* for the disk budget, reboot
 behavior, Slack/heartbeat pairing, threshold tuning, and the reindex procedure.
+
+## MySQL targets
+
+Set `target.engine: mysql` (or pick **MySQL** on a saved target in the
+console) and everything above — sweeps, soaks, suites, continuous mode,
+preflight, prepare, probes, the collector, alerting, and the console pages —
+runs through the identical code paths against MySQL/MariaDB:
+
+```yaml
+target:
+  host: private-mysql.nyc3.db.ondigitalocean.com
+  port: 3306
+  database: sbtest
+  user: bench
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require          # PostgreSQL vocabulary, mapped to --ssl-mode=REQUIRED
+  engine: mysql
+```
+
+What changes under the hood (and only here — `pgbench_harness/engines.py`):
+
+- **sysbench** runs its native `mysql` driver (`--mysql-host/-port/-user/-db`,
+  `--mysql-ssl` from `sslmode`). The TPC-C Lua scripts support both drivers.
+- **SQL goes over the `mysql` client** (`apt-get install mysql-client`)
+  instead of psql, with the same no-headers/one-row-per-line output contract.
+- **The secrets policy is unchanged**: the password reaches sysbench and the
+  client only via `MYSQL_PWD` (libmysqlclient's documented env fallback,
+  the twin of libpq's `PGPASSWORD`) — never on a command line, never in
+  specs, logs, reports, or artifacts.
+- **Probes**: read `SELECT 1`; write canary via
+  `INSERT … ON DUPLICATE KEY UPDATE` on `pgbench_harness_canary`. Auth and
+  network MySQL error shapes feed the same backoff/outage classification.
+- **Engine metrics map onto the same vocabulary**, so charts, rollups and
+  reports need no engine branches: buffer-pool hit ratio ↔ cache-hit %,
+  InnoDB redo bytes ↔ WAL MB/s, `Com_commit`/`Com_rollback` ↔ commits/
+  rollbacks, `Threads_running`/`Threads_connected` ↔ active/total
+  connections, InnoDB history-list length ↔ dead tuples. Metrics with no
+  MySQL analogue (checkpoints, archiver, replica replay lag) chart as gaps.
+
+Not available for MySQL targets (validated up front with a clear error):
+`suite.pgbench` (pgbench is a PostgreSQL tool — set it `false`) and
+`device_probe` (mounts a PostgreSQL cluster's PVC). `sslmode` keeps
+PostgreSQL spelling in specs for one schema everywhere; `verify-ca`/
+`verify-full` map to `VERIFY_CA`/`VERIFY_IDENTITY`.
 
 ## Web application (self-hosted UI)
 

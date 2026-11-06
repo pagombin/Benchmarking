@@ -79,7 +79,7 @@ def build_spec_yaml(tgt: sqlite3.Row, payload: dict[str, Any]) -> str:
         "target": {"host": tgt["host"], "port": tgt["port"],
                    "database": tgt["dbname"], "user": tgt["dbuser"],
                    "password_env": "PGB_TARGET_PASSWORD",
-                   "sslmode": tgt["sslmode"]},
+                   "sslmode": tgt["sslmode"], "engine": tgt["engine"]},
         "workload": workload,
         "continuous": continuous,
     }

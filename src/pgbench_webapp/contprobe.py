@@ -23,7 +23,6 @@ out of the loop.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import threading
@@ -251,18 +250,21 @@ WRITE_SQL = (
 def run_probe(target: dict[str, Any], password: str, kind: str,
               connect_timeout_s: int = 3,
               statement_timeout_ms: int = 3000) -> tuple[bool, str]:
-    """One probe over psql. Returns (ok, redacted-error). Never raises."""
-    sql = READ_SQL if kind == "read" else WRITE_SQL
-    argv = ["psql", "-h", str(target.get("host", "")),
-            "-p", str(target.get("port", 5432)),
-            "-U", str(target.get("user", "")),
-            "-d", str(target.get("database", "")),
-            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql]
-    env = dict(os.environ)
-    env["PGPASSWORD"] = password
-    env["PGSSLMODE"] = str(target.get("sslmode", "require"))
-    env["PGCONNECT_TIMEOUT"] = str(connect_timeout_s)
-    env["PGOPTIONS"] = f"-c statement_timeout={int(statement_timeout_ms)}"
+    """One probe over the engine's client. Returns (ok, redacted-error). Never raises."""
+    from pgbench_harness import engines
+    engine = engines.spec_target_engine(target)
+    sql = READ_SQL if kind == "read" else engines.canary_write_sql(engine)
+    argv = engines.client_argv(
+        engine, str(target.get("host", "")),
+        int(target.get("port", engines.DEFAULT_PORTS.get(engine, 5432)) or 0),
+        str(target.get("user", "")), str(target.get("database", "")), sql,
+        sslmode=str(target.get("sslmode", "require")),
+        connect_timeout_s=connect_timeout_s,
+        statement_timeout_ms=statement_timeout_ms)
+    env = engines.client_env(engine, password,
+                             sslmode=str(target.get("sslmode", "require")),
+                             connect_timeout_s=connect_timeout_s,
+                             statement_timeout_ms=statement_timeout_ms)
     try:
         proc = subprocess.run(
             argv, env=env, capture_output=True, text=True,
@@ -270,7 +272,7 @@ def run_probe(target: dict[str, Any], password: str, kind: str,
     except subprocess.TimeoutExpired:
         return False, f"probe timed out after {connect_timeout_s}s+ (hard cap)"
     except OSError as exc:
-        return False, f"psql could not run: {exc}"
+        return False, f"{engines.client_binary(engine)} could not run: {exc}"
     if proc.returncode != 0:
         err = get_redactor().redact((proc.stderr or proc.stdout or "").strip())
         return False, err.splitlines()[-1][:500] if err else f"exit {proc.returncode}"
@@ -292,7 +294,7 @@ def job_target(conn: sqlite3.Connection, store: Any,
         if tgt is not None:
             target.update(host=tgt["host"], port=tgt["port"],
                           database=tgt["dbname"], user=tgt["dbuser"],
-                          sslmode=tgt["sslmode"])
+                          sslmode=tgt["sslmode"], engine=tgt["engine"])
             password = store.get(tgt["password_ref"])
     if not password or not target.get("host"):
         return None

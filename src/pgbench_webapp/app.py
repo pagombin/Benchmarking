@@ -567,12 +567,18 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         password = payload.get("password") or ""
         if password:
             store.set(ref, password)  # encrypted, off-DB; only the ref is stored
+        from pgbench_harness.engines import ENGINES, normalize_engine
+        engine = normalize_engine(str(payload.get("engine") or ""))
+        if engine not in ENGINES:
+            raise HTTPException(400, f"engine must be one of {list(ENGINES)}")
         try:
             tid = queries.create_target(
-                conn, name, host, int(payload.get("port") or 5432),
+                conn, name, host,
+                int(payload.get("port") or (3306 if engine == "mysql" else 5432)),
                 str(payload.get("dbname", "")).strip() or "defaultdb",
                 str(payload.get("dbuser", "")).strip() or "doadmin",
-                str(payload.get("sslmode", "require")).strip() or "require", ref)
+                str(payload.get("sslmode", "require")).strip() or "require", ref,
+                engine=engine)
         except sqlite3.IntegrityError:
             raise HTTPException(400, "a target with that name already exists")
         queries.audit(conn, user["username"], "target_create", target=name, detail=host)
@@ -616,8 +622,13 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         tgt = queries.get_target(conn, target_id)
         if tgt is None:
             raise HTTPException(404, "target not found")
-        fields = {k: payload[k] for k in ("host", "port", "dbname", "dbuser", "sslmode")
+        fields = {k: payload[k] for k in ("host", "port", "dbname", "dbuser", "sslmode", "engine")
                   if k in payload and payload[k] not in (None, "")}
+        if "engine" in fields:
+            from pgbench_harness.engines import ENGINES, normalize_engine
+            fields["engine"] = normalize_engine(str(fields["engine"]))
+            if fields["engine"] not in ENGINES:
+                raise HTTPException(400, f"engine must be one of {list(ENGINES)}")
         if "port" in fields:
             try:
                 fields["port"] = int(fields["port"])
@@ -1369,7 +1380,8 @@ def _spec_with_target(conn: sqlite3.Connection, payload: dict) -> tuple[str, Opt
         if tgt is None:
             raise HTTPException(400, "unknown target")
         doc["target"].update(host=tgt["host"], port=tgt["port"], database=tgt["dbname"],
-                             user=tgt["dbuser"], sslmode=tgt["sslmode"])
+                             user=tgt["dbuser"], sslmode=tgt["sslmode"],
+                             engine=tgt["engine"])
     doc["target"]["password_env"] = "PGB_TARGET_PASSWORD"
     return yaml.safe_dump(doc, sort_keys=False), (int(target_id) if target_id else None)
 

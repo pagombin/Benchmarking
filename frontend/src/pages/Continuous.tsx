@@ -203,7 +203,7 @@ export function Continuous({ me }: { me: Me }) {
                   <option value={0} disabled>choose a target…</option>
                   {targets.map((t) => (
                     <option key={t.id} value={t.id} disabled={activeTargets.has(t.id)}>
-                      {t.name} ({t.host}){activeTargets.has(t.id) ? " — busy" : ""}
+                      {t.name} ({t.host}){t.engine === "mysql" ? " — MySQL" : ""}{activeTargets.has(t.id) ? " — busy" : ""}
                     </option>
                   ))}
                 </select>

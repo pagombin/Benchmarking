@@ -58,7 +58,7 @@ export function NewRun({ me }: { me: Me }) {
   const [targets, setTargets] = useState<Target[]>([]);
   const [targetMode, setTargetMode] = useState<"saved" | "inline">("inline");
   const [targetId, setTargetId] = useState<number>(0);
-  const [inline, setInline] = useState({ host: "", port: 5432, database: "defaultdb", user: "doadmin", sslmode: "require", password: "" });
+  const [inline, setInline] = useState({ host: "", port: 5432, database: "defaultdb", user: "doadmin", sslmode: "require", engine: "postgres", password: "" });
   const [meta, setMeta] = useState({ label: "", edition: "advanced", tshirt_size: "8c32g", tags: "", ticket: "" });
   const [wl, setWl] = useState({ type: "tpcc", tpcc_path: "/opt/sysbench-tpcc", tables: 10, scale: 30, table_size: 1000000, dataset_gb: 64, mix: "mixed", rand_type: "uniform" });
   const [mode, setMode] = useState<"sweep" | "soak" | "suite" | "probe">("sweep");
@@ -121,8 +121,8 @@ export function NewRun({ me }: { me: Me }) {
   const doc = useMemo(() => {
     const tgt = targetMode === "saved" ? targets.find((t) => t.id === targetId) : null;
     const target = tgt
-      ? { host: tgt.host, port: tgt.port, database: tgt.dbname, user: tgt.dbuser, sslmode: tgt.sslmode, password_env: "PGB_TARGET_PASSWORD" }
-      : { host: inline.host, port: inline.port, database: inline.database, user: inline.user, sslmode: inline.sslmode, password_env: "PGB_TARGET_PASSWORD" };
+      ? { host: tgt.host, port: tgt.port, database: tgt.dbname, user: tgt.dbuser, sslmode: tgt.sslmode, ...(tgt.engine === "mysql" ? { engine: "mysql" } : {}), password_env: "PGB_TARGET_PASSWORD" }
+      : { host: inline.host, port: inline.port, database: inline.database, user: inline.user, sslmode: inline.sslmode, ...(inline.engine === "mysql" ? { engine: "mysql" } : {}), password_env: "PGB_TARGET_PASSWORD" };
     const run: Record<string, unknown> = { label: meta.label || "run", edition: meta.edition, tshirt_size: meta.tshirt_size };
     const tags = meta.tags.split(",").map((s) => s.trim()).filter(Boolean);
     if (tags.length) run.tags = tags;
@@ -267,8 +267,15 @@ export function NewRun({ me }: { me: Me }) {
     } catch (e) { setErr((e as Error).message); }
   }
 
-  const seti = (k: keyof typeof inline) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+  const seti = (k: keyof typeof inline) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    if (k === "engine") {
+      const engine = e.target.value;
+      const untouched = inline.port === (inline.engine === "mysql" ? 3306 : 5432);
+      setInline({ ...inline, engine, port: untouched ? (engine === "mysql" ? 3306 : 5432) : inline.port });
+      return;
+    }
     setInline({ ...inline, [k]: k === "port" ? Number(e.target.value) : e.target.value });
+  };
 
   return (
     <>
@@ -289,13 +296,20 @@ export function NewRun({ me }: { me: Me }) {
           {targetMode === "saved" ? (
             <div className="field">
               <select value={targetId} onChange={(e) => setTargetId(Number(e.target.value))}>
-                {targets.map((t) => <option key={t.id} value={t.id}>{t.name} — {t.host}</option>)}
+                {targets.map((t) => <option key={t.id} value={t.id}>{t.name} — {t.host}{t.engine === "mysql" ? " (MySQL)" : ""}</option>)}
               </select>
               <p className="subtle" style={{ fontSize: 12, marginTop: 4 }}>Uses the cluster's saved encrypted password.</p>
             </div>
           ) : (
             <>
-              <div className="field"><label>Host</label><input value={inline.host} onChange={seti("host")} placeholder="private-db.nyc3.db.ondigitalocean.com" /></div>
+              <div className="row">
+                <div className="field" style={{ maxWidth: 150 }}><label>Engine</label>
+                  <select value={inline.engine} onChange={seti("engine")}>
+                    <option value="postgres">PostgreSQL</option>
+                    <option value="mysql">MySQL</option>
+                  </select></div>
+                <div className="field"><label>Host</label><input value={inline.host} onChange={seti("host")} placeholder={inline.engine === "mysql" ? "private-mysql.nyc3.db.ondigitalocean.com" : "private-db.nyc3.db.ondigitalocean.com"} /></div>
+              </div>
               <div className="row">
                 <div className="field"><label>Port</label><input type="number" value={inline.port} onChange={seti("port")} /></div>
                 <div className="field"><label>SSL</label>

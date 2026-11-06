@@ -50,6 +50,10 @@ class Target:
     user: str
     password_env: str
     sslmode: str = "require"
+    # Database engine: 'postgres' (default) or 'mysql'. Everything downstream
+    # (sysbench driver, client CLI, probes, collectors) branches through
+    # pgbench_harness.engines on this one field.
+    engine: str = "postgres"
 
 
 @dataclass(frozen=True)
@@ -343,7 +347,15 @@ def _parse_target(sec: dict[str, Any]) -> Target:
                 f"'target.{forbidden}' is not allowed: specs must never contain a password",
                 hint="use target.password_env to name an environment variable instead.",
             )
-    _check_keys(sec, "target", {"host", "port", "database", "user", "password_env"}, {"sslmode"})
+    _check_keys(sec, "target", {"host", "port", "database", "user", "password_env"},
+                {"sslmode", "engine"})
+    from pgbench_harness.engines import ENGINES, normalize_engine
+    engine = normalize_engine(_typed(sec, "target", "engine", str, "postgres"))
+    if engine not in ENGINES:
+        raise SpecError(
+            f"target.engine must be one of {list(ENGINES)}, got '{engine}'",
+            hint="omit target.engine for PostgreSQL, or set it to 'mysql'.",
+        )
     return Target(
         host=_typed(sec, "target", "host", str),
         port=_typed(sec, "target", "port", int),
@@ -351,6 +363,7 @@ def _parse_target(sec: dict[str, Any]) -> Target:
         user=_typed(sec, "target", "user", str),
         password_env=_typed(sec, "target", "password_env", str),
         sslmode=_typed(sec, "target", "sslmode", str, "require"),
+        engine=engine,
     )
 
 
@@ -725,9 +738,22 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
             raise SpecError("'pmm.server_host' must be a non-empty string")
         pmm = Pmm(server_host=host.strip(),
                   service_name=_typed(psec, "pmm", "service_name", str, ""))
+    target = _parse_target(_section(doc, "target"))
+    if target.engine == "mysql" and suite is not None and suite.pgbench:
+        raise SpecError(
+            "suite.pgbench is true but the target engine is MySQL — pgbench "
+            "(TPC-B) is a PostgreSQL-only tool",
+            hint="set suite.pgbench: false to run the sysbench matrix on MySQL.",
+        )
+    if target.engine == "mysql" and device_probe is not None:
+        raise SpecError(
+            "device_probe requires a PostgreSQL cluster (it mounts the "
+            "cluster's pgdata PVC)",
+            hint="device probes are not supported for MySQL targets.",
+        )
     return Spec(
         run=_parse_run(_section(doc, "run")),
-        target=_parse_target(_section(doc, "target")),
+        target=target,
         workload=_parse_workload(_section(doc, "workload")),
         sweep=sweep,
         capture=_parse_capture(doc.get("capture") or {}),

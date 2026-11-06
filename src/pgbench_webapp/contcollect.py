@@ -11,7 +11,6 @@ failing query leaves a BLANK FIELD, never a blank row. Raw counters are stored
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import time
@@ -55,6 +54,45 @@ _QUERIES: dict[str, tuple[str, tuple[str, ...]]] = {
         "SELECT coalesce(sum(n_dead_tup), 0) FROM pg_stat_user_tables",
         ("dead_tup",)),
 }
+
+# MySQL: the same engine-neutral field names, sourced from
+# performance_schema.global_status / information_schema. blks_hit is derived
+# (buffer-pool requests minus physical reads) so the console's cache-hit%
+# math — hit/(hit+read) — stays the buffer-pool hit ratio. dead_tup maps to
+# the InnoDB history list length (the purge-lag/bloat analogue). Fields with
+# no MySQL equivalent select NULL and land as blanks, never blank rows.
+_GS = ("(SELECT variable_value+0 FROM performance_schema.global_status "
+       "WHERE variable_name='{v}')")
+_MYSQL_QUERIES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "activity": (
+        "SELECT " + _GS.format(v="Threads_running") + ", "
+        + _GS.format(v="Threads_connected") + " - " + _GS.format(v="Threads_running")
+        + ", NULL, " + _GS.format(v="Threads_connected"),
+        ("conn_active", "conn_idle", "conn_idle_tx", "conn_total")),
+    "database": (
+        "SELECT " + _GS.format(v="Com_commit") + ", "
+        + _GS.format(v="Com_rollback") + ", "
+        + _GS.format(v="Innodb_buffer_pool_read_requests") + " - "
+        + _GS.format(v="Innodb_buffer_pool_reads") + ", "
+        + _GS.format(v="Innodb_buffer_pool_reads") + ", NULL, NULL",
+        ("xact_commit", "xact_rollback", "blks_hit", "blks_read",
+         "deadlocks", "temp_bytes")),
+    "wal": (
+        "SELECT NULL, " + _GS.format(v="Innodb_os_log_written"),
+        ("wal_records", "wal_bytes")),
+    "replication": (
+        "SELECT NULL, (SELECT count(*) FROM information_schema.processlist "
+        "WHERE command LIKE 'Binlog Dump%')",
+        ("repl_lag_s", "repl_count")),
+    "size": (
+        "SELECT coalesce(sum(data_length + index_length), 0) "
+        "FROM information_schema.tables WHERE table_schema = database()",
+        ("db_size",)),
+    "dead_tuples": (
+        "SELECT coalesce((SELECT count FROM information_schema.innodb_metrics "
+        "WHERE name='trx_rseg_history_len'), 0)",
+        ("dead_tup",)),
+}
 CKPT_SQL_17 = ("SELECT num_timed, num_requested FROM pg_stat_checkpointer",
                ("ckpt_timed", "ckpt_req"))
 CKPT_SQL_OLD = ("SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter",
@@ -63,21 +101,32 @@ PGSS_EXISTS_SQL = "SELECT count(*) FROM pg_extension WHERE extname='pg_stat_stat
 PGSS_TOP_SQL = ("SELECT left(regexp_replace(query, '\\s+', ' ', 'g'), 80), "
                 "calls, round(total_exec_time)::bigint "
                 "FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 5")
+DIGEST_EXISTS_SQL = ("SELECT count(*) FROM information_schema.tables "
+                     "WHERE table_schema='performance_schema' "
+                     "AND table_name='events_statements_summary_by_digest'")
+DIGEST_TOP_SQL = ("SELECT left(regexp_replace(coalesce(digest_text, ''), "
+                  "'\\\\s+', ' '), 80), count_star, round(sum_timer_wait/1e9) "
+                  "FROM performance_schema.events_statements_summary_by_digest "
+                  "ORDER BY sum_timer_wait DESC LIMIT 5")
 
 
 def _psql(target: dict[str, Any], password: str, sql: str,
           timeout_s: float = 8.0) -> Optional[list[list[str]]]:
-    """One split query -> rows of '|'-separated cells; None on any failure."""
-    argv = ["psql", "-h", str(target.get("host", "")),
-            "-p", str(target.get("port", 5432)),
-            "-U", str(target.get("user", "")),
-            "-d", str(target.get("database", "")),
-            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql]
-    env = dict(os.environ)
-    env["PGPASSWORD"] = password
-    env["PGSSLMODE"] = str(target.get("sslmode", "require"))
-    env["PGCONNECT_TIMEOUT"] = "3"
-    env["PGOPTIONS"] = "-c statement_timeout=5000"
+    """One split query -> rows of separated cells; None on any failure.
+
+    Engine-aware (psql or mysql client); the cell separator differs per
+    engine and the caller never sees it — rows come back pre-split."""
+    from pgbench_harness import engines
+    engine = engines.spec_target_engine(target)
+    argv = engines.client_argv(
+        engine, str(target.get("host", "")),
+        int(target.get("port", engines.DEFAULT_PORTS.get(engine, 5432)) or 0),
+        str(target.get("user", "")), str(target.get("database", "")), sql,
+        sslmode=str(target.get("sslmode", "require")),
+        connect_timeout_s=3, statement_timeout_ms=5000)
+    env = engines.client_env(engine, password,
+                             sslmode=str(target.get("sslmode", "require")),
+                             connect_timeout_s=3, statement_timeout_ms=5000)
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, text=True,
                               timeout=timeout_s)
@@ -85,7 +134,8 @@ def _psql(target: dict[str, Any], password: str, sql: str,
         return None
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
-    return [line.split("|") for line in proc.stdout.strip().splitlines()]
+    sep = engines.cell_sep(engine)
+    return [line.split(sep) for line in proc.stdout.strip().splitlines()]
 
 
 def _num(v: str) -> Any:
@@ -106,13 +156,27 @@ _ckpt_shape: dict[str, str] = {}
 def collect_once(target: dict[str, Any], password: str,
                  shape_key: str = "") -> dict[str, Any]:
     """One collector pass: every split query, blank fields on failure."""
+    from pgbench_harness import engines
     get_redactor().register(password)
+    engine = engines.spec_target_engine(target)
     out: dict[str, Any] = {}
-    for _name, (sql, fields) in _QUERIES.items():
+    queries_map = _MYSQL_QUERIES if engine == "mysql" else _QUERIES
+    for _name, (sql, fields) in queries_map.items():
         rows = _psql(target, password, sql)
         if rows and rows[0]:
             for i, f in enumerate(fields):
                 out[f] = _num(rows[0][i]) if i < len(rows[0]) else None
+    if engine == "mysql":
+        # no checkpoint-counter analogue; per-statement stats come from the
+        # performance_schema digest table when it exists
+        digest = _psql(target, password, DIGEST_EXISTS_SQL)
+        if digest and digest[0] and _num(digest[0][0]):
+            top = _psql(target, password, DIGEST_TOP_SQL)
+            if top:
+                out["top_queries"] = [
+                    {"q": r[0], "calls": _num(r[1]) or 0, "total_ms": _num(r[2]) or 0}
+                    for r in top if len(r) >= 3]
+        return out
     shape = _ckpt_shape.get(shape_key, "17")
     sql, fields = CKPT_SQL_17 if shape == "17" else CKPT_SQL_OLD
     rows = _psql(target, password, sql)
