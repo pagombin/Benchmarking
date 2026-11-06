@@ -236,3 +236,216 @@ def test_mysql_live_sampler_maps_pg_vocabulary(fake_env: Path) -> None:
     assert row["cache_hit_pct"] != "" and float(row["cache_hit_pct"]) > 90
     # keys with no MySQL analogue chart as gaps, never crash
     assert row["ckpt_timed_s"] == "" and row["repl_replay_lag_s"] == ""
+
+
+# ── webapp: targets, continuous submission, probes, collector ───────
+
+import os as _os
+import stat as _stat
+import sys as _sys
+
+TESTS = Path(__file__).resolve().parent
+FAKEBIN = TESTS / "fakebin"
+
+
+@pytest.fixture()
+def web(tmp_path, monkeypatch):
+    for exe in ("sysbench", "psql", "mysql"):
+        p = FAKEBIN / exe
+        p.chmod(p.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+    venv_bin = Path(_sys.executable).parent
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{_os.pathsep}{venv_bin}{_os.pathsep}{_os.environ['PATH']}")
+    monkeypatch.setenv("PGBENCH_HARNESS_BIN", str(venv_bin / "pgbench-harness"))
+    monkeypatch.setenv("PGB_PROBE_GRACE_S", "0.3")
+    state = tmp_path / "fakestate"
+    state.mkdir()
+    monkeypatch.setenv("FAKE_PSQL_STATE", str(state))
+    data = tmp_path / "data"
+    monkeypatch.setenv("PGBENCH_DATA_DIR", str(data))
+    monkeypatch.setenv("PGBENCH_DB", str(data / "pgbench.db"))
+
+    from fastapi.testclient import TestClient
+    from pgbench_webapp import admin, queries as q
+    from pgbench_webapp.app import create_app
+    from pgbench_webapp.config import load_config
+    from pgbench_webapp.db import connect
+    from pgbench_webapp.security import hash_password
+
+    cfg = load_config()
+    admin.create_admin("admin", "apw")
+    conn = connect(cfg.db_path)
+    q.create_user(conn, "op", hash_password("oppw"), "operator")
+    conn.close()
+    client = TestClient(create_app(cfg))
+    return client, cfg
+
+
+def _mk_mysql_target(client, name="my1", password="pw-secret"):
+    return client.post("/api/targets", json={
+        "name": name, "host": "db.example.invalid", "engine": "mysql",
+        "dbname": "sbtest", "dbuser": "bench", "password": password},
+        auth=("op", "oppw"))
+
+
+def test_target_engine_roundtrip_and_validation(web):
+    client, _cfg = web
+    r = _mk_mysql_target(client)
+    assert r.status_code == 200
+    rows = client.get("/api/targets", auth=("op", "oppw")).json()
+    row = next(t for t in rows if t["name"] == "my1")
+    assert row["engine"] == "mysql"
+    assert row["port"] == 3306          # engine-aware default when omitted
+    # default engine stays postgres
+    r = client.post("/api/targets", json={
+        "name": "pg1", "host": "h", "password": "x"}, auth=("op", "oppw"))
+    rows = client.get("/api/targets", auth=("op", "oppw")).json()
+    assert next(t for t in rows if t["name"] == "pg1")["engine"] == "postgres"
+    # invalid engine refused on create and update
+    r = client.post("/api/targets", json={
+        "name": "bad", "host": "h", "engine": "oracle"}, auth=("op", "oppw"))
+    assert r.status_code == 400
+    tid = row["id"]
+    r = client.post(f"/api/targets/{tid}", json={"engine": "oracle"},
+                    auth=("op", "oppw"))
+    assert r.status_code == 400
+
+
+def test_continuous_spec_carries_engine(web):
+    client, cfg = web
+    from pgbench_webapp.db import connect
+    tid = _mk_mysql_target(client).json()["id"]
+    r = client.post("/api/continuous", json={"target_id": tid, "threads": 2},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+    conn = connect(cfg.db_path)
+    spec_yaml = conn.execute("SELECT spec_yaml FROM jobs WHERE id=?",
+                             (job_id,)).fetchone()["spec_yaml"]
+    conn.close()
+    assert "engine: mysql" in spec_yaml
+    assert "pw-secret" not in spec_yaml
+
+
+def test_run_probe_mysql(web, monkeypatch):
+    from pgbench_webapp.contprobe import run_probe
+    target = {"host": "db.example.invalid", "port": 3306, "user": "bench",
+              "database": "sbtest", "sslmode": "require", "engine": "mysql"}
+    ok, err = run_probe(target, "pw", "read")
+    assert ok, err
+    ok, err = run_probe(target, "pw", "write")
+    assert ok, err
+    monkeypatch.setenv("FAKE_MYSQL_PROBE_FAIL", "read")
+    ok, err = run_probe(target, "pw", "read")
+    assert not ok and classify_error(err) == "network"
+    ok, err = run_probe(target, "pw", "write")   # write path unaffected
+    assert ok, err
+
+
+def test_collect_once_mysql(web):
+    from pgbench_webapp.contcollect import collect_once
+    target = {"host": "db.example.invalid", "port": 3306, "user": "bench",
+              "database": "sbtest", "sslmode": "require", "engine": "mysql"}
+    m = collect_once(target, "pw", shape_key="db.example.invalid")
+    assert m["conn_active"] == 3 and m["conn_total"] == 9
+    assert m["conn_idle_tx"] is None            # NULL -> blank field, kept row
+    assert m["xact_commit"] > 0 and m["blks_hit"] > 0 and m["blks_read"] > 0
+    assert m["wal_bytes"] > 0 and m["wal_records"] is None
+    assert m["db_size"] == 1073741824
+    assert m["dead_tup"] == 1234 and m["repl_count"] == 2
+    assert "ckpt_timed" not in m                 # no MySQL checkpoint analogue
+    assert m["top_queries"] and m["top_queries"][0]["calls"] == 50000
+
+
+def test_preflight_task_spec_merges_engine(web):
+    client, cfg = web
+    from pgbench_webapp.db import connect
+    tid = _mk_mysql_target(client, name="my2").json()["id"]
+    r = client.post("/api/preflight", json={
+        "target_id": tid,
+        "spec_yaml": ("run: {label: t, edition: advanced, tshirt_size: 4c16g}\n"
+                      "workload: {type: oltp_read_write, tables: 1, table_size: 100}\n"
+                      "sweep: {threads: [1], duration_s: 5, warmup_s: 1}\n")},
+        auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    conn = connect(cfg.db_path)
+    spec_yaml = conn.execute("SELECT spec_yaml FROM jobs ORDER BY id DESC "
+                             "LIMIT 1").fetchone()["spec_yaml"]
+    conn.close()
+    assert "engine: mysql" in spec_yaml
+
+
+MYSQL_CONT_SPEC = """\
+run:
+  label: cont-mysql
+  edition: advanced
+  tshirt_size: 4c16g
+target:
+  host: db.example.invalid
+  port: 3306
+  database: sbtest
+  user: bench
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require
+  engine: mysql
+workload:
+  type: oltp_read_write
+  tables: 4
+  table_size: 1000
+continuous:
+  threads: 2
+  segment_time_s: 1
+  segment_kill_grace_s: 2
+"""
+
+
+def test_worker_e2e_mysql_continuous(web, monkeypatch):
+    """run_job drives the real harness CLI for a MySQL target: the mysql
+    sysbench driver is selected, segments stream, and no secret reaches any
+    artifact — the identical lifecycle PostgreSQL gets."""
+    import threading
+    import time as _time
+    from pgbench_webapp import queries as q, worker
+    from pgbench_webapp.db import connect
+    from pgbench_webapp.secrets_store import SecretStore
+    _client, cfg = web
+    monkeypatch.setenv("FAKE_SYSBENCH_REALTIME", "1")
+    conn = connect(cfg.db_path)
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    store.set("target:m1:password", "pw-secret-mysql")
+    tid = q.create_target(conn, "m1", "db.example.invalid", 3306, "sbtest",
+                          "bench", "require", "target:m1:password",
+                          engine="mysql")
+    jid = q.enqueue_job(conn, "continuous", MYSQL_CONT_SPEC, tid, "op",
+                        desired_state="running")
+    claimed = q.claim_next_job(conn, 1, continuous_cap=4)
+    assert claimed is not None and claimed["id"] == jid
+    t = threading.Thread(target=worker._run_job_threaded, args=(cfg, store, jid),
+                         daemon=True)
+    t.start()
+
+    def wait(pred, timeout_s=30.0):
+        deadline = _time.monotonic() + timeout_s
+        while _time.monotonic() < deadline:
+            v = pred()
+            if v:
+                return v
+            _time.sleep(0.2)
+        raise AssertionError("condition not met in time")
+
+    job = wait(lambda: (lambda j: j if j and j["run_id"] and j["pid"] else None)(
+        q.get_job(conn, jid)))
+    run_dir = cfg.results_dir / job["run_id"]
+    wait(lambda: list(run_dir.glob("raw/cont_seg*.log")))
+    assert worker.stop_job_process(cfg, conn, jid) is True
+    t.join(timeout=30)
+    assert not t.is_alive()
+    assert q.get_job(conn, jid)["state"] == "canceled"
+    # the harness logged the sysbench command it built: the mysql driver,
+    # with the password in NO argv and NO artifact
+    harness_log = (run_dir / "harness.log").read_text()
+    assert "--db-driver=mysql" in harness_log
+    assert "--mysql-ssl=on" in harness_log
+    leaked = [p for p in run_dir.rglob("*") if p.is_file()
+              and "pw-secret-mysql" in p.read_text(errors="ignore")]
+    assert leaked == []
+    conn.close()

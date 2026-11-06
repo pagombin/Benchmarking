@@ -81,11 +81,12 @@ def delete_session(conn: sqlite3.Connection, token: str) -> None:
 # ── targets ─────────────────────────────────────────────────────────
 
 def create_target(conn: sqlite3.Connection, name: str, host: str, port: int, dbname: str,
-                  dbuser: str, sslmode: str, password_ref: str) -> int:
+                  dbuser: str, sslmode: str, password_ref: str,
+                  engine: str = "postgres") -> int:
     cur = conn.execute(
-        "INSERT INTO targets(name, host, port, dbname, dbuser, sslmode, password_ref, created_utc) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (name, host, port, dbname, dbuser, sslmode, password_ref, utc_now_iso()))
+        "INSERT INTO targets(name, host, port, dbname, dbuser, sslmode, password_ref, "
+        "engine, created_utc) VALUES (?,?,?,?,?,?,?,?,?)",
+        (name, host, port, dbname, dbuser, sslmode, password_ref, engine, utc_now_iso()))
     return int(cur.lastrowid or 0)
 
 
@@ -94,7 +95,9 @@ def get_target(conn: sqlite3.Connection, target_id: int) -> Optional[sqlite3.Row
 
 
 def list_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return list(conn.execute("SELECT id, name, host, port, dbname, dbuser, sslmode FROM targets ORDER BY name"))
+    return list(conn.execute(
+        "SELECT id, name, host, port, dbname, dbuser, sslmode, engine "
+        "FROM targets ORDER BY name"))
 
 
 def get_target_by_name(conn: sqlite3.Connection, name: str) -> Optional[sqlite3.Row]:
@@ -113,9 +116,9 @@ def delete_target(conn: sqlite3.Connection, target_id: int) -> None:
 
 
 def update_target(conn: sqlite3.Connection, target_id: int, **fields: Any) -> None:
-    """Update connection fields (host/port/dbname/dbuser/sslmode). Never the password
-    (that lives in the secret store under password_ref)."""
-    allowed = {"host", "port", "dbname", "dbuser", "sslmode"}
+    """Update connection fields (host/port/dbname/dbuser/sslmode/engine). Never the
+    password (that lives in the secret store under password_ref)."""
+    allowed = {"host", "port", "dbname", "dbuser", "sslmode", "engine"}
     sets = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not sets:
         return

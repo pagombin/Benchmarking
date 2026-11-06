@@ -219,6 +219,11 @@ MIGRATIONS: list[tuple[int, str]] = [
     CREATE INDEX idx_alerts_open ON alerts(dedup_key) WHERE resolved_utc IS NULL;
     CREATE INDEX idx_alerts_undelivered ON alerts(id) WHERE delivery IS NULL;
     """),
+    # 10: multi-engine targets — MySQL rides the same tables/paths as
+    #     PostgreSQL; the engine lives on the saved target (and in specs).
+    (10, """
+    ALTER TABLE targets ADD COLUMN engine TEXT NOT NULL DEFAULT 'postgres';
+    """),
 ]
 
 
