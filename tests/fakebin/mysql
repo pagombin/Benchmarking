@@ -166,6 +166,8 @@ elif "select @@version" in low:
     print("8.0.39")
 elif "select @@max_connections" in low:
     print("500")
+elif "select @@sql_require_primary_key" in low:
+    print(os.environ.get("FAKE_MYSQL_REQUIRE_PK", "0"))
 elif low == "select database()":
     print(database or "sbtest")
 elif "information_schema.columns" in low:

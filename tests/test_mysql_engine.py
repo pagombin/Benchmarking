@@ -504,3 +504,29 @@ def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("SSL_CERT_FILE", "/operator/own.pem")
     env = engines.client_env("mysql", "pw")
     assert env["SSL_CERT_FILE"] == "/operator/own.pem"
+
+
+def test_mysql_tpcc_require_pk_preflight(fake_env: Path, tmp_path: Path,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """sql_require_primary_key=ON + TPC-C is caught BEFORE the load: a
+    warning in run_preflight and a fail event in the live checklist, with
+    the disable-for-load guidance; OFF stays silent, and oltp specs never
+    run the check."""
+    doc = mysql_doc()
+    tpcc = tmp_path / "tpcc"
+    tpcc.mkdir()
+    (tpcc / "tpcc.lua").write_text("-- stub")
+    doc["workload"] = {"type": "tpcc", "tpcc_path": str(tpcc),
+                      "tables": 1, "scale": 1}
+    import logging as _logging
+    monkeypatch.setenv("FAKE_MYSQL_REQUIRE_PK", "1")
+    spec = parse_spec(doc)
+    warn = capture._check_mysql_require_pk(spec, TEST_PASSWORD)
+    assert "error 3750" in warn and "re-enabled afterwards" in warn
+    events = {e["name"]: e for e in capture.preflight_steps(
+        spec, TEST_PASSWORD, _logging.getLogger("t"))}
+    assert events["sql_require_primary_key"]["status"] == "fail"
+    monkeypatch.setenv("FAKE_MYSQL_REQUIRE_PK", "0")
+    assert capture._check_mysql_require_pk(spec, TEST_PASSWORD) == ""
+    assert capture._check_mysql_require_pk(
+        parse_spec(mysql_doc()), TEST_PASSWORD) == ""   # oltp: no check
