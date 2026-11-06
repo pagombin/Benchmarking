@@ -449,3 +449,23 @@ def test_worker_e2e_mysql_continuous(web, monkeypatch):
               and "pw-secret-mysql" in p.read_text(errors="ignore")]
     assert leaked == []
     conn.close()
+
+
+def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--mysql-ssl=on carries a CA bundle (sysbench's SSL context init fails
+    without one on MariaDB-linked builds: 'SSL_CTX_set_default_verify_paths
+    failed'); PGB_MYSQL_SSL_CA overrides, empty suppresses, disable omits."""
+    monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    if engines.mysql_ssl_ca():                       # system bundle present
+        assert any(a.startswith("--mysql-ssl-ca=") for a in args)
+    monkeypatch.setenv("PGB_MYSQL_SSL_CA", "/custom/provider-ca.pem")
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl-ca=/custom/provider-ca.pem" in args
+    monkeypatch.setenv("PGB_MYSQL_SSL_CA", "")
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert not any(a.startswith("--mysql-ssl-ca=") for a in args)
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
+                                            sslmode="disable")
+    assert "--mysql-ssl=off" in args
+    assert not any(a.startswith("--mysql-ssl-ca=") for a in args)

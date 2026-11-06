@@ -113,13 +113,42 @@ def cell_sep(engine: str) -> str:
     return "\t" if engine == "mysql" else "|"
 
 
+_MYSQL_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian/Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL/Fedora
+    "/etc/ssl/cert.pem",                    # Alpine/macOS
+)
+
+
+def mysql_ssl_ca() -> str:
+    """CA bundle handed to sysbench's mysql driver when TLS is on.
+
+    With ``--mysql-ssl=on`` and no CA, several connector builds (Ubuntu's
+    MariaDB-linked sysbench among them) fail at context init with
+    ``error 2026: SSL_CTX_set_default_verify_paths failed`` before a single
+    connection is attempted. Passing any readable CA bundle satisfies the
+    init; the server certificate is still NOT verified (sysbench never
+    enables peer verification), so this changes availability, not trust.
+    ``PGB_MYSQL_SSL_CA`` overrides the autodetected path — set it to a
+    provider CA file if you want one, or to the empty string to suppress
+    the flag entirely.
+    """
+    override = os.environ.get("PGB_MYSQL_SSL_CA")
+    if override is not None:
+        return override
+    for p in _MYSQL_CA_BUNDLES:
+        if os.path.exists(p):
+            return p
+    return ""
+
+
 def sysbench_connection_args(engine: str, host: str, port: int, user: str,
                              database: str, sslmode: str = "require") -> list[str]:
     """sysbench driver + connection flags. Password stays OUT of argv for both
     drivers (PGPASSWORD / MYSQL_PWD via the child env)."""
     if engine == "mysql":
         ssl = "off" if sslmode == "disable" else "on"
-        return [
+        args = [
             "--db-driver=mysql",
             f"--mysql-host={host}",
             f"--mysql-port={port}",
@@ -127,6 +156,11 @@ def sysbench_connection_args(engine: str, host: str, port: int, user: str,
             f"--mysql-db={database}",
             f"--mysql-ssl={ssl}",
         ]
+        if ssl == "on":
+            ca = mysql_ssl_ca()
+            if ca:
+                args.append(f"--mysql-ssl-ca={ca}")
+        return args
     return [
         "--db-driver=pgsql",
         f"--pgsql-host={host}",
