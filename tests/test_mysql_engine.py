@@ -471,11 +471,18 @@ def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -
                         "...mysql-ssl=STRING...mysql-ssl-ca=STRING...")  # 1.1.0
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
     assert "--mysql-ssl=REQUIRED" in args                      # mode dialect
-    if engines.mysql_ssl_ca():
-        assert any(a.startswith("--mysql-ssl-ca=") for a in args)
+    # require = encrypt-only: NO CA (a CA makes libmysql verify, and managed
+    # providers sign with private CAs -> 'certificate verify failed')
+    assert not any(a.startswith("--mysql-ssl-ca") for a in args)
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
                                             sslmode="verify-full")
     assert "--mysql-ssl=VERIFY_IDENTITY" in args
+    if engines.mysql_ssl_ca():                                 # verify wants a CA
+        assert any(a.startswith("--mysql-ssl-ca=") for a in args)
+    monkeypatch.setenv("PGB_MYSQL_SSL_CA", "/root/do-ca.crt")  # operator-pinned CA
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert "--mysql-ssl-ca=/root/do-ca.crt" in args
+    monkeypatch.delenv("PGB_MYSQL_SSL_CA")
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
                                             sslmode="disable")
     assert "--mysql-ssl=DISABLED" in args
