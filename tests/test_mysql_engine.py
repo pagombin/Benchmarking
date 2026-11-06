@@ -452,20 +452,30 @@ def test_worker_e2e_mysql_continuous(web, monkeypatch):
 
 
 def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--mysql-ssl=on carries a CA bundle (sysbench's SSL context init fails
-    without one on MariaDB-linked builds: 'SSL_CTX_set_default_verify_paths
-    failed'); PGB_MYSQL_SSL_CA overrides, empty suppresses, disable omits."""
+    """TLS trust setup rides the ENV, not argv: sysbench 1.0.20 rejects
+    --mysql-ssl-ca, and its SSL context init fails without a reachable CA
+    ('SSL_CTX_set_default_verify_paths failed'). client_env points
+    SSL_CERT_FILE/DIR at the system bundle; PGB_MYSQL_SSL_CA overrides,
+    empty leaves the env untouched; sslmode=disable sets nothing."""
     monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    assert not any(a.startswith("--mysql-ssl-ca") for a in args)  # 1.0.20-safe
+    env = engines.client_env("mysql", "pw")
     if engines.mysql_ssl_ca():                       # system bundle present
-        assert any(a.startswith("--mysql-ssl-ca=") for a in args)
+        assert env["SSL_CERT_FILE"] == engines.mysql_ssl_ca()
+        assert env["SSL_CERT_DIR"]
     monkeypatch.setenv("PGB_MYSQL_SSL_CA", "/custom/provider-ca.pem")
-    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
-    assert "--mysql-ssl-ca=/custom/provider-ca.pem" in args
+    env = engines.client_env("mysql", "pw")
+    assert env["SSL_CERT_FILE"] == "/custom/provider-ca.pem"
     monkeypatch.setenv("PGB_MYSQL_SSL_CA", "")
-    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
-    assert not any(a.startswith("--mysql-ssl-ca=") for a in args)
-    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d",
-                                            sslmode="disable")
-    assert "--mysql-ssl=off" in args
-    assert not any(a.startswith("--mysql-ssl-ca=") for a in args)
+    env = engines.client_env("mysql", "pw")
+    assert "SSL_CERT_FILE" not in env
+    monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
+    env = engines.client_env("mysql", "pw", sslmode="disable")
+    assert "SSL_CERT_FILE" not in env
+    # an operator's own SSL_CERT_FILE is never clobbered
+    monkeypatch.setenv("SSL_CERT_FILE", "/operator/own.pem")
+    env = engines.client_env("mysql", "pw")
+    assert env["SSL_CERT_FILE"] == "/operator/own.pem"

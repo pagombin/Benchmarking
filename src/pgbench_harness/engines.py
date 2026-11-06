@@ -94,10 +94,24 @@ def client_env(engine: str, password: str, sslmode: str = "require",
     password is ``MYSQL_PWD``, which libmysqlclient reads whenever no
     explicit password option is supplied — the same no-secret-in-argv
     contract as libpq's ``PGPASSWORD``.
+
+    When TLS is on, the standard OpenSSL variables are pointed at the
+    system CA bundle: sysbench's MySQL driver (and some client builds)
+    initialize their TLS context via ``SSL_CTX_set_default_verify_paths``,
+    which fails outright on stock Ubuntu (no default cert *file*, only the
+    certs dir) with ``error 2026: SSL_CTX_set_default_verify_paths
+    failed``. sysbench 1.0.20 has no ``--mysql-ssl-ca`` option, so the env
+    route is the one that works everywhere. Peer verification is NOT
+    enabled by this — it only lets the context initialize.
     """
     env = dict(os.environ)
     if engine == "mysql":
         env["MYSQL_PWD"] = password
+        if sslmode != "disable":
+            ca = mysql_ssl_ca()
+            if ca:
+                env.setdefault("SSL_CERT_FILE", ca)
+                env.setdefault("SSL_CERT_DIR", os.path.dirname(ca) or "/etc/ssl/certs")
         return env
     env["PGPASSWORD"] = password
     env["PGSSLMODE"] = sslmode
@@ -121,18 +135,10 @@ _MYSQL_CA_BUNDLES = (
 
 
 def mysql_ssl_ca() -> str:
-    """CA bundle handed to sysbench's mysql driver when TLS is on.
-
-    With ``--mysql-ssl=on`` and no CA, several connector builds (Ubuntu's
-    MariaDB-linked sysbench among them) fail at context init with
-    ``error 2026: SSL_CTX_set_default_verify_paths failed`` before a single
-    connection is attempted. Passing any readable CA bundle satisfies the
-    init; the server certificate is still NOT verified (sysbench never
-    enables peer verification), so this changes availability, not trust.
-    ``PGB_MYSQL_SSL_CA`` overrides the autodetected path — set it to a
-    provider CA file if you want one, or to the empty string to suppress
-    the flag entirely.
-    """
+    """CA bundle the OpenSSL env vars point at when MySQL TLS is on (see
+    client_env). ``PGB_MYSQL_SSL_CA`` overrides the autodetected path — set
+    it to a provider CA file if you want one, or to the empty string to
+    leave the environment untouched."""
     override = os.environ.get("PGB_MYSQL_SSL_CA")
     if override is not None:
         return override
@@ -145,10 +151,12 @@ def mysql_ssl_ca() -> str:
 def sysbench_connection_args(engine: str, host: str, port: int, user: str,
                              database: str, sslmode: str = "require") -> list[str]:
     """sysbench driver + connection flags. Password stays OUT of argv for both
-    drivers (PGPASSWORD / MYSQL_PWD via the child env)."""
+    drivers (PGPASSWORD / MYSQL_PWD via the child env). TLS trust setup also
+    rides the env (client_env), never argv: sysbench 1.0.20 — the Ubuntu
+    package — rejects --mysql-ssl-ca as an invalid option."""
     if engine == "mysql":
         ssl = "off" if sslmode == "disable" else "on"
-        args = [
+        return [
             "--db-driver=mysql",
             f"--mysql-host={host}",
             f"--mysql-port={port}",
@@ -156,11 +164,6 @@ def sysbench_connection_args(engine: str, host: str, port: int, user: str,
             f"--mysql-db={database}",
             f"--mysql-ssl={ssl}",
         ]
-        if ssl == "on":
-            ca = mysql_ssl_ca()
-            if ca:
-                args.append(f"--mysql-ssl-ca={ca}")
-        return args
     return [
         "--db-driver=pgsql",
         f"--pgsql-host={host}",
