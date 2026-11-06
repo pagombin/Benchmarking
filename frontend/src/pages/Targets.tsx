@@ -3,7 +3,8 @@ import { api } from "../api";
 import type { Me, Target } from "../types";
 import { usePageTitle } from "../lib/ui";
 
-const BLANK = { name: "", host: "", port: 5432, dbname: "defaultdb", dbuser: "doadmin", sslmode: "require", password: "" };
+const BLANK = { name: "", host: "", port: 5432, dbname: "defaultdb", dbuser: "doadmin", sslmode: "require", engine: "postgres", password: "" };
+const DEFAULT_PORT: Record<string, number> = { postgres: 5432, mysql: 3306 };
 
 export function Targets({ me }: { me: Me }) {
   usePageTitle("DB targets");
@@ -22,7 +23,8 @@ export function Targets({ me }: { me: Me }) {
   function startEdit(t: Target) {
     setEditId(t.id);
     setForm({ name: t.name, host: t.host, port: t.port, dbname: t.dbname,
-              dbuser: t.dbuser, sslmode: t.sslmode, password: "" });
+              dbuser: t.dbuser, sslmode: t.sslmode,
+              engine: t.engine || "postgres", password: "" });
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
   function cancelEdit() { setEditId(null); setForm({ ...BLANK }); }
@@ -58,8 +60,17 @@ export function Targets({ me }: { me: Me }) {
     }
   }
 
-  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    if (k === "engine") {
+      // switching engine flips the port with it — unless the operator
+      // already set a non-default one
+      const engine = e.target.value;
+      const untouched = form.port === DEFAULT_PORT[form.engine];
+      setForm({ ...form, engine, port: untouched ? DEFAULT_PORT[engine] : form.port });
+      return;
+    }
     setForm({ ...form, [k]: k === "port" ? Number(e.target.value) : e.target.value });
+  };
 
   return (
     <>
@@ -76,15 +87,16 @@ export function Targets({ me }: { me: Me }) {
         <div className="card">
           <div className="card-head"><h2>Saved clusters</h2></div>
           <table>
-            <thead><tr><th>Name</th><th>Host</th><th className="num">Port</th><th>Database</th><th>User</th><th>SSL</th><th></th></tr></thead>
+            <thead><tr><th>Name</th><th>Engine</th><th>Host</th><th className="num">Port</th><th>Database</th><th>User</th><th>SSL</th><th></th></tr></thead>
             <tbody>
               {targets === null ? (
-                <tr><td colSpan={7} className="empty mono">loading…</td></tr>
+                <tr><td colSpan={8} className="empty mono">loading…</td></tr>
               ) : targets.length === 0 ? (
-                <tr><td colSpan={7} className="empty">No saved targets yet.</td></tr>
+                <tr><td colSpan={8} className="empty">No saved targets yet.</td></tr>
               ) : targets.map((t) => (
                 <tr key={t.id}>
                   <td>{t.name}</td>
+                  <td><span className="chip">{t.engine === "mysql" ? "MySQL" : "PostgreSQL"}</span></td>
                   <td className="mono" style={{ fontSize: 12 }}>{t.host}</td>
                   <td className="num">{t.port}</td>
                   <td className="mono">{t.dbname}</td>
@@ -106,7 +118,15 @@ export function Targets({ me }: { me: Me }) {
               {editId !== null && <button className="ghost" style={{ marginLeft: "auto" }} onClick={cancelEdit}>Cancel</button>}</div>
             <form onSubmit={submit}>
               <div className="field"><label>Name</label><input value={form.name} onChange={set("name")} placeholder="advanced-nyc3-prod" required disabled={editId !== null} /></div>
-              <div className="field"><label>Host</label><input value={form.host} onChange={set("host")} placeholder="private-db.nyc3.db.ondigitalocean.com" required /></div>
+              <div className="row">
+                <div className="field"><label>Engine</label>
+                  <select value={form.engine} onChange={set("engine")}>
+                    <option value="postgres">PostgreSQL</option>
+                    <option value="mysql">MySQL</option>
+                  </select>
+                </div>
+                <div className="field"><label>Host</label><input value={form.host} onChange={set("host")} placeholder={form.engine === "mysql" ? "private-mysql.nyc3.db.ondigitalocean.com" : "private-db.nyc3.db.ondigitalocean.com"} required /></div>
+              </div>
               <div className="row">
                 <div className="field"><label>Port</label><input type="number" value={form.port} onChange={set("port")} /></div>
                 <div className="field"><label>SSL mode</label>

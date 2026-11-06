@@ -1,0 +1,34 @@
+# MySQL target quickstart: the same pipeline (preflight, prepare, sweep,
+# report) against a managed MySQL endpoint. Only target.engine changes —
+# sysbench switches to its native mysql driver and SQL rides the `mysql`
+# client, with the password delivered via MYSQL_PWD (never on a command
+# line). Works identically with soak:/continuous: in place of sweep:.
+run:
+  label: "quickstart-mysql"
+  edition: standard
+  tshirt_size: 4c16g
+  notes: "MySQL engine smoke test"
+
+target:
+  host: private-mysql.nyc3.db.ondigitalocean.com
+  port: 25060
+  database: sbtest
+  user: bench
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require          # PostgreSQL vocabulary; maps to --ssl-mode=REQUIRED
+  engine: mysql
+
+workload:
+  type: oltp_read_write
+  tables: 4
+  table_size: 10000
+
+sweep:
+  threads: [1, 4]
+  duration_s: 60
+  warmup_s: 10
+  cooldown_s: 5
+  repetitions: 1
+
+capture:
+  pg_settings: true         # dumps global variables on MySQL (same CSV shape)

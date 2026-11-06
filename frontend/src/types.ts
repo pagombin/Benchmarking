@@ -43,6 +43,7 @@ export interface Target {
   dbname: string;
   dbuser: string;
   sslmode: string;
+  engine: string;               // postgres | mysql
 }
 
 export interface Job {

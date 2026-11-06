@@ -701,6 +701,12 @@ intent** (`jobs.desired_state` = `running` | `stopped`) that the worker
 converges toward — that intent, not the process state, decides what survives
 a reboot.
 
+MySQL targets (`engine: mysql` on the saved target) run the identical
+lifecycle — supervisor, probes, collector, ledger, alerts. The droplet needs
+the `mysql` client on PATH (`deploy.sh` installs it best-effort:
+`mysql-client`, or `default-mysql-client` on Debian); the password rides
+`MYSQL_PWD` exactly as `PGPASSWORD` does for PostgreSQL.
+
 ### 15.1 Starting and stopping
 
 Start from the console: **Continuous → Start a continuous workload**. It

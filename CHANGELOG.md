@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — MySQL targets
+
+- **`target.engine: mysql`**: every mode (sweep/soak/suite/continuous),
+  preflight, prepare, probes, the DB-side collector, alerting and the
+  console now run against MySQL/MariaDB through the same code paths.
+  sysbench uses its native mysql driver; SQL rides the `mysql` client; the
+  password travels only via `MYSQL_PWD` (no command line, ever). Engine
+  metrics map onto the existing vocabulary (buffer-pool hit ratio as
+  cache-hit %, redo bytes as WAL, history list length as dead tuples), so
+  charts/rollups/reports are engine-agnostic; absent analogues chart as
+  gaps. Saved targets carry the engine (migration 10, default postgres);
+  `suite.pgbench` and `device_probe` are refused for MySQL with clear
+  errors. See README → "MySQL targets".
+
 ## Unreleased — Continuous Mode: always-on benchmarking with an availability ledger
 
 - **New run mode `continuous:`** (`pgbench-harness continuous`): a
