@@ -460,8 +460,14 @@ def test_mysql_ssl_ca_autodetect_and_override(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("PGB_MYSQL_SSL_CA", raising=False)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    engines._SYSBENCH_HELP = "...mysql-ssl[=on|off]..."      # a 1.0.20 build
     args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
     assert not any(a.startswith("--mysql-ssl-ca") for a in args)  # 1.0.20-safe
+    engines._SYSBENCH_HELP = "...mysql-ssl-ca=STRING..."      # a capable build
+    args = engines.sysbench_connection_args("mysql", "h", 3306, "u", "d")
+    if engines.mysql_ssl_ca():
+        assert any(a.startswith("--mysql-ssl-ca=") for a in args)
+    engines._SYSBENCH_HELP = None                              # restore probe
     env = engines.client_env("mysql", "pw")
     if engines.mysql_ssl_ca():                       # system bundle present
         assert env["SSL_CERT_FILE"] == engines.mysql_ssl_ca()

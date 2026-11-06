@@ -16,6 +16,7 @@ for the credential — so one module owns the differences:
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import Any, Optional
 
 ENGINES = ("postgres", "mysql")
@@ -148,15 +149,39 @@ def mysql_ssl_ca() -> str:
     return ""
 
 
+# Cached `sysbench --help` text: which driver options this build knows.
+# Ubuntu's 1.0.20 package lacks --mysql-ssl-ca (and its MariaDB-linked TLS
+# init fails against TLS-required servers); newer builds (Percona's, or
+# upstream master) have the flag. Probed once per process, never raising.
+_SYSBENCH_HELP: Optional[str] = None
+
+
+def _sysbench_help() -> str:
+    global _SYSBENCH_HELP
+    if _SYSBENCH_HELP is None:
+        try:
+            out = subprocess.run(["sysbench", "--help"], capture_output=True,
+                                 text=True, timeout=10)
+            _SYSBENCH_HELP = (out.stdout or "") + (out.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            _SYSBENCH_HELP = ""
+    return _SYSBENCH_HELP
+
+
+def sysbench_supports(option: str) -> bool:
+    """True when the installed sysbench lists *option* in its --help."""
+    return option in _sysbench_help()
+
+
 def sysbench_connection_args(engine: str, host: str, port: int, user: str,
                              database: str, sslmode: str = "require") -> list[str]:
     """sysbench driver + connection flags. Password stays OUT of argv for both
-    drivers (PGPASSWORD / MYSQL_PWD via the child env). TLS trust setup also
-    rides the env (client_env), never argv: sysbench 1.0.20 — the Ubuntu
-    package — rejects --mysql-ssl-ca as an invalid option."""
+    drivers (PGPASSWORD / MYSQL_PWD via the child env). The CA flag is added
+    only when this sysbench build knows it — Ubuntu's 1.0.20 rejects
+    --mysql-ssl-ca as an invalid option and would refuse to start."""
     if engine == "mysql":
         ssl = "off" if sslmode == "disable" else "on"
-        return [
+        args = [
             "--db-driver=mysql",
             f"--mysql-host={host}",
             f"--mysql-port={port}",
@@ -164,6 +189,11 @@ def sysbench_connection_args(engine: str, host: str, port: int, user: str,
             f"--mysql-db={database}",
             f"--mysql-ssl={ssl}",
         ]
+        if ssl == "on":
+            ca = mysql_ssl_ca()
+            if ca and sysbench_supports("mysql-ssl-ca"):
+                args.append(f"--mysql-ssl-ca={ca}")
+        return args
     return [
         "--db-driver=pgsql",
         f"--pgsql-host={host}",
