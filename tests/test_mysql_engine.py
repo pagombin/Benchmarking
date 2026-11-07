@@ -548,3 +548,16 @@ def test_prepare_threads_knob() -> None:
     doc["workload"]["prepare_threads"] = -1
     with pytest.raises(SpecError, match="prepare_threads"):
         parse_spec(doc)
+
+
+def test_wrong_schema_hint_is_engine_aware(tmp_path: Path) -> None:
+    """The wrong_schema abort explains databases for MySQL (no search_path
+    advice, which is meaningless there) and keeps the PG wording for PG."""
+    from pgbench_harness.capture import DatasetCheck
+    from pgbench_harness.runner import _dataset_error
+    chk = DatasetCheck(status="wrong_schema", detail="found elsewhere")
+    my = _dataset_error(chk, tmp_path / "s.yaml", "mysql")
+    assert "DIFFERENT database" in my.hint and "DROP DATABASE" in my.hint
+    assert "ALTER ROLE" not in my.hint          # no PostgreSQL advice
+    pg = _dataset_error(chk, tmp_path / "s.yaml", "postgres")
+    assert "search_path" in pg.hint

@@ -50,17 +50,31 @@ def print_dry_run(spec: Spec) -> None:
           f"{spec.target.password_env} -> PGPASSWORD (never on the command line)")
 
 
-def _dataset_error(check: "capture.DatasetCheck", spec_path: Path) -> PreflightError:
+def _dataset_error(check: "capture.DatasetCheck", spec_path: Path,
+                   engine: str = "postgres") -> PreflightError:
     """Map a non-ok dataset check onto an actionable abort message."""
+    if engine == "mysql":
+        wrong_schema_hint = (
+            "the benchmark tables exist in a DIFFERENT database than "
+            "target.database connects to (MySQL has no search_path — the "
+            "connection's database is where unqualified names resolve). "
+            "Either point target.database at the database listed above, or "
+            "drop those tables (e.g. a leftover smoke test: "
+            "`DROP DATABASE <that_db>`) and run `prepare` again."
+        )
+    else:
+        wrong_schema_hint = (
+            "the tables exist but not on this connection's search_path, so "
+            "sysbench's run would not see them. Set the search_path on the "
+            "target (e.g. `ALTER ROLE <user> IN DATABASE <db> SET "
+            "search_path = <schema>, public;`) so the schema above is first, "
+            "then re-run preflight. This commonly happens on poolers/clusters "
+            "where the default schema is not `public`."
+        )
     hints = {
         "missing": f"run `pgbench-harness prepare --spec {spec_path}` first; "
                    "`run` never prepares silently.",
-        "wrong_schema": "the tables exist but not on this connection's search_path, so "
-                        "sysbench's run would not see them. Set the search_path on the "
-                        "target (e.g. `ALTER ROLE <user> IN DATABASE <db> SET "
-                        "search_path = <schema>, public;`) so the schema above is first, "
-                        "then re-run preflight. This commonly happens on poolers/clusters "
-                        "where the default schema is not `public`.",
+        "wrong_schema": wrong_schema_hint,
         "incomplete": "the benchmark tables are partially present or have an "
                       "unrecognized schema. Drop them (or use a dedicated database) "
                       "and run `prepare` again — the harness never overwrites tables "
@@ -189,7 +203,7 @@ def cmd_preflight(spec_path: Path, json_output: bool = False) -> int:
         logger.warning("run `pgbench-harness prepare --spec %s` before `run`.", spec_path)
         return 1
     if not pf.dataset.ok:
-        raise _dataset_error(pf.dataset, spec_path)
+        raise _dataset_error(pf.dataset, spec_path, spec.target.engine)
     logger.info("preflight OK")
     return 0
 
@@ -324,7 +338,7 @@ def cmd_prepare(spec_path: Path, results_dir: Path, recreate: str = "",
             hint="re-run prepare with 'drop existing data first' (recreate) to reload it, "
                  "or just run the benchmark against the existing data.")
     if check.status not in ("missing", "ok") and not recreate:
-        raise _dataset_error(check, spec_path)
+        raise _dataset_error(check, spec_path, spec.target.engine)
     results_dir.mkdir(parents=True, exist_ok=True)
     cmd = sysbench.build_prepare_command(spec)
     log_path = results_dir / f"prepare_{_prepare_slug(spec)}.log"
@@ -346,7 +360,7 @@ def cmd_prepare(spec_path: Path, results_dir: Path, recreate: str = "",
     if check.status in ("wrong_schema", "mismatch", "incomplete"):
         # sysbench succeeded but the result is not usable as-is — give the
         # specific guidance rather than blaming the load.
-        raise _dataset_error(check, spec_path)
+        raise _dataset_error(check, spec_path, spec.target.engine)
     if not check.ok:
         raise RunError(
             f"sysbench prepare reported success but no benchmark tables exist "
@@ -570,7 +584,7 @@ def cmd_run(
         pf = capture.run_preflight(spec, password, logger)
         assert pf.dataset is not None
         if not pf.dataset.ok:
-            raise _dataset_error(pf.dataset, spec_path)
+            raise _dataset_error(pf.dataset, spec_path, spec.target.engine)
     except PreflightError:
         manifest.status = "failed"  # keep `list` honest about aborted runs
         manifest.save(run_dir)
@@ -1063,7 +1077,7 @@ def cmd_soak(
         pf = capture.run_preflight(spec, password, logger)
         assert pf.dataset is not None
         if not pf.dataset.ok:
-            raise _dataset_error(pf.dataset, spec_path)
+            raise _dataset_error(pf.dataset, spec_path, spec.target.engine)
     except PreflightError:
         manifest.status = "failed"
         manifest.save(run_dir)
@@ -1412,7 +1426,7 @@ def cmd_suite(spec_path: Path, results_dir: Path, dry_run: bool = False,
         pf = capture.run_preflight(spec, password, logger)
         assert pf.dataset is not None
         if not pf.dataset.ok:
-            raise _dataset_error(pf.dataset, spec_path)
+            raise _dataset_error(pf.dataset, spec_path, spec.target.engine)
     except PreflightError:
         manifest.status = "failed"
         manifest.save(run_dir)
